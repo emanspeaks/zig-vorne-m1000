@@ -1,0 +1,66 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug zig-vorne-m1000",
+            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": true,
+            "console": "integratedTerminal",
+            "preLaunchTask": "zig build"
+        },
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "Debug with GDB",
+            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
+            "args": [],
+            "stopAtEntry": true,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "zig build",
+            "MIMode": "gdb",
+            "miDebuggerArgs": "-q",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set new-console off",
+                    "text": "set new-console off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set pagination off",
+                    "text": "set pagination off",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "Debug with GDB (Simple)",
+            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "zig build",
+            "MIMode": "gdb",
+            "miDebuggerArgs": "-q --batch-silent",
+            "logging": {
+                "engineLogging": false,
+                "programOutput": true,
+                "trace": false
+            }
+        }
+    ]
+}
