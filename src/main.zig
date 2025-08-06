@@ -43,7 +43,8 @@ pub fn main() !void {
             // Format full date/time string (ISO format without T)
             const time_str_formatted = time.formatTimestamp(timestamp, &time_buf) catch unreachable;
             // std.debug.print("Full update (local): {s}\n", .{time_str_formatted});
-            const time_str = std.fmt.bufPrint(&display_buf, "{s}{s}", .{ protocol.ESC ++ "C", time_str_formatted }) catch unreachable;
+            const local_or_utc = if (tz_offset == 0) "Z" else "L";
+            const time_str = std.fmt.bufPrint(&display_buf, "{s}{s}{s}", .{ protocol.ESC ++ "C", time_str_formatted, local_or_utc }) catch unreachable;
             protocol.sendUnitDisplayCmd(allocator, port, 1, time_str) catch |err| return err;
             tz_offset = time.getTimezoneOffset();
             last_full_update = utc_timestamp;
