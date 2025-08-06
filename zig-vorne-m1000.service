@@ -1,0 +1,25 @@
+[Unit]
+Description=Zig Vorne M1000 Display Clock
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/emanspeaks/git/zig-vorne-m1000
+ExecStart=/home/emanspeaks/git/zig-vorne-m1000/zig-out/bin/zig_vorne_m1000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Allow access to serial devices
+SupplementaryGroups=plugdev
+; SupplementaryGroups=dialout
+
+# Environment variables (if needed)
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

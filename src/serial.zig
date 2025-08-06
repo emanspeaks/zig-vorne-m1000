@@ -11,7 +11,7 @@ pub const SerialPort = struct {
                 return err;
             },
             error.AccessDenied => {
-                std.debug.print("Permission denied accessing {s}. Make sure you're in the dialout group.\n", .{path});
+                std.debug.print("Permission denied accessing {s}. Make sure you're in the dialout or plugdev group.\n", .{path});
                 return err;
             },
             else => return err,
