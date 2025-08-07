@@ -1,0 +1,7 @@
+{
+  // Christmas countdown
+  "Xmas": [2025, 12, 25, 6, 0, 0],
+  /* New Year countdown
+     for 2026 */
+  "NewYear26": [2026, 1, 1, 6, 0, 0], // you can add trailing commas too
+}

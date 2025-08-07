@@ -242,6 +242,15 @@ pub fn sendGrpDefaultInitCmd(
 
 // Update a single character at specified line and column
 pub fn unitUpdateChar(
+    buf: []u8,
+    line: u8,
+    column: u8,
+    new_char: u8,
+) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{d};{d}C{c}", .{ ESC, line, column, new_char }) catch unreachable;
+}
+
+pub fn sendUnitUpdateChar(
     allocator: std.mem.Allocator,
     port: *serial.SerialPort,
     address: u8,
@@ -251,7 +260,7 @@ pub fn unitUpdateChar(
 ) !void {
     // Build the command string: "<ESC><line>;<col>C<newchar>"
     var cmd_buf: [32]u8 = undefined;
-    const update_cmd = std.fmt.bufPrint(&cmd_buf, "{s}{d};{d}C{c}", .{ ESC, line, column, new_char }) catch unreachable;
+    const update_cmd = unitUpdateChar(&cmd_buf, line, column, new_char);
 
     // Send the command using unitDisplayCmd
     try sendUnitDisplayCmd(allocator, port, address, update_cmd);
