@@ -4,17 +4,12 @@
         {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Run clocks",
+            "name": "Run bluray",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": [],
+            "args": ["--bluray"],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
-            "environment": [
-                {
-                    "name": "DEBUG_MODE",
-                    "value": "1"
-                }
-            ],
+            "environment": [],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
@@ -46,12 +41,17 @@
         {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Run bluray",
+            "name": "Run clocks",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": ["--bluray"],
+            "args": [],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
-            "environment": [],
+            // "environment": [
+            //     {
+            //         "name": "DEBUG_MODE",
+            //         "value": "1"
+            //     }
+            // ],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
