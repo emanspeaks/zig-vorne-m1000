@@ -22,6 +22,13 @@ pub const Dhms = struct {
     second: u8,
 };
 
+pub const Hms = struct {
+    sign: i8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+};
+
 /// Get the local timezone offset in seconds from UTC
 pub fn getTimezoneInfo() zoneinfo {
     // Read timezone info from /etc/localtime symlink
@@ -176,15 +183,20 @@ pub fn formatDhms(dhms: Dhms, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}{d}/{d:0>2}:{d:0>2}:{d:0>2}", .{ sign_char, dhms.day, dhms.hour, dhms.minute, dhms.second });
 }
 
+pub fn formatHms(hms: Hms, buf: []u8) ![]const u8 {
+    const sign_char = if (hms.sign < 0) "-" else "";
+    return std.fmt.bufPrint(buf, "{s}{d}:{d:0>2}:{d:0>2}", .{ sign_char, hms.hour, hms.minute, hms.second });
+}
+
 /// Format a timestamp as "25Au06W200/20:37:13D"
-pub fn formatRandyTimestamp(timestamp: i64, buf: []u8, zi: *const zoneinfo) ![]const u8 {
+pub fn formatRandyTimestamp(timestamp: i64, buf: []u8, zi: ?*const zoneinfo) ![]const u8 {
     const ymdhms = timestampToYmdhms(timestamp);
 
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const epoch_day = epoch_seconds.getEpochDay();
     // const year_day = epoch_day.calculateYearDay();
     const weekday_idx: usize = @as(u4, @intCast(@mod(epoch_day.day + 4, 7))); // Jan 1, 1970 was a Thursday (index 4)
-    const zone_idx = if (zi.offset_sec == 0) 2 else zi.is_dst;
+    const zone_idx = if (zi == null or zi.?.offset_sec == 0) 2 else zi.?.is_dst;
 
     // return std.fmt.bufPrint(buf, "{d:0>2}{s}{d:0>2}{s}{d:0>3}/{d:0>2}:{d:0>2}:{d:0>2}{s}", .{
     //     @mod(ymdhms.year, 100),
@@ -331,4 +343,26 @@ pub fn dhmsToTimedelta(dhms: Dhms) i64 {
     const m: i64 = @intCast(dhms.minute);
     const s: i64 = @intCast(dhms.second);
     return sign * (d * 86400 + h * 3600 + m * 60 + s);
+}
+
+pub fn timedeltaToHms(delta_sec: i64) Hms {
+    const sign: i64 = if (delta_sec < 0) -1 else 1;
+    const abs_delta_sec = @abs(delta_sec);
+    const hours = @as(i64, @intCast(@divFloor(abs_delta_sec, 3600)));
+    const minutes = @divFloor(@mod(abs_delta_sec, 3600), 60);
+    const seconds = @mod(abs_delta_sec, 60);
+    return Hms{
+        .sign = @as(i8, @intCast(sign)),
+        .hour = @intCast(hours),
+        .minute = @intCast(minutes),
+        .second = @intCast(seconds),
+    };
+}
+
+pub fn hmsToTimedelta(hms: Hms) i64 {
+    const sign: i64 = @intCast(hms.sign);
+    const h: i64 = @intCast(hms.hour);
+    const m: i64 = @intCast(hms.minute);
+    const s: i64 = @intCast(hms.second);
+    return sign * (h * 3600 + m * 60 + s);
 }

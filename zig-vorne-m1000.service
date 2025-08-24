@@ -9,17 +9,17 @@ User=emanspeaks
 Group=emanspeaks
 WorkingDirectory=/home/emanspeaks/git/zig-vorne-m1000
 ExecStart=/home/emanspeaks/git/zig-vorne-m1000/zig-out/bin/zig_vorne_m1000
-Restart=always
+Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+; StandardOutput=journal
+; StandardError=journal
 
 # Allow access to serial devices
 SupplementaryGroups=plugdev
 ; SupplementaryGroups=dialout
 
 # Environment variables (if needed)
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+; Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target

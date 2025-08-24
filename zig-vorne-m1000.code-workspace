@@ -3,5 +3,9 @@
 		{
 			"path": "."
 		}
-	]
+	],
+	"settings": {
+		"zig.zls.path": "zls",
+		"terminal.integrated.automationShell.linux": "bash"
+	}
 }

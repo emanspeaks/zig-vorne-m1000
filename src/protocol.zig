@@ -82,20 +82,20 @@ pub fn genCmdStr(
     const addr_str = std.fmt.bufPrint(&buf, "{d}", .{address}) catch unreachable;
 
     // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8).init(allocator);
-    defer cmd_parts.deinit();
+    var cmd_parts = std.ArrayList(u8){};
+    defer cmd_parts.deinit(allocator);
 
-    try cmd_parts.appendSlice(addr_cmd);
-    try cmd_parts.appendSlice(addr_str);
-    try cmd_parts.appendSlice(type_cmd);
+    try cmd_parts.appendSlice(allocator, addr_cmd);
+    try cmd_parts.appendSlice(allocator, addr_str);
+    try cmd_parts.appendSlice(allocator, type_cmd);
     if (data_no_cr) |data| {
         if (data.len > 0) {
-            try cmd_parts.appendSlice(data);
+            try cmd_parts.appendSlice(allocator, data);
         }
     }
-    try cmd_parts.appendSlice(CR);
+    try cmd_parts.appendSlice(allocator, CR);
 
-    return try cmd_parts.toOwnedSlice();
+    return try cmd_parts.toOwnedSlice(allocator);
 }
 
 // Generate single flush command
@@ -238,6 +238,18 @@ pub fn sendGrpDefaultInitCmd(
     //     std.debug.print("Failed to send group clear command: {}\n", .{err});
     //     return err;
     // };
+}
+
+pub fn appendStrToCmdList(
+    allocator: std.mem.Allocator,
+    cmd_parts: *std.ArrayList(u8),
+    line: u8,
+    column: u8,
+    text: []const u8,
+) !void {
+    var line_buf: [32]u8 = undefined;
+    const line_cmd = std.fmt.bufPrint(&line_buf, "{s}{d};{d}C{s}", .{ ESC, line, column, text }) catch unreachable;
+    try cmd_parts.appendSlice(allocator, line_cmd);
 }
 
 // Update a single character at specified line and column

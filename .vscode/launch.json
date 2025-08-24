@@ -2,28 +2,23 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug zig-vorne-m1000",
-            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": [],
-            "cwd": "${workspaceFolder}",
-            "stopOnEntry": true,
-            "console": "integratedTerminal",
-            "preLaunchTask": "zig build"
-        },
-        {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Debug with GDB",
+            "name": "Run clocks",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
             "args": [],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "DEBUG_MODE",
+                    "value": "1"
+                }
+            ],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
+            // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
             "miDebuggerArgs": "-q",
             "setupCommands": [
                 {
@@ -40,26 +35,63 @@
                     "description": "Set pagination off",
                     "text": "set pagination off",
                     "ignoreFailures": true
+                },
+                {
+                    "description": "Force target architecture for debuggee (MI-style)",
+                    "text": "-gdb-set architecture aarch64",
+                    "ignoreFailures": true
                 }
             ]
         },
         {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Debug with GDB (Simple)",
+            "name": "Run bluray",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": [],
-            "stopAtEntry": false,
+            "args": ["--bluray"],
+            "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
-            "miDebuggerArgs": "-q --batch-silent",
-            "logging": {
-                "engineLogging": false,
-                "programOutput": true,
-                "trace": false
+            // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
+            "miDebuggerArgs": "-q",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set new-console off",
+                    "text": "set new-console off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set pagination off",
+                    "text": "set pagination off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Force target architecture for debuggee (MI-style)",
+                    "text": "-gdb-set architecture aarch64",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug zig-vorne-m1000",
+            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "console": "integratedTerminal",
+            "preLaunchTask": "zig build",
+            "env": {
+                "DEBUG_MODE": "1"
             }
         }
     ]
