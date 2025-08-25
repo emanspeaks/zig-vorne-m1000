@@ -8,7 +8,12 @@
 			"args": ["build"],
 			"group": "build",
 			"isBackground": false,
-			"problemMatcher": []
+			"problemMatcher": [
+				{
+					"base": "$zig",
+					"fileLocation": "autoDetect"
+				}
+			]
 		}
 	]
 }

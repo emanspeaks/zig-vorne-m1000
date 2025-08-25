@@ -38,8 +38,7 @@ pub fn main() !void {
     std.Thread.sleep(1 * std.time.ns_per_s);
 
     if (bluray_mode) {
-        std.debug.print("Starting Blu-ray run mode...\n", .{});
-        try bluray.runBluray(allocator, port);
+        try bluray.runBlurayClocks(allocator, port);
     } else {
         try clocks.runClocks(allocator, port);
     }

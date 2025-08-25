@@ -1,19 +1,57 @@
 const std = @import("std");
 const time = @import("time.zig");
+const str_utils = @import("str_utils.zig");
+
+const maxbufsz = str_utils.maxbufsz;
 
 pub const CountdownConfig = struct {
-    label: [20]u8,
+    label: [maxbufsz]u8,
     target_date: time.Ymdhms,
 };
 
 pub const BlurayConfig = struct {
-    label: [20]u8,
+    label: [maxbufsz]u8,
     target_date: time.Ymdhms,
 };
 
+const bluray_cfg_path = "/home/emanspeaks/bluray_config.jsonc";
+const bluray_ip_path = "/home/emanspeaks/bluray_ip.txt";
+const countdown_cfg_path = "/home/emanspeaks/line2_config.jsonc";
+
+pub fn loadBlurayIp(allocator: std.mem.Allocator) ?[]const u8 {
+    // Try to read the IP address from the text file
+    const file = std.fs.openFileAbsolute(bluray_ip_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("bluray_ip.txt not found, skipping\n", .{});
+            return null;
+        },
+        else => {
+            std.debug.print("Error opening IP file: {}, skipping\n", .{err});
+            return null;
+        },
+    };
+    defer file.close();
+
+    const file_size = file.getEndPos() catch |err| {
+        std.debug.print("Error getting file size: {}, skipping\n", .{err});
+        return null;
+    };
+    const contents = allocator.alloc(u8, @intCast(file_size)) catch |err| {
+        std.debug.print("Error allocating memory: {}, skipping\n", .{err});
+        return null;
+    };
+    // defer allocator.free(contents);
+    _ = file.readAll(contents) catch |err| {
+        std.debug.print("Error reading file: {}, skipping\n", .{err});
+        return null;
+    };
+
+    return contents;
+}
+
 pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
     // Try to read the JSON file
-    const file = std.fs.openFileAbsolute("/home/emanspeaks/bluray_config.jsonc", .{}) catch |err| switch (err) {
+    const file = std.fs.openFileAbsolute(bluray_cfg_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("bluray_config.jsonc not found, skipping\n", .{});
             return null;
@@ -135,8 +173,8 @@ pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
             //     const second = @as(u8, @intCast(date_array.items[5].integer));
 
             //     // Create a label buffer and copy the string
-            //     var label_buf: [20]u8 = [_]u8{0} ** 20;
-            //     const copy_len = @min(label.len, 20);
+            //     var label_buf: [maxbufsz]u8 = [_]u8{0} ** maxbufsz;
+            //     const copy_len = @min(label.len, maxbufsz);
             //     @memcpy(label_buf[0..copy_len], label[0..copy_len]);
 
             //     // std.debug.print("Loaded countdown: {s} -> {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n", .{ label_buf[0..copy_len], year, month, day, hour, minute, second });
@@ -163,7 +201,7 @@ pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
 
 pub fn loadCountdownConfig(allocator: std.mem.Allocator) ?CountdownConfig {
     // Try to read the JSON file
-    const file = std.fs.openFileAbsolute("/home/emanspeaks/line2_config.jsonc", .{}) catch |err| switch (err) {
+    const file = std.fs.openFileAbsolute(countdown_cfg_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("line2_config.jsonc not found, skipping\n", .{});
             return null;
@@ -284,8 +322,8 @@ pub fn loadCountdownConfig(allocator: std.mem.Allocator) ?CountdownConfig {
                 const second = @as(u8, @intCast(date_array.items[5].integer));
 
                 // Create a label buffer and copy the string
-                var label_buf: [20]u8 = [_]u8{0} ** 20;
-                const copy_len = @min(label.len, 20);
+                var label_buf: [maxbufsz]u8 = [_]u8{0} ** maxbufsz;
+                const copy_len = @min(label.len, maxbufsz);
                 @memcpy(label_buf[0..copy_len], label[0..copy_len]);
 
                 // std.debug.print("Loaded countdown: {s} -> {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n", .{ label_buf[0..copy_len], year, month, day, hour, minute, second });

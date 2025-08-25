@@ -1,13 +1,18 @@
 const std = @import("std");
 const serial = @import("serial.zig");
+const str_utils = @import("str_utils.zig");
+
+const maxbufsz = str_utils.maxbufsz;
 
 // Special characters constants
 pub const ESC = "\x1B";
 pub const CR = "\r";
 pub const LF = "\n";
-pub const CRLF = "\r\n";
 pub const SOH = "\x01";
+pub const EOT = "\x04";
 pub const FF = "\x0c";
+pub const DLE = "\x10";
+pub const CRLF = "\r\n";
 
 // Simple Packet Protocol (SPP) constants
 pub const flush_cmd = ":F";
@@ -247,8 +252,10 @@ pub fn appendStrToCmdList(
     column: u8,
     text: []const u8,
 ) !void {
-    var line_buf: [32]u8 = undefined;
-    const line_cmd = std.fmt.bufPrint(&line_buf, "{s}{d};{d}C{s}", .{ ESC, line, column, text }) catch unreachable;
+    var line_buf: [2 * maxbufsz]u8 = undefined;
+    // Trim null characters from the text if present
+    const trimmed_text = std.mem.sliceTo(text, 0);
+    const line_cmd = std.fmt.bufPrint(&line_buf, "{s}{d};{d}C{s}", .{ ESC, line, column, trimmed_text }) catch unreachable;
     try cmd_parts.appendSlice(allocator, line_cmd);
 }
 
@@ -271,7 +278,7 @@ pub fn sendUnitUpdateChar(
     new_char: u8,
 ) !void {
     // Build the command string: "<ESC><line>;<col>C<newchar>"
-    var cmd_buf: [32]u8 = undefined;
+    var cmd_buf: [2 * maxbufsz]u8 = undefined;
     const update_cmd = unitUpdateChar(&cmd_buf, line, column, new_char);
 
     // Send the command using unitDisplayCmd
@@ -400,169 +407,169 @@ pub fn formatWithControlChars(allocator: std.mem.Allocator, data: []const u8) ![
 
 // Control character lookup table for characters 0x00-0x1F and 0x7F
 pub const control_chars = [_][]const u8{
-    "<NUL>",
-    "<SOH>",
-    "<STX>",
-    "<ETX>",
-    "<EOT>",
-    "<ENQ>",
-    "<ACK>",
-    "<BEL>",
-    "<BS>",
-    "<HT>",
-    "<LF>",
-    "<VT>",
-    "<FF>",
-    "<CR>",
-    "<SO>",
-    "<SI>",
-    "<DLE>",
-    "<DC1>",
-    "<DC2>",
-    "<DC3>",
-    "<DC4>",
-    "<NAK>",
-    "<SYN>",
-    "<ETB>",
-    "<CAN>",
-    "<EM>",
-    "<SUB>",
-    "<ESC>",
-    "<FS>",
-    "<GS>",
-    "<RS>",
-    "<US>",
-    "<DEL>",
+    "<NUL>", // x00 - @
+    "<SOH>", //"☺︎",  // x01 - A
+    "☻", //"<STX>",  // x02 - B
+    "♥︎", //"<ETX>",  // x03 - C
+    "<EOT>", //"♦︎",  // x04 - D
+    "♣︎", //"<ENQ>",  // x05 - E
+    "♠︎", //"<ACK>",  // x06 - F
+    "•", //"<BEL>",  // x07 - G  (rendered as small square bullet)
+    "<BS>", //"◘",   // x08 - H
+    "<HT>", //"○",   // x09 - I
+    "<LF>", //"◙",   // x0a - J
+    "<VT>", //"♂︎",   // x0b - K
+    "<FF>", //"♀︎",   // x0c - L
+    "<CR>", //"♪",   // x0d - M
+    "♫", //"<SO>",   // x0e - N
+    "☼", //"<SI>",   // x0f - O
+    "►", //"<DLE>",  // x10 - P
+    "◄", //"<DC1>",  // x11 - Q
+    "↕︎", //"<DC2>",  // x12 - R
+    "‼︎", //"<DC3>",  // x13 - S
+    "¶", //"<DC4>",  // x14 - T
+    "§", //"<NAK>",  // x15 - U
+    "▬", //"<SYN>",  // x16 - V
+    "↨", //"<ETB>",  // x17 - W
+    "↑", //"<CAN>",  // x18 - X
+    "↓", //"<EM>",   // x19 - Y
+    "→", //"<SUB>",  // x1a - Z
+    "<ESC>", //"←",  // x1b - [
+    "∟", //"<FS>",   // x1c - \
+    "↔︎", //"<GS>",   // x1d - ]
+    "▲", //"<RS>",   // x1e - ^
+    "▼", //"<US>",   // x1f - _
+    "⌂", //"<DEL>",  // x7f - `
 };
 
 // Extended character lookup table for characters 0x80-0xFF (CP437/DOS)
 pub const extended_chars = [_][]const u8{
-    "Ç",
-    "ü",
-    "é",
-    "â",
-    "ä",
-    "à",
-    "å",
-    "ç",
-    "ê",
-    "ë",
-    "è",
-    "ï",
-    "î",
-    "ì",
-    "Ä",
-    "Å",
-    "É",
-    "æ",
-    "Æ",
-    "ô",
-    "ö",
-    "ò",
-    "û",
-    "ù",
-    "ÿ",
-    "Ö",
-    "Ü",
-    "¢",
-    "£",
-    "¥",
-    "<Pt>",
-    "ƒ",
-    "á",
-    "í",
-    "ó",
-    "ú",
-    "ñ",
-    "Ñ",
-    "a",
-    "o",
-    "¿",
-    "⌐",
-    "¬",
-    "½",
-    "¼",
-    "¡",
-    "«",
-    "»",
-    "░",
-    "▒",
-    "▓",
-    "│",
-    "┤",
-    "╡",
-    "╢",
-    "╖",
-    "╕",
-    "╣",
-    "║",
-    "╗",
-    "╝",
-    "╜",
-    "╛",
-    "┐",
-    "└",
-    "┴",
-    "┬",
-    "├",
-    "─",
-    "┼",
-    "╞",
-    "╟",
-    "╚",
-    "╔",
-    "╩",
-    "╦",
-    "╠",
-    "═",
-    "╬",
-    "╧",
-    "╨",
-    "╤",
-    "╥",
-    "╙",
-    "╘",
-    "╒",
-    "╓",
-    "╫",
-    "╪",
-    "┘",
-    "┌",
-    "█",
-    "▄",
-    "▌",
-    "▐",
-    "▀",
-    "α",
-    "ß",
-    "Γ",
-    "π",
-    "Σ",
-    "σ",
-    "µ",
-    "τ",
-    "Φ",
-    "Θ",
-    "Ω",
-    "δ",
-    "∞",
-    "φ",
-    "ε",
-    "∩",
-    "≡",
-    "±",
-    "≥",
-    "≤",
-    "⌠",
-    "⌡",
-    "÷",
-    "≈",
-    "°",
-    "∙",
-    "·",
-    "√",
-    "ⁿ",
-    "²",
-    "■",
-    "�",
+    "Ç", // x80
+    "ü", // x81
+    "é", // x82
+    "â", // x83
+    "ä", // x84
+    "à", // x85
+    "å", // x86
+    "ç", // x87
+    "ê", // x88
+    "ë", // x89
+    "è", // x8a
+    "ï", // x8b
+    "î", // x8c
+    "ì", // x8d
+    "Ä", // x8e
+    "Å", // x8f
+    "É", // x90
+    "æ", // x91
+    "Æ", // x92
+    "ô", // x93
+    "ö", // x94
+    "ò", // x95
+    "û", // x96
+    "ù", // x97
+    "ÿ", // x98
+    "Ö", // x99
+    "Ü", // x9a
+    "¢", // x9b
+    "£", // x9c
+    "¥", // x9d
+    "<Pt>", // x9e
+    "ƒ", // x9f
+    "á", // xa0
+    "í", // xa1
+    "ó", // xa2
+    "ú", // xa3
+    "ñ", // xa4
+    "Ñ", // xa5
+    "a", // xa6
+    "o", // xa7
+    "¿", // xa8
+    "⌐", // xa9
+    "¬", // xaa
+    "½", // xab
+    "¼", // xac
+    "¡", // xad
+    "«", // xae
+    "»", // xaf
+    "░", // xb0
+    "▒", // xb1
+    "▓", // xb2
+    "│", // xb3
+    "┤", // xb4
+    "╡", // xb5
+    "╢", // xb6
+    "╖", // xb7
+    "╕", // xb8
+    "╣", // xb9
+    "║", // xba
+    "╗", // xbb
+    "╝", // xbc
+    "╜", // xbd
+    "╛", // xbe
+    "┐", // xbf
+    "└", // xc0
+    "┴", // xc1
+    "┬", // xc2
+    "├", // xc3
+    "─", // xc4
+    "┼", // xc5
+    "╞", // xc6
+    "╟", // xc7
+    "╚", // xc8
+    "╔", // xc9
+    "╩", // xca
+    "╦", // xcb
+    "╠", // xcc
+    "═", // xcd
+    "╬", // xce
+    "╧", // xcf
+    "╨", // xd0
+    "╤", // xd1
+    "╥", // xd2
+    "╙", // xd3
+    "╘", // xd4
+    "╒", // xd5
+    "╓", // xd6
+    "╫", // xd7
+    "╪", // xd8
+    "┘", // xd9
+    "┌", // xda
+    "█", // xdb
+    "▄", // xdc
+    "▌", // xdd
+    "▐", // xde
+    "▀", // xdf
+    "α", // xe0
+    "ß", // xe1
+    "Γ", // xe2
+    "π", // xe3
+    "Σ", // xe4
+    "σ", // xe5
+    "µ", // xe6
+    "τ", // xe7
+    "Φ", // xe8
+    "Θ", // xe9
+    "Ω", // xea
+    "δ", // xeb
+    "∞", // xec
+    "φ", // xed
+    "ε", // xee
+    "∩", // xef
+    "≡", // xf0
+    "±", // xf1
+    "≥", // xf2
+    "≤", // xf3
+    "⌠", // xf4
+    "⌡", // xf5
+    "÷", // xf6
+    "≈", // xf7
+    "°", // xf8
+    "∙", // xf9
+    "·", // xfa
+    "√", // xfb
+    "ⁿ", // xfc
+    "²", // xfd
+    "■", // xfe
+    "�", // xff
 };
