@@ -9,7 +9,7 @@ function descriptor()
         title = "Multicast Timecode Broadcaster",
         version = "1.0",
         author = "You",
-        url = "https://example.com",
+        url = "https://github.com/emanspeaks/zig-vorne-m1000",
         shortdesc = "Broadcasts filename + playhead over multicast",
         description = "Pushes current VLC playback status as UDP multicast JSON",
         capabilities = {}
