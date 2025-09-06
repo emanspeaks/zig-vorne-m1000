@@ -7,8 +7,8 @@ require("simplexml")  -- VLC bundles some Lua helpers
 function descriptor()
     return {
         title = "Multicast Timecode Broadcaster",
-        version = "1.0",
-        author = "You",
+        version = "1.0.1",
+        author = "Randy Eckman",
         url = "https://github.com/emanspeaks/zig-vorne-m1000",
         shortdesc = "Broadcasts filename + playhead over multicast",
         description = "Pushes current VLC playback status as UDP multicast JSON",
