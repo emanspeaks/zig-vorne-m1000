@@ -1,7 +1,20 @@
 -- multicast_vlc_status.lua
--- VLC Lua interface to broadcast current media filename + playhead via UDP multicast
+-- VLC Lua extension to broadcast current media filename + playhead via UDP multicast
 
 require("simplexml")  -- VLC bundles some Lua helpers
+
+-- Metadata so VLC knows what to do
+function descriptor()
+    return {
+        title = "Multicast Timecode Broadcaster",
+        version = "1.0.2",
+        author = "Randy Eckman",
+        url = "https://github.com/emanspeaks/zig-vorne-m1000",
+        shortdesc = "Broadcasts filename + playhead over multicast",
+        description = "Pushes current VLC playback status as UDP multicast JSON",
+        capabilities = {"input-listener"}  -- Add input listener capability
+    }
+end
 
 local mcast_addr = "239.255.0.1"
 local mcast_port = 5005
@@ -9,12 +22,33 @@ local running = false
 local last_send = 0
 local timer_id = nil
 
--- Start the interface
-function start()
-    vlc.msg.info("[multicast_time] Starting interface...")
+-- Add menu item to VLC interface
+function menu()
+    return {"Start Broadcasting", "Stop Broadcasting", "Send Test Message"}
+end
+
+-- Handle menu selections
+function trigger_menu(id)
+    if id == 1 then
+        vlc.msg.info("[multicast_time] Manual start requested")
+        if not running then
+            activate()
+        end
+    elseif id == 2 then
+        vlc.msg.info("[multicast_time] Manual stop requested")
+        deactivate()
+    elseif id == 3 then
+        vlc.msg.info("[multicast_time] Manual test requested")
+        test_multicast()
+    end
+end
+
+-- Activate when user enables extension
+function activate()
+    vlc.msg.info("[multicast_time] ACTIVATING EXTENSION...")
 
     if running then
-        vlc.msg.info("[multicast_time] Already running, skipping start")
+        vlc.msg.info("[multicast_time] Already running, skipping activation")
         return
     end
 
@@ -31,15 +65,15 @@ function start()
         return
     end
 
-    vlc.msg.info("[multicast_time] Interface started successfully!")
+    vlc.msg.info("[multicast_time] Extension activated successfully!")
 
     -- Send an initial test message
     test_multicast()
 end
 
--- Stop the interface
-function stop()
-    vlc.msg.info("[multicast_time] Stopping interface")
+-- Deactivate on exit
+function deactivate()
+    vlc.msg.info("[multicast_time] Deactivated")
     if timer_id then
         vlc.timer.unregister(timer_id)
         timer_id = nil
@@ -69,11 +103,8 @@ end
 
 -- VLC startup function
 function vlc_main()
-    vlc.msg.info("[multicast_time] VLC main called - interface loaded")
-    -- Add menu items to VLC interface
-    vlc.add_menu_item("Start Broadcasting", start)
-    vlc.add_menu_item("Stop Broadcasting", stop)
-    vlc.add_menu_item("Send Test Message", test_multicast)
+    vlc.msg.info("[multicast_time] VLC main called - extension loaded")
+    -- Don't auto-activate here, wait for user interaction or media events
 end
 
 -- Manual test function (can be called from VLC Lua console)
