@@ -23,12 +23,19 @@ local running = false
 
 -- Activate when user enables extension
 function activate()
-    msg.info("[multicast_time] Activated")
+    msg.info("[multicast_time] ACTIVATING EXTENSION...")
     udp = vlc.net.udp_socket()
+    if not udp then
+        msg.err("[multicast_time] FAILED to create UDP socket!")
+        return
+    end
     -- Set multicast TTL so packets can travel across network
     vlc.net.set_multicast_ttl(udp, 10)
+    msg.info("[multicast_time] UDP socket created, TTL set to 10")
     running = true
+    msg.info("[multicast_time] Starting timer with 250ms interval")
     vlc.timer.register(250, push_status)  -- every 250ms
+    msg.info("[multicast_time] Extension activated successfully!")
 end
 
 -- Deactivate on exit
@@ -38,22 +45,64 @@ function deactivate()
     running = false
 end
 
+-- Manual test function (can be called from VLC Lua console)
+function test_multicast()
+    msg.info("[multicast_time] MANUAL TEST: Creating test message...")
+    local test_payload = '{"test":"manual_test","time":12345,"length":67890,"state":"playing"}'
+    local result = vlc.net.sendto(udp, test_payload, mcast_addr, mcast_port)
+    if result then
+        msg.info("[multicast_time] MANUAL TEST: Sent successfully: " .. test_payload)
+    else
+        msg.err("[multicast_time] MANUAL TEST: Failed to send!")
+    end
+    return result
+end
+
 function push_status()
-    if not running then return end
+    if not running then
+        msg.dbg("[multicast_time] Not running, skipping")
+        return
+    end
+
+    msg.dbg("[multicast_time] push_status() called")
+
     local item = vlc.input.item()
-    if not item then return end
+    if not item then
+        msg.dbg("[multicast_time] No input item")
+        return
+    end
+
+    msg.dbg("[multicast_time] Got input item")
+
     local meta = item:metas()
     local name = meta["filename"] or meta["title"] or "unknown"
     local input = vlc.object.input()
-    if not input then return end
+    if not input then
+        msg.dbg("[multicast_time] No input object")
+        return
+    end
+
+    msg.dbg("[multicast_time] Got input object")
+
     local time = vlc.var.get(input, "time")
     local length = vlc.var.get(input, "length")
     local state = vlc.var.get(input, "state")
+
+    msg.dbg(string.format("[multicast_time] time=%s, length=%s, state=%s",
+        tostring(time), tostring(length), tostring(state)))
+
     local payload = string.format(
         '{"filename":"%s","time":%d,"length":%d,"state":"%s"}',
-        name, time, length, state or "unknown"
+        name, time or 0, length or 0, state or "unknown"
     )
+
+    msg.dbg("[multicast_time] Sending payload: " .. payload)
+
     -- Send directly to multicast address (don't connect first)
-    vlc.net.sendto(udp, payload, mcast_addr, mcast_port)
-    msg.dbg("[multicast_time] Sent: " .. payload)
+    local result = vlc.net.sendto(udp, payload, mcast_addr, mcast_port)
+    if result then
+        msg.info("[multicast_time] Sent successfully: " .. payload)
+    else
+        msg.err("[multicast_time] Failed to send message!")
+    end
 end
