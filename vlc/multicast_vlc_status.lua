@@ -16,7 +16,6 @@ function descriptor()
     }
 end
 
-local udp
 local mcast_addr = "239.255.0.1"
 local mcast_port = 5005
 local running = false
@@ -75,16 +74,6 @@ function activate()
         return
     end
 
-    udp = vlc.net.fd()
-    if not udp then
-        vlc.msg.err("[multicast_time] FAILED to create UDP socket!")
-        return
-    end
-
-    -- Set multicast TTL so packets can travel across network
-    vlc.net.set_multicast_ttl(udp, 10)
-    vlc.msg.info("[multicast_time] UDP socket created, TTL set to 10")
-
     running = true
     vlc.msg.info("[multicast_time] Starting timer with 250ms interval")
 
@@ -107,7 +96,6 @@ end
 -- Deactivate on exit
 function deactivate()
     vlc.msg.info("[multicast_time] Deactivated")
-    if udp then vlc.net.close(udp) end
     running = false
 end
 
@@ -115,7 +103,7 @@ end
 function test_multicast()
     vlc.msg.info("[multicast_time] MANUAL TEST: Creating test message...")
     local test_payload = '{"test":"manual_test","time":12345,"length":67890,"state":"playing"}'
-    local result = vlc.net.sendto(udp, test_payload, mcast_addr, mcast_port)
+    local result = vlc.net.sendto(test_payload, mcast_addr, mcast_port)
     if result then
         vlc.msg.info("[multicast_time] MANUAL TEST: Sent successfully: " .. test_payload)
     else
@@ -165,7 +153,7 @@ function push_status()
     vlc.msg.dbg("[multicast_time] Sending payload: " .. payload)
 
     -- Send directly to multicast address (don't connect first)
-    local result = vlc.net.sendto(udp, payload, mcast_addr, mcast_port)
+    local result = vlc.net.sendto(payload, mcast_addr, mcast_port)
     if result then
         vlc.msg.info("[multicast_time] Sent successfully: " .. payload)
     else
