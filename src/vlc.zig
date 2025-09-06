@@ -160,7 +160,7 @@ pub const VlcPlayer = struct {
 
         if (result) |bytes_read| {
             const message = buffer[0..bytes_read];
-            std.debug.print("VLC: Received {} bytes: {s}\n", .{bytes_read, message});
+            std.debug.print("VLC: Received {} bytes: {s}\n", .{ bytes_read, message });
             try self.parseMessage(message);
         } else |err| switch (err) {
             error.WouldBlock => {
