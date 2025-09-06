@@ -75,7 +75,7 @@ function activate()
         return
     end
 
-    udp = vlc.net.udp()
+    udp = vlc.net.fd()
     if not udp then
         vlc.msg.err("[multicast_time] FAILED to create UDP socket!")
         return
