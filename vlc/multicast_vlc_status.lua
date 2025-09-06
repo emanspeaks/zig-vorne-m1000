@@ -19,6 +19,7 @@ end
 local mcast_addr = "239.255.0.1"
 local mcast_port = 5005
 local running = false
+local timer_id = nil
 
 -- Add menu item to VLC interface
 function menu()
@@ -78,11 +79,11 @@ function activate()
     vlc.msg.info("[multicast_time] Starting timer with 250ms interval")
 
     -- Register the timer
-    local timer_id = vlc.timer.register(250, push_status)
+    timer_id = vlc.timer_create(250, push_status)
     if timer_id then
-        vlc.msg.info("[multicast_time] Timer registered successfully (ID: " .. tostring(timer_id) .. ")")
+        vlc.msg.info("[multicast_time] Timer created successfully (ID: " .. tostring(timer_id) .. ")")
     else
-        vlc.msg.err("[multicast_time] Failed to register timer!")
+        vlc.msg.err("[multicast_time] Failed to create timer!")
         running = false
         return
     end
@@ -96,6 +97,10 @@ end
 -- Deactivate on exit
 function deactivate()
     vlc.msg.info("[multicast_time] Deactivated")
+    if timer_id then
+        vlc.timer_destroy(timer_id)
+        timer_id = nil
+    end
     running = false
 end
 
