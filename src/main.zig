@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = std.http;
 const protocol = @import("protocol.zig");
 const serial = @import("serial.zig");
 const time = @import("time.zig");
@@ -6,6 +7,7 @@ const config = @import("config.zig");
 const clocks = @import("clocks.zig");
 const bluray = @import("bluray.zig");
 const process_mgmt = @import("process_mgmt.zig");
+const Mode = @import("mode.zig").Mode;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -37,9 +39,165 @@ pub fn main() !void {
     protocol.sendUnitDisplayCmd(allocator, port, 1, protocol.ESC ++ "E") catch |err| return err;
     std.Thread.sleep(1 * std.time.ns_per_s);
 
+    var mode = std.atomic.Value(Mode).init(.Clocks);
     if (bluray_mode) {
-        try bluray.runBlurayClocks(allocator, port);
+        mode.store(.Bluray, .release);
+    }
+
+    // Shared mode state
+
+    // Start HTTP server in a separate thread
+    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ allocator, port, &mode });
+    server_thread.detach();
+
+    // Main display loop
+    while (true) {
+        const current_mode = mode.load(.acquire);
+        if (current_mode == .Clocks) {
+            try clocks.runClocks(allocator, port, &mode);
+        } else {
+            try bluray.runBlurayClocks(allocator, port, &mode);
+        }
+    }
+}
+
+fn startHttpServer(allocator: std.mem.Allocator, port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+    const address = std.net.Address.parseIp("0.0.0.0", 80) catch unreachable;
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    std.debug.print("HTTP server listening on port 80\n", .{});
+
+    while (true) {
+        const conn = try listener.accept();
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ allocator, conn, port, mode });
+        thread.detach();
+    }
+}
+
+fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection, serial_port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+    defer conn.stream.close();
+
+    var buffer: [1024]u8 = undefined;
+    const n = try conn.stream.read(&buffer);
+    const request = buffer[0..n];
+
+    // Simple HTTP request parsing
+    var lines = std.mem.splitSequence(u8, request, "\r\n");
+    const request_line = lines.next() orelse return;
+    var parts = std.mem.splitSequence(u8, request_line, " ");
+    const method = parts.next() orelse return;
+    const path = parts.next() orelse return;
+
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+        const current_mode = mode.load(.acquire);
+        const mode_str = if (current_mode == .Clocks) "Clocks" else "Blu-Ray";
+        const html_body = std.fmt.allocPrint(allocator,
+            \\<!DOCTYPE html>
+            \\<html>
+            \\<head>
+            \\<title>Serial Display Control</title>
+            \\</head>
+            \\<body>
+            \\<h1>Serial Display Control</h1>
+            \\<p>Current Mode: {s}</p>
+            \\<form action="/mode" method="post">
+            \\<button type="submit" name="mode" value="clocks">Switch to Clocks</button>
+            \\<button type="submit" name="mode" value="bluray">Switch to Blu-Ray</button>
+            \\</form>
+            // \\<form action="/control" method="post">
+            // \\<label for="text">Display Text:</label>
+            // \\<input type="text" id="text" name="text" maxlength="100">
+            // \\<button type="submit" name="action" value="display">Display</button>
+            // \\</form>
+            \\<form action="/control" method="post">
+            // \\<button type="submit" name="action" value="flush">Flush</button>
+            \\<button type="submit" name="action" value="init">Init</button>
+            \\</form>
+            \\</body>
+            \\</html>
+        , .{mode_str}) catch return;
+        defer allocator.free(html_body);
+        const headers = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\n\r\n", .{html_body.len}) catch return;
+        defer allocator.free(headers);
+        _ = try conn.stream.write(headers);
+        _ = try conn.stream.write(html_body);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/control")) {
+        // Find the body
+        var body_start: usize = 0;
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "")) {
+                body_start = @intFromPtr(line.ptr) - @intFromPtr(request.ptr) + line.len + 2;
+                break;
+            }
+        }
+        const body = request[body_start..];
+
+        var action: []const u8 = "";
+        var text: []const u8 = "";
+
+        // Simple form parsing
+        var iter = std.mem.splitSequence(u8, body, "&");
+        while (iter.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "action=")) {
+                action = pair[7..];
+            } else if (std.mem.startsWith(u8, pair, "text=")) {
+                text = pair[5..];
+                // URL decode
+                text = std.mem.replaceOwned(u8, allocator, text, "+", " ") catch text;
+            }
+        }
+
+        if (std.mem.eql(u8, action, "display")) {
+            protocol.sendUnitDisplayCmd(allocator, serial_port, 1, text) catch |err| {
+                std.debug.print("Error sending display command: {}\n", .{err});
+            };
+            // } else if (std.mem.eql(u8, action, "flush")) {
+            //     protocol.sendUnitFlushCmd(allocator, serial_port, 1) catch |err| {
+            //         std.debug.print("Error sending flush command: {}\n", .{err});
+            //     };
+        } else if (std.mem.eql(u8, action, "init")) {
+            protocol.sendUnitDefaultInitCmd(allocator, serial_port, 1) catch |err| {
+                std.debug.print("Error sending init command: {}\n", .{err});
+            };
+        }
+
+        // Redirect back to main page
+        const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
+        _ = try conn.stream.write(response);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/mode")) {
+        // Find the body
+        var body_start: usize = 0;
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "")) {
+                body_start = @intFromPtr(line.ptr) - @intFromPtr(request.ptr) + line.len + 2;
+                break;
+            }
+        }
+        const body = request[body_start..];
+
+        var new_mode: []const u8 = "";
+
+        // Simple form parsing
+        var iter = std.mem.splitSequence(u8, body, "&");
+        while (iter.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "mode=")) {
+                new_mode = pair[5..];
+            }
+        }
+
+        try protocol.sendUnitDefaultInitCmd(allocator, serial_port, 1);
+        if (std.mem.eql(u8, new_mode, "clocks")) {
+            mode.store(.Clocks, .release);
+        } else if (std.mem.eql(u8, new_mode, "bluray")) {
+            mode.store(.Bluray, .release);
+        }
+
+        // Redirect back to main page
+        const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
+        _ = try conn.stream.write(response);
     } else {
-        try clocks.runClocks(allocator, port);
+        const response = "HTTP/1.1 404 Not Found\r\n\r\n";
+        _ = try conn.stream.write(response);
     }
 }

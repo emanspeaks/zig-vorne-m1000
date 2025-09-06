@@ -4,15 +4,16 @@
         {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Run bluray",
+            "name": "Run server",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": ["--bluray"],
+            // "args": ["--bluray"],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
             // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
             "miDebuggerArgs": "-q",
             "setupCommands": [
@@ -41,20 +42,16 @@
         {
             "type": "cppdbg",
             "request": "launch",
-            "name": "Run clocks",
+            "name": "Run server bluray",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
-            "args": [],
+            "args": ["--bluray"],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
-            // "environment": [
-            //     {
-            //         "name": "DEBUG_MODE",
-            //         "value": "1"
-            //     }
-            // ],
+            "environment": [],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
             // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
             "miDebuggerArgs": "-q",
             "setupCommands": [

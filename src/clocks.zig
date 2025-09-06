@@ -3,8 +3,9 @@ const protocol = @import("protocol.zig");
 const time = @import("time.zig");
 const config = @import("config.zig");
 const process_mgmt = @import("process_mgmt.zig");
+const Mode = @import("mode.zig").Mode;
 
-pub fn runClocks(allocator: std.mem.Allocator, port: anytype) !void {
+pub fn runClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     // Build the command string dynamically
     var cmd_parts = std.ArrayList(u8){};
     defer cmd_parts.deinit(allocator);
@@ -16,10 +17,18 @@ pub fn runClocks(allocator: std.mem.Allocator, port: anytype) !void {
     var msg1_buf: [128]u8 = undefined;
     var msg2_buf: [128]u8 = undefined;
     var line2_config: ?config.CountdownConfig = null;
+
+    last_full_update_utc = 0; // force full update on first run
     while (true) {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
             std.debug.print("Clock display received shutdown signal, exiting gracefully...\n", .{});
+            return;
+        }
+
+        // Check for mode change
+        if (mode.load(.acquire) != .Clocks) {
+            std.debug.print("Mode changed, exiting clocks mode...\n", .{});
             return;
         }
 

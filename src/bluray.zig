@@ -5,6 +5,7 @@ const time = @import("time.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
 const frame_timer = @import("frame_timer.zig");
+const Mode = @import("mode.zig").Mode;
 
 const Writer = std.Io.Writer;
 const maxbufsz = str_utils.maxbufsz;
@@ -13,7 +14,7 @@ pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 
-pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype) !void {
+pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
     // Build the command string dynamically
@@ -41,6 +42,12 @@ pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype) !void {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
             std.debug.print("Blu-Ray display received shutdown signal, exiting gracefully...\n", .{});
+            return;
+        }
+
+        // Check for mode change
+        if (mode.load(.acquire) != .Bluray) {
+            std.debug.print("Mode changed, exiting bluray mode...\n", .{});
             return;
         }
 
