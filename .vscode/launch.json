@@ -13,8 +13,7 @@
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
-            "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
-            // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
+            // "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
             "miDebuggerArgs": "-q",
             "setupCommands": [
                 {
@@ -51,8 +50,7 @@
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
-            "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
-            // "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
+            // "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
             "miDebuggerArgs": "-q",
             "setupCommands": [
                 {

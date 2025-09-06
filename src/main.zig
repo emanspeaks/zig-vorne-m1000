@@ -6,6 +6,7 @@ const time = @import("time.zig");
 const config = @import("config.zig");
 const clocks = @import("clocks.zig");
 const bluray = @import("bluray.zig");
+const vlc = @import("vlc.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const Mode = @import("mode.zig").Mode;
 
@@ -18,13 +19,16 @@ pub fn main() !void {
     defer process_mgmt.cleanup();
 
     // Parse command-line arguments for optional modes
-    var bluray_mode = false;
+    var bluray_flag = false;
+    var vlc_flag = false;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
     if (args.len > 1) {
         for (args[1..]) |arg| {
             if (std.mem.eql(u8, arg, "--bluray")) {
-                bluray_mode = true;
+                bluray_flag = true;
+            } else if (std.mem.eql(u8, arg, "--vlc")) {
+                vlc_flag = true;
             }
         }
     }
@@ -40,8 +44,10 @@ pub fn main() !void {
     std.Thread.sleep(1 * std.time.ns_per_s);
 
     var mode = std.atomic.Value(Mode).init(.Clocks);
-    if (bluray_mode) {
+    if (bluray_flag) {
         mode.store(.Bluray, .release);
+    } else if (vlc_flag) {
+        mode.store(.Vlc, .release);
     }
 
     // Shared mode state
@@ -52,21 +58,29 @@ pub fn main() !void {
 
     // Main display loop
     while (true) {
+        // Check for shutdown signal
+        if (process_mgmt.shouldShutdown()) {
+            std.debug.print("Main loop received shutdown signal, exiting gracefully...\n", .{});
+            return;
+        }
+
         const current_mode = mode.load(.acquire);
         if (current_mode == .Clocks) {
             try clocks.runClocks(allocator, port, &mode);
-        } else {
+        } else if (current_mode == .Bluray) {
             try bluray.runBlurayClocks(allocator, port, &mode);
+        } else if (current_mode == .Vlc) {
+            try vlc.runVlcClocks(allocator, port, &mode);
         }
     }
 }
 
 fn startHttpServer(allocator: std.mem.Allocator, port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
-    const address = std.net.Address.parseIp("0.0.0.0", 80) catch unreachable;
+    const address = std.net.Address.parseIp("0.0.0.0", 8080) catch unreachable;
     var listener = try address.listen(.{ .reuse_address = true });
     defer listener.deinit();
 
-    std.debug.print("HTTP server listening on port 80\n", .{});
+    std.debug.print("HTTP server listening on port 8080\n", .{});
 
     while (true) {
         const conn = try listener.accept();
@@ -91,7 +105,11 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
         const current_mode = mode.load(.acquire);
-        const mode_str = if (current_mode == .Clocks) "Clocks" else "Blu-Ray";
+        const mode_str = switch (current_mode) {
+            .Clocks => "Clocks",
+            .Bluray => "Blu-Ray",
+            .Vlc => "VLC",
+        };
         const html_body = std.fmt.allocPrint(allocator,
             \\<!DOCTYPE html>
             \\<html>
@@ -104,6 +122,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
             \\<form action="/mode" method="post">
             \\<button type="submit" name="mode" value="clocks">Switch to Clocks</button>
             \\<button type="submit" name="mode" value="bluray">Switch to Blu-Ray</button>
+            \\<button type="submit" name="mode" value="vlc">Switch to VLC</button>
             \\</form>
             // \\<form action="/control" method="post">
             // \\<label for="text">Display Text:</label>
@@ -191,6 +210,8 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
             mode.store(.Clocks, .release);
         } else if (std.mem.eql(u8, new_mode, "bluray")) {
             mode.store(.Bluray, .release);
+        } else if (std.mem.eql(u8, new_mode, "vlc")) {
+            mode.store(.Vlc, .release);
         }
 
         // Redirect back to main page

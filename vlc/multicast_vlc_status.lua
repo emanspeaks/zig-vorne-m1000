@@ -25,7 +25,8 @@ local running = false
 function activate()
     msg.info("[multicast_time] Activated")
     udp = vlc.net.udp_socket()
-    vlc.net.connect_udp(udp, mcast_addr, mcast_port)
+    -- Set multicast TTL so packets can travel across network
+    vlc.net.set_multicast_ttl(udp, 10)
     running = true
     vlc.timer.register(250, push_status)  -- every 250ms
 end
@@ -52,5 +53,7 @@ function push_status()
         '{"filename":"%s","time":%d,"length":%d,"state":"%s"}',
         name, time, length, state or "unknown"
     )
-    vlc.net.send(udp, payload)
+    -- Send directly to multicast address (don't connect first)
+    vlc.net.sendto(udp, payload, mcast_addr, mcast_port)
+    msg.dbg("[multicast_time] Sent: " .. payload)
 end
