@@ -25,8 +25,9 @@ target_compile_options(vlc_status_server PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(vlc_status_server PRIVATE
     _WIN32_WINNT=0x0601
     WIN32_LEAN_AND_MEAN
+    _GNU_SOURCE
 )
-target_link_libraries(vlc_status_server ws2_32)
+target_link_libraries(vlc_status_server ws2_32 m)
 
 # Set output directory
 set_target_properties(vlc_status_server PROPERTIES
