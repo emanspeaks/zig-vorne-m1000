@@ -27,7 +27,7 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
     var filename: []const u8 = "No media";
 
     // Initialize frame timer for real-time operation
-    var timer = frame_timer.FrameTimer.init(1.0); // 1 FPS target
+    var timer = frame_timer.FrameTimer.init(2.0); // 2 FPS target
 
     // Initialize VLC player
     var player = VlcPlayer.init(allocator);
@@ -122,6 +122,7 @@ pub const VlcPlayer = struct {
     state: VlcPlayerState,
     socket: ?std.posix.socket_t,
     last_update_time: i64,
+    last_processed_ts: i64,
 
     const Self = @This();
     const MULTICAST_ADDR = "239.255.0.100";
@@ -134,6 +135,7 @@ pub const VlcPlayer = struct {
             .state = VlcPlayerState.init(allocator),
             .socket = null,
             .last_update_time = 0,
+            .last_processed_ts = 0,
         };
     }
 
@@ -151,26 +153,117 @@ pub const VlcPlayer = struct {
             try self.connectMulticast();
         }
 
-        // Try to receive a message with timeout
-        var buffer: [1024]u8 = undefined;
-        var addr: std.net.Address = undefined;
-        var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+        // Receive all available messages, keeping only the latest
+        var latest_message: ?[]const u8 = null;
+        var latest_server_ts: ?[]const u8 = null;
+        var latest_bytes: usize = 0;
 
-        const result = std.posix.recvfrom(self.socket.?, &buffer, 0, &addr.any, &addr_len);
+        while (true) {
+            var buffer: [1024]u8 = undefined;
+            var addr: std.net.Address = undefined;
+            var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
 
-        if (result) |bytes_read| {
-            const message = buffer[0..bytes_read];
-            std.debug.print("VLC: Received {} bytes: {s}\n", .{ bytes_read, message });
-            try self.parseMessage(message);
-        } else |err| switch (err) {
-            error.WouldBlock => {
-                // No message received, keep current state
+            const result = std.posix.recvfrom(self.socket.?, &buffer, 0, &addr.any, &addr_len);
+
+            if (result) |bytes_read| {
+                const message = self.allocator.dupe(u8, buffer[0..bytes_read]) catch {
+                    std.debug.print("VLC: Failed to allocate memory for message\n", .{});
+                    continue;
+                };
+
+                // Parse server_timestamp to compare
+                var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
+                    std.debug.print("VLC: JSON parse error\n", .{});
+                    self.allocator.free(message);
+                    continue;
+                };
+                defer json.deinit();
+
+                var server_ts: ?[]const u8 = null;
+                if (json.value == .object) {
+                    const obj = &json.value.object;
+                    if (obj.get("server_timestamp")) |ts_val| {
+                        if (ts_val == .string) {
+                            server_ts = ts_val.string;
+                        }
+                    }
+                }
+
+                // Keep the latest message
+                if (latest_message) |old_msg| {
+                    self.allocator.free(old_msg);
+                }
+                latest_message = message;
+                latest_server_ts = server_ts;
+                latest_bytes = bytes_read;
+            } else |err| switch (err) {
+                error.WouldBlock => {
+                    // No more messages
+                    break;
+                },
+                else => {
+                    std.debug.print("VLC: Socket error: {}\n", .{err});
+                    if (latest_message) |msg| self.allocator.free(msg);
+                    return err;
+                },
+            }
+        }
+
+        // Process the latest message if any
+        if (latest_message) |message| {
+            defer self.allocator.free(message);
+
+            // Parse and process the latest message
+            var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
+                std.debug.print("VLC: JSON parse error\n", .{});
                 return;
-            },
-            else => {
-                std.debug.print("VLC: Socket error: {}\n", .{err});
-                return err;
-            },
+            };
+            defer json.deinit();
+
+            var server_ts: ?[]const u8 = null;
+            if (json.value == .object) {
+                const obj = &json.value.object;
+                if (obj.get("server_timestamp")) |ts_val| {
+                    if (ts_val == .string) {
+                        server_ts = ts_val.string;
+                    }
+                }
+            }
+
+            var delta_sec: ?i64 = null;
+            if (server_ts) |ts| {
+                // Parse timestamp string: "YYYY-MM-DD HH:MM:SS"
+                const year = try std.fmt.parseInt(u16, ts[0..4], 10);
+                const month = try std.fmt.parseInt(u8, ts[5..7], 10);
+                const day = try std.fmt.parseInt(u8, ts[8..10], 10);
+                const hour = try std.fmt.parseInt(u8, ts[11..13], 10);
+                const min = try std.fmt.parseInt(u8, ts[14..16], 10);
+                const sec = try std.fmt.parseInt(u8, ts[17..19], 10);
+                const server_epoch_local = time.ymdhmsToTimestamp(time.Ymdhms{
+                    .year = year,
+                    .month = month,
+                    .day = day,
+                    .hour = hour,
+                    .minute = min,
+                    .second = sec,
+                });
+                // Server time is in local timezone, get dynamic offset to UTC
+                const zi = time.getTimezoneInfo();
+                const tz_offset_sec = zi.offset_sec;
+                const server_epoch_utc = server_epoch_local - tz_offset_sec;
+                const now_epoch = std.time.timestamp();
+
+                // Discard if message is older than last processed
+                if (server_epoch_utc <= self.last_processed_ts) {
+                    std.debug.print("VLC: Discarding old message (server_ts: {}, last_processed: {})\n", .{ server_epoch_utc, self.last_processed_ts });
+                    return;
+                }
+
+                delta_sec = now_epoch - server_epoch_utc;
+                self.last_processed_ts = server_epoch_utc;
+            }
+            std.debug.print("VLC: Received {} bytes. Server ts: {s}, Local ts: {}, Delta: {any} sec\n", .{ latest_bytes, server_ts orelse "(none)", std.time.timestamp(), delta_sec });
+            try self.parseMessage(message);
         }
     }
 

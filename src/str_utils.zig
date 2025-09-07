@@ -31,9 +31,9 @@ pub fn strlensz(s: []const u8) ![2]usize {
     var j: usize = 0;
     for (s) |c| {
         if (c == 0) break;
-        j += 1;
+        j += 1; // bytes
         if (c == DLE) continue;
-        i += 1;
+        i += 1; // char
     }
     return .{ i, j };
 }
@@ -50,7 +50,12 @@ pub fn copyLeftJustify(dest: *[maxbufsz]u8, src: []const u8, maxlen: ?usize, off
     const destendidx = idxChar2Str(dest, charoffset + copycharlen) catch unreachable;
 
     const startidx = idxChar2Str(dest, charoffset) catch unreachable;
-    const endidx = startidx + srclensz[1];
+    // const endidx = startidx + srclensz[1];
+    var srcendidx = srclensz[1];
+    if (srclensz[0] > bufcharlen) {
+        srcendidx = idxChar2Str(src, copycharlen) catch unreachable;
+    }
+    const endidx = startidx + srcendidx;
 
     const remchar = bufcharlen - copycharlen;
     const remendidx = endidx + remchar;
@@ -65,7 +70,7 @@ pub fn copyLeftJustify(dest: *[maxbufsz]u8, src: []const u8, maxlen: ?usize, off
                 @memset(dest[newendidx..maxbufsz], 0);
             }
         }
-        @memcpy(dest[startidx..endidx], src[0..srclensz[1]]);
+        @memcpy(dest[startidx..endidx], src[0..srcendidx]);
         if (remchar > 0) {
             @memset(dest[endidx..remendidx], ' ');
         }
@@ -95,7 +100,12 @@ pub fn copyRightJustify(dest: *[maxbufsz]u8, src: []const u8, maxlen: ?usize, of
     const destendidx = idxChar2Str(dest, endcharidx) catch unreachable;
 
     const startidx = remstartidx + remchar;
-    const endidx = startidx + srclensz[1];
+    // const endidx = startidx + srclensz[1];
+    var srcendidx = srclensz[1];
+    if (srclensz[0] > bufcharlen) {
+        srcendidx = idxChar2Str(src, copycharlen) catch unreachable;
+    }
+    const endidx = startidx + srcendidx;
 
     if (copycharlen > 0) {
         // move contents of the rest of the line after the buffer in case the
@@ -107,7 +117,7 @@ pub fn copyRightJustify(dest: *[maxbufsz]u8, src: []const u8, maxlen: ?usize, of
                 @memset(dest[newendidx..maxbufsz], 0);
             }
         }
-        @memcpy(dest[startidx..endidx], src[0..srclensz[1]]);
+        @memcpy(dest[startidx..endidx], src[0..srcendidx]);
         if (remchar > 0) {
             @memset(dest[remstartidx..startidx], ' ');
         }

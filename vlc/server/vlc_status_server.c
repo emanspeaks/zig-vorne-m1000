@@ -99,8 +99,13 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Server started successfully\n");
-    printf("Querying VLC at http://%s:%d\n", VLC_HTTP_HOST, VLC_HTTP_PORT);
-    printf("Broadcasting to %s:%d\n", MULTICAST_GROUP, MULTICAST_PORT);
+    // Get current timestamp
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    printf("[%s] Querying VLC at http://%s:%d\n", time_str, VLC_HTTP_HOST, VLC_HTTP_PORT);
+    printf("[%s] Broadcasting to %s:%d\n", time_str, MULTICAST_GROUP, MULTICAST_PORT);
 
     vlc_status_t current_status = {0};
     vlc_status_t last_status = {0};
@@ -125,7 +130,14 @@ int main(int argc, char *argv[]) {
                         }
                         // Send via multicast
                         if (send_multicast_data(multicast_sock, json_message)) {
-                            printf("Status broadcast: %s - %s\n",
+                            // Get current timestamp for broadcast message
+                            time_t now = time(NULL);
+                            struct tm *tm_info = localtime(&now);
+                            char time_str[32];
+                            strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+
+                            printf("[%s] Status broadcast: %s - %s\n",
+                                   time_str,
                                    current_status.is_playing ? "Playing" : "Stopped",
                                    current_status.title[0] ? current_status.title : "Unknown");
                             if (debug_mode) {
@@ -153,7 +165,13 @@ int main(int argc, char *argv[]) {
                 }
 
                 memcpy(&last_status, &current_status, sizeof(vlc_status_t));
-                printf("VLC not responding - sent stopped status\n");
+                // Get current timestamp for broadcast message
+                time_t now = time(NULL);
+                struct tm *tm_info = localtime(&now);
+                char time_str[32];
+                strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+
+                printf("[%s] VLC not responding - sent stopped status\n", time_str);
                 if (debug_mode) {
                     printf("[DEBUG] VLC not responding, sent stopped status\n");
                 }
