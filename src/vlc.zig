@@ -14,6 +14,23 @@ pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 
+// Check if VLC debug mode is enabled via environment variable
+fn isVlcDebugEnabled() bool {
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "DEBUG_VLC")) |value| {
+        defer std.heap.page_allocator.free(value);
+        return std.mem.eql(u8, value, "1");
+    } else |_| {
+        return false;
+    }
+}
+
+// Debug print function that only prints if DEBUG_VLC=1
+fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    if (isVlcDebugEnabled()) {
+        std.debug.print(fmt, args);
+    }
+}
+
 pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     std.debug.print("Starting VLC run mode...\n", .{});
 
@@ -252,12 +269,12 @@ pub const VlcPlayer = struct {
                 delta_ms = now_ms - ts_ms;
                 // Discard if message is older than last processed
                 if (ts_ms <= self.last_processed_ts) {
-                    std.debug.print("VLC: Discarding old message (server_ts: {}, last_processed: {})\n", .{ ts_ms, self.last_processed_ts });
+                    debugPrint("VLC: Discarding old message (server_ts: {}, last_processed: {})\n", .{ ts_ms, self.last_processed_ts });
                     return;
                 }
                 self.last_processed_ts = @intCast(ts_ms);
             }
-            std.debug.print("VLC: Received {} bytes. Server ts: {any}, Local ts: {}, Delta: {any} ms\n", .{ latest_bytes, latest_server_ts_ms, now_ms, delta_ms });
+            debugPrint("VLC: Received {} bytes. Server ts: {any}, Local ts: {}, Delta: {any} ms\n", .{ latest_bytes, latest_server_ts_ms, now_ms, delta_ms });
             try self.parseMessage(message);
             if (server_ts_ms) |ts_ms| {
                 self.last_message_time = @intCast(ts_ms);
@@ -267,7 +284,7 @@ pub const VlcPlayer = struct {
 
     /// Connect to multicast group
     fn connectMulticast(self: *Self) !void {
-        std.debug.print("VLC: Creating UDP socket...\n", .{});
+        std.debug.print("Creating UDP socket for VLC status multicast...\n", .{});
 
         // Create UDP socket
         self.socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, 0);
@@ -311,7 +328,7 @@ pub const VlcPlayer = struct {
 
     /// Parse JSON message from VLC extension
     fn parseMessage(self: *Self, message: []const u8) !void {
-        std.debug.print("VLC: Parsing message: {s}\n", .{message});
+        debugPrint("VLC: Parsing message: {s}\n", .{message});
 
         // Parse the new JSON format from C server: {"server_timestamp":<ms>,"server_id":"...","vlc_data":{...}}
         var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
@@ -344,19 +361,10 @@ pub const VlcPlayer = struct {
         if (data_obj.get("filename")) |filename_val| {
             if (filename_val == .string) {
                 const new_filename = filename_val.string;
-                std.debug.print("VLC: Parsed filename: {s}\n", .{new_filename});
+                debugPrint("VLC: Parsed filename: {s}\n", .{new_filename});
                 // Free old filename and allocate new one
                 self.allocator.free(self.state.filename);
                 self.state.filename = try self.allocator.dupe(u8, new_filename);
-            }
-        }
-
-        // Parse time (in milliseconds)
-        if (data_obj.get("time")) |time_val| {
-            if (time_val == .integer) {
-                self.state.play_time_ms = @intCast(time_val.integer);
-                self.last_vlc_time = @intCast(time_val.integer);
-                std.debug.print("VLC: Parsed time: {} ms\n", .{time_val.integer});
             }
         }
 
@@ -364,14 +372,23 @@ pub const VlcPlayer = struct {
         if (data_obj.get("duration")) |duration_val| {
             if (duration_val == .integer) {
                 self.state.length_ms = @intCast(duration_val.integer);
-                std.debug.print("VLC: Parsed duration: {} ms\n", .{duration_val.integer});
+                debugPrint("VLC: Parsed duration: {} ms\n", .{duration_val.integer});
+            }
+        }
+
+        // Parse time (in milliseconds) - now the primary source of timing
+        if (data_obj.get("time")) |time_val| {
+            if (time_val == .integer) {
+                self.state.play_time_ms = @intCast(time_val.integer);
+                self.last_vlc_time = @intCast(time_val.integer);
+                debugPrint("VLC: Parsed time: {} ms\n", .{time_val.integer});
             }
         }
 
         // Parse playing state
         if (data_obj.get("is_playing")) |playing_val| {
             if (playing_val == .bool) {
-                std.debug.print("VLC: Parsed is_playing: {}\n", .{playing_val.bool});
+                debugPrint("VLC: Parsed is_playing: {}\n", .{playing_val.bool});
                 if (playing_val.bool) {
                     self.state.run_status = .Playing;
                 } else {
@@ -381,7 +398,7 @@ pub const VlcPlayer = struct {
             }
         }
 
-        std.debug.print("VLC: State updated successfully\n", .{});
+        debugPrint("VLC: State updated successfully\n", .{});
     }
 
     /// Get the current player state (for debugging/monitoring)

@@ -1,24 +1,16 @@
 @echo off
 REM VLC Status Broadcaster Launcher
-REM Starts VLC with HTTP interface and the status server
+REM Starts VLC with RC interface and the status server
 
-REM Default password (can be overridden by command line argument)
-set "PASSWORD=vlcstatus"
+REM Default settings
 set "DEBUG=0"
 
-REM Check if password was provided as command line argument
-if "%~1" NEQ "" (
-    set "PASSWORD=%~1"
-)
-
 REM Check for debug flag in command line arguments
-if /I "%~2"=="debug" set "DEBUG=1"
 if /I "%~1"=="debug" set "DEBUG=1"
 
 echo VLC Status Broadcaster Launcher
 echo ================================
-echo Password: %PASSWORD%
-echo VLC HTTP: http://127.0.0.1:8080
+echo VLC RC: 127.0.0.1:4212
 echo Multicast: 239.255.0.100:8888
 echo ================================
 echo.
@@ -41,29 +33,29 @@ if not exist "%SERVER_EXE%" (
     exit /b 1
 )
 
-echo Starting VLC with HTTP interface...
+echo Starting VLC with RC interface...
 start "VLC Media Player" "%VLC_EXE%" ^
-    --extraintf=http ^
-    --http-password=%PASSWORD%
-    @REM --no-http-acl
+    --extraintf=rc ^
+    --rc-host=127.0.0.1 ^
+    --rc-port=4212
 
-echo Waiting 1 second for VLC to start...
-timeout /t 1 /nobreak >nul
+echo Waiting 2 seconds for VLC to start...
+timeout /t 2 /nobreak >nul
 
 echo Starting VLC Status Server...
 if "%DEBUG%"=="1" (
     echo Debug mode enabled: passing --debug to server
-    start "VLC Status Server" "%SERVER_EXE%" "%PASSWORD%" --debug
+    start "VLC Status Server" "%SERVER_EXE%" --debug
 ) else (
-    start "VLC Status Server" "%SERVER_EXE%" "%PASSWORD%"
+    start "VLC Status Server" "%SERVER_EXE%"
 )
 
 echo.
 echo VLC Status Broadcaster is now running!
 echo.
-echo - VLC is running with HTTP interface at http://127.0.0.1:8080
+echo - VLC is running with RC interface at 127.0.0.1:4212
 echo - Status server is broadcasting to UDP multicast 239.255.0.100:8888
-echo - Use password '%PASSWORD%' to access VLC's web interface
+echo - No authentication required for RC interface
 echo.
 echo Press any key to stop both VLC and the status server...
 pause >nul

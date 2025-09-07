@@ -46,7 +46,9 @@
             "args": ["--vlc"],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
-            "environment": [],
+            "environment": [
+                {"name": "DEBUG_VLC", "value": "1"}
+            ],
             "externalConsole": false,
             "preLaunchTask": "zig build",
             "MIMode": "gdb",
