@@ -124,8 +124,8 @@ pub const VlcPlayer = struct {
     last_update_time: i64,
 
     const Self = @This();
-    const MULTICAST_ADDR = "239.255.0.1";
-    const MULTICAST_PORT = 5005;
+    const MULTICAST_ADDR = "239.255.0.100";
+    const MULTICAST_PORT = 8888;
 
     /// Initialize a new VlcPlayer instance
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -222,47 +222,74 @@ pub const VlcPlayer = struct {
     fn parseMessage(self: *Self, message: []const u8) !void {
         std.debug.print("VLC: Parsing message: {s}\n", .{message});
 
-        // Simple JSON parsing for the expected format: {"filename":"name","time":123,"length":456,"state":"playing"}
-        var json = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
+        // Parse the new JSON format from C server: {"server_timestamp":"...","server_id":"...","vlc_data":{...}}
+        var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
+            std.debug.print("VLC: JSON parse error\n", .{});
+            return;
+        };
         defer json.deinit();
+
+        if (json.value != .object) {
+            std.debug.print("VLC: Root is not an object\n", .{});
+            return;
+        }
 
         const obj = &json.value.object;
 
+        // Get the vlc_data object
+        const vlc_data = obj.get("vlc_data") orelse {
+            std.debug.print("VLC: No vlc_data found in message\n", .{});
+            return;
+        };
+
+        if (vlc_data != .object) {
+            std.debug.print("VLC: vlc_data is not an object\n", .{});
+            return;
+        }
+
+        const data_obj = &vlc_data.object;
+
         // Parse filename
-        if (obj.get("filename")) |filename_val| {
-            const new_filename = filename_val.string;
-            std.debug.print("VLC: Parsed filename\n", .{});
-            // Free old filename and allocate new one
-            self.allocator.free(self.state.filename);
-            self.state.filename = try self.allocator.dupe(u8, new_filename);
-        }
-
-        // Parse time
-        if (obj.get("time")) |time_val| {
-            self.state.play_time_seconds = @intCast(time_val.integer);
-            std.debug.print("VLC: Parsed time\n", .{});
-        }
-
-        // Parse length
-        if (obj.get("length")) |length_val| {
-            self.state.length_seconds = @intCast(length_val.integer);
-            std.debug.print("VLC: Parsed length\n", .{});
-        }
-
-        // Parse state
-        if (obj.get("state")) |state_val| {
-            const state_str = state_val.string;
-            std.debug.print("VLC: Parsed state\n", .{});
-            if (std.mem.eql(u8, state_str, "playing")) {
-                self.state.run_status = .Playing;
-            } else if (std.mem.eql(u8, state_str, "paused")) {
-                self.state.run_status = .Paused;
-            } else {
-                self.state.run_status = .Stopped;
+        if (data_obj.get("filename")) |filename_val| {
+            if (filename_val == .string) {
+                const new_filename = filename_val.string;
+                std.debug.print("VLC: Parsed filename: {s}\n", .{new_filename});
+                // Free old filename and allocate new one
+                self.allocator.free(self.state.filename);
+                self.state.filename = try self.allocator.dupe(u8, new_filename);
             }
         }
 
-        std.debug.print("VLC: State updated\n", .{});
+        // Parse time (in milliseconds, convert to seconds)
+        if (data_obj.get("time")) |time_val| {
+            if (time_val == .integer) {
+                self.state.play_time_seconds = @intCast(@divTrunc(time_val.integer, 1000));
+                std.debug.print("VLC: Parsed time: {} ms ({} s)\n", .{ time_val.integer, self.state.play_time_seconds });
+            }
+        }
+
+        // Parse duration (in milliseconds, convert to seconds)
+        if (data_obj.get("duration")) |duration_val| {
+            if (duration_val == .integer) {
+                self.state.length_seconds = @intCast(@divTrunc(duration_val.integer, 1000));
+                std.debug.print("VLC: Parsed duration: {} ms ({} s)\n", .{ duration_val.integer, self.state.length_seconds });
+            }
+        }
+
+        // Parse playing state
+        if (data_obj.get("is_playing")) |playing_val| {
+            if (playing_val == .bool) {
+                std.debug.print("VLC: Parsed is_playing: {}\n", .{playing_val.bool});
+                if (playing_val.bool) {
+                    self.state.run_status = .Playing;
+                } else {
+                    // Could be paused or stopped, we'll assume paused for now
+                    self.state.run_status = .Paused;
+                }
+            }
+        }
+
+        std.debug.print("VLC: State updated successfully\n", .{});
     }
 
     /// Get the current player state (for debugging/monitoring)

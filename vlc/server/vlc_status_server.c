@@ -7,9 +7,6 @@
 #include <ws2tcpip.h>
 #include <stdint.h>
 
-// Windows-specific headers
-#pragma comment(lib, "ws2_32.lib")
-
 #define VLC_HTTP_HOST "127.0.0.1"
 #define VLC_HTTP_PORT 8080
 #define MULTICAST_GROUP "239.255.0.100"
@@ -400,22 +397,49 @@ int parse_vlc_status(const char *json, vlc_status_t *status) {
         }
     }
 
-    // Extract position
+    // Extract position (0-1 scalar)
     char *position = strstr(json_copy, "\"position\":");
     if (position) {
         sscanf(position + 11, "%lf", &status->position);
     }
 
-    // Extract time
+    // Extract time (current time in seconds)
     char *time_field = strstr(json_copy, "\"time\":");
     if (time_field) {
-        sscanf(time_field + 7, "%lld", &status->time);
+        double time_seconds;
+        if (sscanf(time_field + 7, "%lf", &time_seconds) == 1) {
+            status->time = (long long)(time_seconds * 1000); // Convert to milliseconds
+        }
     }
 
-    // Extract duration
+    // Extract duration (length in seconds)
     char *duration = strstr(json_copy, "\"length\":");
     if (duration) {
-        sscanf(duration + 9, "%lld", &status->duration);
+        double duration_seconds;
+        if (sscanf(duration + 9, "%lf", &duration_seconds) == 1) {
+            status->duration = (long long)(duration_seconds * 1000); // Convert to milliseconds
+        }
+    }
+
+    // Calculate more precise duration if possible
+    // If we have both time and position, we can get a more precise duration
+    if (status->time > 0 && status->position > 0.0) {
+        long long calculated_duration = (long long)(status->time / status->position);
+        // Use the calculated duration if it's significantly different (more precise)
+        if (llabs(calculated_duration - status->duration) > 100) { // More than 100ms difference
+            status->duration = calculated_duration;
+        }
+    }
+
+    // Extract state (playing, paused, stopped)
+    char *state_str = strstr(json_copy, "\"state\":\"");
+    if (state_str) {
+        state_str += 9;
+        char *end = strchr(state_str, '"');
+        if (end) {
+            *end = '\0';
+            status->is_playing = strcmp(state_str, "playing") == 0;
+        }
     }
 
     // Extract rate
@@ -424,25 +448,42 @@ int parse_vlc_status(const char *json, vlc_status_t *status) {
         sscanf(rate + 7, "%lf", &status->rate);
     }
 
-    // Extract title
-    char *title = strstr(json_copy, "\"title\":\"");
-    if (title) {
-        title += 9;
-        char *end = strchr(title, '"');
+    // Extract filename from metadata
+    char *filename_meta = strstr(json_copy, "\"filename\":\"");
+    if (filename_meta) {
+        filename_meta += 12;
+        char *end = strchr(filename_meta, '"');
         if (end) {
             *end = '\0';
-            strncpy(status->title, title, sizeof(status->title) - 1);
+            strncpy(status->filename, filename_meta, sizeof(status->filename) - 1);
         }
     }
 
-    // Extract filename
-    char *filename = strstr(json_copy, "\"filename\":\"");
-    if (filename) {
-        filename += 12;
-        char *end = strchr(filename, '"');
-        if (end) {
-            *end = '\0';
-            strncpy(status->filename, filename, sizeof(status->filename) - 1);
+    // Extract title from information section (more reliable than top-level title)
+    char *info_title = strstr(json_copy, "\"information\":{");
+    if (info_title) {
+        char *title_in_info = strstr(info_title, "\"title\":");
+        if (title_in_info && title_in_info < strstr(info_title, "},\"")) {
+            int title_num;
+            if (sscanf(title_in_info + 8, "%d", &title_num) == 1) {
+                // Title is a number, not a string - skip for now
+            }
+        }
+    }
+
+    // If we don't have a good title, try to extract from filename
+    if (strlen(status->title) == 0 && strlen(status->filename) > 0) {
+        // Simple filename to title conversion (remove extension)
+        char *dot = strrchr(status->filename, '.');
+        if (dot) {
+            size_t title_len = dot - status->filename;
+            if (title_len < sizeof(status->title)) {
+                strncpy(status->title, status->filename, title_len);
+                status->title[title_len] = '\0';
+            }
+        } else {
+            strncpy(status->title, status->filename, sizeof(status->title) - 1);
+            status->title[sizeof(status->title) - 1] = '\0';
         }
     }
 
@@ -506,13 +547,11 @@ char *create_status_json(const vlc_status_t *status) {
 void print_status(const vlc_status_t *status) {
     printf("VLC Status:\n");
     printf("  Playing: %s\n", status->is_playing ? "Yes" : "No");
-    printf("  Position: %.3f\n", status->position);
-    printf("  Time: %lld ms\n", status->time);
-    printf("  Duration: %lld ms\n", status->duration);
+    printf("  Position: %.6f (%.2f%%)\n", status->position, status->position * 100.0);
+    printf("  Time: %lld ms (%.2f sec)\n", status->time, status->time / 1000.0);
+    printf("  Duration: %lld ms (%.2f sec)\n", status->duration, status->duration / 1000.0);
     printf("  Rate: %.2f\n", status->rate);
     printf("  Title: %s\n", status->title);
-    printf("  Artist: %s\n", status->artist);
-    printf("  Album: %s\n", status->album);
     printf("  Filename: %s\n", status->filename);
 }
 
