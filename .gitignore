@@ -1,3 +1,10 @@
 /zig-out/
 /.zig-cache/
 ~$*
+/.vscode/settings.json
+build/
+!vlc/server/build/
+vlc/server/build/*
+!vlc/server/build/bin/
+vlc/server/build/bin/*
+!/vlc/server/build/bin/vlc_status_server.exe
