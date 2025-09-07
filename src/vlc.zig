@@ -23,11 +23,11 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
 
     var playtime_buf: [maxbufsz]u8 = undefined;
     var linebuf: [maxbufsz]u8 = undefined;
-    var playtime: u32 = 0;
+    var playtime_ms: u64 = 0;
     var filename: []const u8 = "No media";
 
     // Initialize frame timer for real-time operation
-    var timer = frame_timer.FrameTimer.init(2.0); // 2 FPS target
+    var timer = frame_timer.FrameTimer.init(5.0); // 5 FPS target to match server
 
     // Initialize VLC player
     var player = VlcPlayer.init(allocator);
@@ -61,10 +61,21 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
             std.debug.print("Failed to update VLC state: {}\n", .{err});
         };
 
-        playtime = player.state.play_time_seconds;
+        // Interpolate play time if playing
+        if (player.state.run_status == .Playing and player.last_message_time > 0) {
+            const now = std.time.milliTimestamp();
+            const last_msg_i64: i64 = @intCast(player.last_message_time);
+            const elapsed = now - last_msg_i64;
+            const elapsed_u: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
+            player.state.play_time_ms = player.last_vlc_time + elapsed_u;
+        }
+
+        playtime_ms = player.state.play_time_ms;
         filename = player.state.filename;
 
-        const playtime_hms = time.timedeltaToHms(playtime);
+        const playtime_sec = @divFloor(playtime_ms, 1000);
+        const playtime_sec_i64: i64 = @intCast(playtime_sec);
+        const playtime_hms = time.timedeltaToHms(playtime_sec_i64);
         const playtime_str = time.formatHms(playtime_hms, &playtime_buf) catch unreachable;
         const runstatus_str = switch (player.state.run_status) {
             .Stopped => STOPCHAR,
@@ -98,17 +109,17 @@ pub const VlcPlayerRunStatus = enum {
 };
 
 pub const VlcPlayerState = struct {
-    play_time_seconds: u32,
+    play_time_ms: u64,
     run_status: VlcPlayerRunStatus,
     filename: []const u8,
-    length_seconds: u32,
+    length_ms: u64,
 
     pub fn init(allocator: std.mem.Allocator) VlcPlayerState {
         return VlcPlayerState{
-            .play_time_seconds = 0,
+            .play_time_ms = 0,
             .run_status = .Stopped,
             .filename = std.fmt.allocPrint(allocator, "No media", .{}) catch unreachable,
-            .length_seconds = 0,
+            .length_ms = 0,
         };
     }
 
@@ -122,7 +133,9 @@ pub const VlcPlayer = struct {
     state: VlcPlayerState,
     socket: ?std.posix.socket_t,
     last_update_time: i64,
-    last_processed_ts: i64,
+    last_processed_ts: u64,
+    last_vlc_time: u64,
+    last_message_time: u64,
 
     const Self = @This();
     const MULTICAST_ADDR = "239.255.0.100";
@@ -136,6 +149,8 @@ pub const VlcPlayer = struct {
             .socket = null,
             .last_update_time = 0,
             .last_processed_ts = 0,
+            .last_vlc_time = 0,
+            .last_message_time = 0,
         };
     }
 
@@ -213,6 +228,8 @@ pub const VlcPlayer = struct {
         if (latest_message) |message| {
             defer self.allocator.free(message);
 
+            const now_ms = std.time.milliTimestamp();
+
             // Parse and process the latest message
             var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
                 std.debug.print("VLC: JSON parse error\n", .{});
@@ -230,22 +247,21 @@ pub const VlcPlayer = struct {
                 }
             }
 
-            var delta_sec: ?i64 = null;
+            var delta_ms: ?i64 = null;
             if (server_ts_ms) |ts_ms| {
-                const server_epoch_utc = @divTrunc(ts_ms, 1000);
-                const now_epoch = std.time.timestamp();
-
+                delta_ms = now_ms - ts_ms;
                 // Discard if message is older than last processed
-                if (server_epoch_utc <= self.last_processed_ts) {
-                    std.debug.print("VLC: Discarding old message (server_ts: {}, last_processed: {})\n", .{ server_epoch_utc, self.last_processed_ts });
+                if (ts_ms <= self.last_processed_ts) {
+                    std.debug.print("VLC: Discarding old message (server_ts: {}, last_processed: {})\n", .{ ts_ms, self.last_processed_ts });
                     return;
                 }
-
-                delta_sec = now_epoch - server_epoch_utc;
-                self.last_processed_ts = server_epoch_utc;
+                self.last_processed_ts = @intCast(ts_ms);
             }
-            std.debug.print("VLC: Received {} bytes. Server ts: {any}, Local ts: {}, Delta: {any} sec\n", .{ latest_bytes, latest_server_ts_ms, std.time.timestamp(), delta_sec });
+            std.debug.print("VLC: Received {} bytes. Server ts: {any}, Local ts: {}, Delta: {any} ms\n", .{ latest_bytes, latest_server_ts_ms, now_ms, delta_ms });
             try self.parseMessage(message);
+            if (server_ts_ms) |ts_ms| {
+                self.last_message_time = @intCast(ts_ms);
+            }
         }
     }
 
@@ -335,19 +351,20 @@ pub const VlcPlayer = struct {
             }
         }
 
-        // Parse time (in milliseconds, convert to seconds)
+        // Parse time (in milliseconds)
         if (data_obj.get("time")) |time_val| {
             if (time_val == .integer) {
-                self.state.play_time_seconds = @intCast(@divTrunc(time_val.integer, 1000));
-                std.debug.print("VLC: Parsed time: {} ms ({} s)\n", .{ time_val.integer, self.state.play_time_seconds });
+                self.state.play_time_ms = @intCast(time_val.integer);
+                self.last_vlc_time = @intCast(time_val.integer);
+                std.debug.print("VLC: Parsed time: {} ms\n", .{time_val.integer});
             }
         }
 
-        // Parse duration (in milliseconds, convert to seconds)
+        // Parse duration (in milliseconds)
         if (data_obj.get("duration")) |duration_val| {
             if (duration_val == .integer) {
-                self.state.length_seconds = @intCast(@divTrunc(duration_val.integer, 1000));
-                std.debug.print("VLC: Parsed duration: {} ms ({} s)\n", .{ duration_val.integer, self.state.length_seconds });
+                self.state.length_ms = @intCast(duration_val.integer);
+                std.debug.print("VLC: Parsed duration: {} ms\n", .{duration_val.integer});
             }
         }
 

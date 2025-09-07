@@ -29,6 +29,14 @@ pub const Hms = struct {
     second: u8,
 };
 
+pub const HmsMs = struct {
+    sign: i8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    millisecond: u16,
+};
+
 /// Get the local timezone offset in seconds from UTC
 pub fn getTimezoneInfo() zoneinfo {
     // Read timezone info from /etc/localtime symlink
@@ -186,6 +194,11 @@ pub fn formatDhms(dhms: Dhms, buf: []u8) ![]const u8 {
 pub fn formatHms(hms: Hms, buf: []u8) ![]const u8 {
     const sign_char = if (hms.sign < 0) "-" else "";
     return std.fmt.bufPrint(buf, "{s}{d}:{d:0>2}:{d:0>2}", .{ sign_char, hms.hour, hms.minute, hms.second });
+}
+
+pub fn formatHmsMs(hmsms: HmsMs, buf: []u8) ![]const u8 {
+    const sign_char = if (hmsms.sign < 0) "-" else "";
+    return std.fmt.bufPrint(buf, "{s}{d}:{d:0>2}:{d:0>2}.{d:0>3}", .{ sign_char, hmsms.hour, hmsms.minute, hmsms.second, hmsms.millisecond });
 }
 
 /// Format a timestamp as "25Au06W200/20:37:13D"
@@ -356,6 +369,23 @@ pub fn timedeltaToHms(delta_sec: i64) Hms {
         .hour = @intCast(hours),
         .minute = @intCast(minutes),
         .second = @intCast(seconds),
+    };
+}
+
+pub fn timedeltaMsToHmsMs(delta_ms: i64) HmsMs {
+    const sign: i64 = if (delta_ms < 0) -1 else 1;
+    const abs_delta_ms = @abs(delta_ms);
+    const total_seconds = @divFloor(abs_delta_ms, 1000);
+    const hours = @as(i64, @intCast(@divFloor(total_seconds, 3600)));
+    const minutes = @divFloor(@mod(total_seconds, 3600), 60);
+    const seconds = @mod(total_seconds, 60);
+    const milliseconds = @mod(abs_delta_ms, 1000);
+    return HmsMs{
+        .sign = @as(i8, @intCast(sign)),
+        .hour = @intCast(hours),
+        .minute = @intCast(minutes),
+        .second = @intCast(seconds),
+        .millisecond = @intCast(milliseconds),
     };
 }
 

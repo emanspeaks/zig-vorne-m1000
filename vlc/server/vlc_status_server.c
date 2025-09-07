@@ -50,7 +50,7 @@ int send_multicast_data(SOCKET sock, const char *data);
 http_response_t *http_get(const char *host, int port, const char *path, const char *password);
 void free_http_response(http_response_t *response);
 int parse_vlc_status(const char *json, vlc_status_t *status);
-char *create_status_json(const vlc_status_t *status);
+char *create_status_json_with_timestamp(const vlc_status_t *status, long long server_timestamp_ms);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
 char *base64_encode(const char *input);
@@ -138,6 +138,9 @@ int main(int argc, char *argv[]) {
             last_query_time = current_time;
         }
 
+        // Get server timestamp at poll time (UTC milliseconds)
+        long long server_timestamp_ms = getUnixTimeMs();
+
         // Query VLC status via HTTP
         http_response_t *response = http_get(VLC_HTTP_HOST, VLC_HTTP_PORT, "/requests/status.json", vlc_password);
 
@@ -169,7 +172,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 // Always send the current status
-                char *json_message = create_status_json(&current_status);
+                char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
                 if (json_message) {
                     if (debug_mode) {
                         printf("[DEBUG] Multicast JSON: %s\n", json_message);
@@ -196,10 +199,11 @@ int main(int argc, char *argv[]) {
             }
         } else {
             // VLC not responding - always send stopped status
+            long long server_timestamp_ms = getUnixTimeMs();
             current_status.is_playing = 0;
             // current_status.timestamp = time(NULL); // Removed to avoid redundancy
 
-            char *json_message = create_status_json(&current_status);
+            char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
             if (json_message) {
                 send_multicast_data(multicast_sock, json_message);
                 free(json_message);
@@ -569,7 +573,7 @@ int parse_vlc_status(const char *json, vlc_status_t *status) {
 }
 
 // Create JSON message for broadcasting
-char *create_status_json(const vlc_status_t *status) {
+char *create_status_json_with_timestamp(const vlc_status_t *status, long long server_timestamp_ms) {
     if (!status) {
         return NULL;
     }
@@ -578,9 +582,6 @@ char *create_status_json(const vlc_status_t *status) {
     if (!json) {
         return NULL;
     }
-
-    // Get server timestamp as Unix milliseconds (UTC)
-    long long server_timestamp_ms = getUnixTimeMs();
 
     // Create JSON message
     snprintf(json, 2048,
