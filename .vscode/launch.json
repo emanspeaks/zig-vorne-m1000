@@ -4,6 +4,22 @@
         {
             "type": "cppdbg",
             "request": "launch",
+            "name": "Run VLC server",
+            "program": "${workspaceFolder}/vlc/server/build/bin/vlc_status_server.exe",
+            // "args": ["--bluray"],
+            "stopAtEntry": true,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {"name": "PATH", "value": "C:\\Program Files\\VideoLAN\\VLC;${env:PATH}"}
+            ],
+            "externalConsole": false,
+            "preLaunchTask": "cmake build",
+            "MIMode": "gdb",
+            // "miDebuggerPath": "gdb.exe",
+        },
+        {
+            "type": "cppdbg",
+            "request": "launch",
             "name": "Run server",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
             // "args": ["--bluray"],

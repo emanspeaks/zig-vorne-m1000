@@ -5,6 +5,12 @@
 		}
 	],
 	"settings": {
-		"cSpell.enabled": false
+		"cSpell.enabled": false,
+		"files.watcherExclude": {
+			"**/.git/objects/**": true,
+			"**/.git/subtree-cache/**": true,
+			"**/.hg/store/**": true,
+			"**/build/_deps/**": true
+		}
 	}
 }

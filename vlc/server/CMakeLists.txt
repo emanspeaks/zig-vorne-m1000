@@ -21,8 +21,6 @@ FetchContent_Declare(
     vlc_headers
     GIT_REPOSITORY https://code.videolan.org/videolan/vlc.git
     GIT_TAG 3.0.21
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ""
 )
 
 # Download VLC Windows binaries
@@ -41,7 +39,7 @@ set(VLC_BIN_DIR ${vlc_binaries_SOURCE_DIR})
 # Create import library from def file using dlltool
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/libvlc.lib
-    COMMAND x86_64-w64-mingw32-dlltool -d ${CMAKE_BINARY_DIR}/libvlc.def -l ${CMAKE_BINARY_DIR}/libvlc.lib
+    COMMAND ${CMAKE_DLLTOOL} -d ${CMAKE_BINARY_DIR}/libvlc.def -l ${CMAKE_BINARY_DIR}/libvlc.lib
     DEPENDS ${CMAKE_BINARY_DIR}/libvlc.def
     COMMENT "Creating libvlc import library"
 )
@@ -75,7 +73,7 @@ file(APPEND ${CMAKE_BINARY_DIR}/libvlc.def "libvlc_media_player_get_hwnd\n")
 add_executable(vlc_status_server vlc_status_server.c)
 
 # Make executable depend on import library
-add_dependencies(vlc_status_server libvlc_import copy_vlc_runtime)
+add_dependencies(vlc_status_server libvlc_import)  # copy_vlc_runtime)
 
 # Include VLC headers
 target_include_directories(vlc_status_server PRIVATE ${VLC_INCLUDE_DIR})
@@ -113,41 +111,41 @@ install(TARGETS vlc_status_server
     RUNTIME DESTINATION bin
 )
 
-# Add a custom target to copy VLC DLLs for testing (optional)
-add_custom_target(copy_vlc_dlls
-    COMMAND ${CMAKE_COMMAND} -E echo "To copy VLC DLLs for testing, run:"
-    COMMAND ${CMAKE_COMMAND} -E echo "copy \"C:\\Program Files\\VideoLAN\\VLC\\libvlc.dll\" \"${CMAKE_BINARY_DIR}/bin/\""
-    COMMAND ${CMAKE_COMMAND} -E echo "copy \"C:\\Program Files\\VideoLAN\\VLC\\libvlccore.dll\" \"${CMAKE_BINARY_DIR}/bin/\""
-    COMMAND ${CMAKE_COMMAND} -E echo "xcopy \"C:\\Program Files\\VideoLAN\\VLC\\plugins\" \"${CMAKE_BINARY_DIR}/bin/plugins\" /E /I"
-    VERBATIM
-)
+# # Add a custom target to copy VLC DLLs for testing (optional)
+# add_custom_target(copy_vlc_dlls
+#     COMMAND ${CMAKE_COMMAND} -E echo "To copy VLC DLLs for testing, run:"
+#     COMMAND ${CMAKE_COMMAND} -E echo "copy \"C:\\Program Files\\VideoLAN\\VLC\\libvlc.dll\" \"${CMAKE_BINARY_DIR}/bin/\""
+#     COMMAND ${CMAKE_COMMAND} -E echo "copy \"C:\\Program Files\\VideoLAN\\VLC\\libvlccore.dll\" \"${CMAKE_BINARY_DIR}/bin/\""
+#     COMMAND ${CMAKE_COMMAND} -E echo "xcopy \"C:\\Program Files\\VideoLAN\\VLC\\plugins\" \"${CMAKE_BINARY_DIR}/bin/plugins\" /E /I"
+#     VERBATIM
+# )
 
-# Copy VLC runtime files automatically during build
-add_custom_target(copy_vlc_runtime ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VLC_BIN_DIR}/libvlc.dll"
-        "${CMAKE_BINARY_DIR}/bin/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VLC_BIN_DIR}/libvlccore.dll"
-        "${CMAKE_BINARY_DIR}/bin/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VLC_BIN_DIR}/axvlc.dll"
-        "${CMAKE_BINARY_DIR}/bin/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VLC_BIN_DIR}/npvlc.dll"
-        "${CMAKE_BINARY_DIR}/bin/"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${VLC_BIN_DIR}/plugins"
-        "${CMAKE_BINARY_DIR}/bin/plugins"
-    COMMENT "Copying VLC runtime files to output directory"
-    VERBATIM
-)
+# # Copy VLC runtime files automatically during build
+# add_custom_target(copy_vlc_runtime ALL
+#     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+#         "${VLC_BIN_DIR}/libvlc.dll"
+#         "${CMAKE_BINARY_DIR}/bin/"
+#     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+#         "${VLC_BIN_DIR}/libvlccore.dll"
+#         "${CMAKE_BINARY_DIR}/bin/"
+#     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+#         "${VLC_BIN_DIR}/axvlc.dll"
+#         "${CMAKE_BINARY_DIR}/bin/"
+#     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+#         "${VLC_BIN_DIR}/npvlc.dll"
+#         "${CMAKE_BINARY_DIR}/bin/"
+#     COMMAND ${CMAKE_COMMAND} -E copy_directory
+#         "${VLC_BIN_DIR}/plugins"
+#         "${CMAKE_BINARY_DIR}/bin/plugins"
+#     COMMENT "Copying VLC runtime files to output directory"
+#     VERBATIM
+# )
 
-# Create Windows package
-set(CPACK_PACKAGE_NAME "VLC Status Server")
-set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Multicast server for VLC playback status")
-set(CPACK_PACKAGE_VENDOR "VLC Status Broadcaster")
-set(CPACK_GENERATOR "ZIP")
+# # Create Windows package
+# set(CPACK_PACKAGE_NAME "VLC Status Server")
+# set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+# set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Multicast server for VLC playback status")
+# set(CPACK_PACKAGE_VENDOR "VLC Status Broadcaster")
+# set(CPACK_GENERATOR "ZIP")
 
-include(CPack)
+# include(CPack)
