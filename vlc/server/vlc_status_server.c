@@ -99,11 +99,12 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Server started successfully\n");
-    // Get current timestamp
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char time_str[32];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    // Get current timestamp with subsecond precision
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char time_str[64];
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     printf("[%s] Querying VLC at http://%s:%d\n", time_str, VLC_HTTP_HOST, VLC_HTTP_PORT);
     printf("[%s] Broadcasting to %s:%d\n", time_str, MULTICAST_GROUP, MULTICAST_PORT);
 
@@ -113,14 +114,40 @@ int main(int argc, char *argv[]) {
     // Main loop
     while (1) {
         DWORD frame_start = GetTickCount();
+
+        if (debug_mode) {
+            static DWORD last_query_time = 0;
+            DWORD current_time = GetTickCount();
+            if (last_query_time > 0) {
+                printf("[DEBUG] Query interval: %lu ms\n", current_time - last_query_time);
+            }
+            last_query_time = current_time;
+        }
+
         // Query VLC status via HTTP
         http_response_t *response = http_get(VLC_HTTP_HOST, VLC_HTTP_PORT, "/requests/status.json", vlc_password);
 
         if (response && response->data) {
             // Parse the JSON response
             if (parse_vlc_status(response->data, &current_status)) {
-                // Check if status has changed
-                int status_changed = memcmp(&current_status, &last_status, sizeof(vlc_status_t)) != 0;
+                // Check if status has changed (excluding timestamp field)
+                int status_changed = 0;
+                if (current_status.is_playing != last_status.is_playing ||
+                    fabs(current_status.position - last_status.position) > 0.001 ||
+                    current_status.time != last_status.time ||
+                    current_status.duration != last_status.duration ||
+                    fabs(current_status.rate - last_status.rate) > 0.01 ||
+                    strcmp(current_status.title, last_status.title) != 0 ||
+                    strcmp(current_status.filename, last_status.filename) != 0) {
+                    status_changed = 1;
+                }
+
+                if (debug_mode) {
+                    printf("[DEBUG] Query result - Playing: %s, Position: %.3f, Status changed: %s\n",
+                           current_status.is_playing ? "Yes" : "No",
+                           current_status.position,
+                           status_changed ? "Yes" : "No");
+                }
 
                 if (status_changed || current_status.is_playing) {
                     // Create JSON message
@@ -131,11 +158,12 @@ int main(int argc, char *argv[]) {
                         }
                         // Send via multicast
                         if (send_multicast_data(multicast_sock, json_message)) {
-                            // Get current timestamp for broadcast message
-                            time_t now = time(NULL);
-                            struct tm *tm_info = localtime(&now);
+                            // Get current timestamp with subsecond precision
+                            SYSTEMTIME st;
+                            GetLocalTime(&st);
                             char time_str[32];
-                            strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+                            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 
                             printf("[%s] Status broadcast: %s - %s\n",
                                    time_str,
@@ -166,11 +194,12 @@ int main(int argc, char *argv[]) {
                 }
 
                 memcpy(&last_status, &current_status, sizeof(vlc_status_t));
-                // Get current timestamp for broadcast message
-                time_t now = time(NULL);
-                struct tm *tm_info = localtime(&now);
+                // Get current timestamp with subsecond precision
+                SYSTEMTIME st;
+                GetLocalTime(&st);
                 char time_str[32];
-                strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+                snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 
                 printf("[%s] VLC not responding - sent stopped status\n", time_str);
                 if (debug_mode) {
@@ -539,11 +568,12 @@ char *create_status_json(const vlc_status_t *status) {
         return NULL;
     }
 
-    // Create server timestamp
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char timestamp_str[32];
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    // Create server timestamp with subsecond precision
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timestamp_str[64];
+    snprintf(timestamp_str, sizeof(timestamp_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 
     // Create JSON message
     snprintf(json, 2048,
