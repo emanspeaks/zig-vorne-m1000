@@ -36,8 +36,7 @@ if not exist "%SERVER_EXE%" (
 echo Starting VLC with RC interface...
 start "VLC Media Player" "%VLC_EXE%" ^
     --extraintf=rc ^
-    --rc-host=127.0.0.1 ^
-    --rc-port=4212
+    --rc-host=127.0.0.1:4212
 
 echo Waiting 2 seconds for VLC to start...
 timeout /t 2 /nobreak >nul
