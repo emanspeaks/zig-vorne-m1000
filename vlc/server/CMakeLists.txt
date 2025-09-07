@@ -130,6 +130,12 @@ add_custom_target(copy_vlc_runtime ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${VLC_BIN_DIR}/libvlccore.dll"
         "${CMAKE_BINARY_DIR}/bin/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${VLC_BIN_DIR}/axvlc.dll"
+        "${CMAKE_BINARY_DIR}/bin/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${VLC_BIN_DIR}/npvlc.dll"
+        "${CMAKE_BINARY_DIR}/bin/"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${VLC_BIN_DIR}/plugins"
         "${CMAKE_BINARY_DIR}/bin/plugins"

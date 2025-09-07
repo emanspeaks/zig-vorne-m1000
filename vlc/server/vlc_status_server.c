@@ -40,6 +40,7 @@ typedef struct {
 int debug_mode = 0;
 
 // Function declarations
+int check_vlc_and_qt_libraries();
 long long getUnixTimeMs();
 int initialize_winsock();
 void cleanup_winsock();
@@ -55,6 +56,70 @@ int query_vlc_status(vlc_player_t *player, vlc_status_t *status);
 char *create_status_json_with_timestamp(const vlc_status_t *status, long long server_timestamp_ms);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
+
+// Check if VLC and Qt libraries can be loaded
+int check_vlc_and_qt_libraries() {
+    HMODULE vlc_dll = LoadLibrary("libvlc.dll");
+    if (!vlc_dll) {
+        printf("Error: Could not load libvlc.dll\n");
+        printf("Make sure VLC is installed and libvlc.dll is in your PATH\n");
+        return 0;
+    }
+
+    HMODULE vlccore_dll = LoadLibrary("libvlccore.dll");
+    if (!vlccore_dll) {
+        printf("Error: Could not load libvlccore.dll\n");
+        printf("Make sure VLC is installed and libvlccore.dll is in your PATH\n");
+        FreeLibrary(vlc_dll);
+        return 0;
+    }
+
+    // Check for Qt libraries (required for Qt interface)
+    HMODULE qt5core_dll = LoadLibrary("Qt5Core.dll");
+    if (!qt5core_dll) {
+        printf("Warning: Could not load Qt5Core.dll\n");
+        printf("Qt interface may not work properly. Consider using VLC with Qt support.\n");
+        // Don't fail here, as VLC might have Qt libraries in plugins or different location
+    } else {
+        FreeLibrary(qt5core_dll);
+    }
+
+    HMODULE qt5gui_dll = LoadLibrary("Qt5Gui.dll");
+    if (!qt5gui_dll) {
+        printf("Warning: Could not load Qt5Gui.dll\n");
+        printf("Qt interface may not work properly. Consider using VLC with Qt support.\n");
+    } else {
+        FreeLibrary(qt5gui_dll);
+    }
+
+    HMODULE qt5widgets_dll = LoadLibrary("Qt5Widgets.dll");
+    if (!qt5widgets_dll) {
+        printf("Warning: Could not load Qt5Widgets.dll\n");
+        printf("Qt interface may not work properly. Consider using VLC with Qt support.\n");
+    } else {
+        FreeLibrary(qt5widgets_dll);
+    }
+
+    // Check if key VLC functions are available
+    FARPROC libvlc_new_func = GetProcAddress(vlc_dll, "libvlc_new");
+    if (!libvlc_new_func) {
+        printf("Error: libvlc_new function not found in libvlc.dll\n");
+        FreeLibrary(vlc_dll);
+        FreeLibrary(vlccore_dll);
+        return 0;
+    }
+
+    printf("VLC libraries loaded successfully\n");
+    if (qt5core_dll && qt5gui_dll && qt5widgets_dll) {
+        printf("Qt libraries found - Qt interface should work\n");
+    } else {
+        printf("Some Qt libraries missing - Qt interface may have issues\n");
+    }
+
+    FreeLibrary(vlc_dll);
+    FreeLibrary(vlccore_dll);
+    return 1;
+}
 
 // Get Unix timestamp in milliseconds (UTC)
 long long getUnixTimeMs() {
@@ -157,6 +222,12 @@ int main(int argc, char *argv[]) {
     }
 
     printf("VLC Status Server with LibVLC starting...\n");
+
+    // Check if VLC and Qt libraries are available
+    if (!check_vlc_and_qt_libraries()) {
+        fprintf(stderr, "VLC libraries not available. Please ensure VLC is installed and in PATH.\n");
+        return 1;
+    }
 
     // Initialize Winsock
     if (!initialize_winsock()) {
@@ -368,20 +439,38 @@ vlc_player_t *vlc_player_create() {
 
     memset(player, 0, sizeof(vlc_player_t));
 
-    // Initialize VLC instance with full interface enabled
+    // Initialize VLC instance with full Qt interface enabled
     const char *vlc_args[] = {
         "--intf", "qt",             // Use Qt interface (full VLC UI)
-        "--volume", "50",           // Set initial volume
-        "--video-title-show",       // Show video title
+        // "--volume", "50",           // Set initial volume
+        // "--video-title-show",       // Show video title
         "--mouse-events",           // Enable mouse events
-        "--keyboard-events"         // Enable keyboard events
+        "--keyboard-events",        // Enable keyboard events
+        "--no-qt-privacy-ask",      // Skip privacy dialog
+        "--no-qt-updates-notif",    // Skip update notifications
+        // "--qt-start-minimized"      // Start minimized to reduce initial load
     };
 
     player->vlc_instance = libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
     if (!player->vlc_instance) {
-        printf("Error: Failed to create VLC instance: %s\n", libvlc_errmsg());
-        free(player);
-        return NULL;
+        printf("Warning: Failed to create VLC instance with Qt interface: %s\n", libvlc_errmsg());
+        printf("Attempting fallback to dummy interface...\n");
+
+        // Fallback to dummy interface if Qt fails
+        const char *fallback_args[] = {
+            "--intf", "dummy",
+            "--quiet"
+        };
+
+        player->vlc_instance = libvlc_new(sizeof(fallback_args) / sizeof(fallback_args[0]), fallback_args);
+        if (!player->vlc_instance) {
+            printf("Error: Failed to create VLC instance even with fallback: %s\n", libvlc_errmsg());
+            free(player);
+            return NULL;
+        }
+        printf("Successfully created VLC instance with dummy interface fallback\n");
+    } else {
+        printf("Successfully created VLC instance with Qt interface\n");
     }
 
     // Create media player
