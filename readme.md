@@ -2,6 +2,21 @@
 
 This directory contains scripts and configuration to run the Zig Vorne M1000 display program automatically on boot.
 
+## Components
+
+### Main Service
+
+The Zig-based Vorne M1000 display service that interfaces with the serial display.
+
+### VLC Status Server
+
+A C-based Windows server that provides VLC media player status broadcasting. See `vlc/README.md` for details.
+
+- Creates native VLC window with full functionality
+- Broadcasts playback status via multicast UDP
+- Two deployment modes: bundled DLLs or system VLC
+- Cross-compiled for Windows from Linux
+
 ## Installation
 
 1. **Install the service:**

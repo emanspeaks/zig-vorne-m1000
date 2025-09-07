@@ -4,12 +4,18 @@
 #include <string.h>
 #include <winsock2.h>
 #include <windows.h>
+#include <commdlg.h>
 #include <time.h>
 #include <ws2tcpip.h>
 #include <stdint.h>
+#include <shellapi.h>
 
-#define VLC_RC_HOST "127.0.0.1"
-#define VLC_RC_PORT 4212
+// Include VLC headers
+#include <vlc/vlc.h>
+#include <vlc/libvlc.h>
+#include <vlc/libvlc_media.h>
+#include <vlc/libvlc_media_player.h>
+
 #define MULTICAST_GROUP "239.255.0.100"
 #define MULTICAST_PORT 8888
 #define UPDATE_INTERVAL_MS 200  // 5Hz (every 200ms)
@@ -23,11 +29,13 @@ typedef struct {
     char filename[256];
 } vlc_status_t;
 
-// RC connection structure
+// VLC instance structure
 typedef struct {
-    SOCKET socket;
-    int connected;
-} vlc_rc_connection_t;
+    libvlc_instance_t *vlc_instance;
+    libvlc_media_player_t *media_player;
+    libvlc_media_t *current_media;
+    int initialized;
+} vlc_player_t;
 
 int debug_mode = 0;
 
@@ -37,10 +45,13 @@ int initialize_winsock();
 void cleanup_winsock();
 SOCKET create_multicast_socket();
 int send_multicast_data(SOCKET sock, const char *data);
-vlc_rc_connection_t *vlc_rc_connect(const char *host, int port);
-void vlc_rc_disconnect(vlc_rc_connection_t *conn);
-char *vlc_rc_command(vlc_rc_connection_t *conn, const char *command);
-int query_vlc_status_rc(vlc_rc_connection_t *conn, vlc_status_t *status);
+vlc_player_t *vlc_player_create();
+void vlc_player_destroy(vlc_player_t *player);
+int vlc_player_open_file(vlc_player_t *player, const char *filepath);
+int vlc_player_play(vlc_player_t *player);
+int vlc_player_pause(vlc_player_t *player);
+int vlc_player_stop(vlc_player_t *player);
+int query_vlc_status(vlc_player_t *player, vlc_status_t *status);
 char *create_status_json_with_timestamp(const vlc_status_t *status, long long server_timestamp_ms);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
@@ -57,6 +68,80 @@ long long getUnixTimeMs() {
     return ull.QuadPart;
 }
 
+// Window procedure for VLC player window
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_CLOSE:
+            PostQuitMessage(0);
+            return 0;
+        case WM_KEYDOWN:
+            // Handle keyboard shortcuts for VLC player
+            switch (wParam) {
+                case VK_SPACE: {
+                    // Space bar to play/pause
+                    vlc_player_t *player = (vlc_player_t*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+                    if (player && player->media_player) {
+                        if (libvlc_media_player_is_playing(player->media_player)) {
+                            libvlc_media_player_pause(player->media_player);
+                        } else {
+                            libvlc_media_player_play(player->media_player);
+                        }
+                    }
+                    break;
+                }
+                case VK_ESCAPE:
+                    // Escape to stop
+                    {
+                        vlc_player_t *player = (vlc_player_t*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+                        if (player && player->media_player) {
+                            libvlc_media_player_stop(player->media_player);
+                        }
+                    }
+                    break;
+                case VK_LEFT:
+                    // Left arrow to seek backward (10 seconds)
+                    {
+                        vlc_player_t *player = (vlc_player_t*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+                        if (player && player->media_player) {
+                            int64_t current_time = libvlc_media_player_get_time(player->media_player);
+                            libvlc_media_player_set_time(player->media_player,
+                                current_time > 10000 ? current_time - 10000 : 0);
+                        }
+                    }
+                    break;
+                case VK_RIGHT:
+                    // Right arrow to seek forward (10 seconds)
+                    {
+                        vlc_player_t *player = (vlc_player_t*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+                        if (player && player->media_player) {
+                            int64_t current_time = libvlc_media_player_get_time(player->media_player);
+                            libvlc_media_player_set_time(player->media_player, current_time + 10000);
+                        }
+                    }
+                    break;
+            }
+            break;
+        case WM_DROPFILES: {
+            // Handle drag and drop of files
+            HDROP hDrop = (HDROP)wParam;
+            UINT fileCount = DragQueryFile(hDrop, 0xFFFFFFFF, NULL, 0);
+            if (fileCount > 0) {
+                char filePath[MAX_PATH];
+                if (DragQueryFile(hDrop, 0, filePath, MAX_PATH)) {
+                    vlc_player_t *player = (vlc_player_t*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+                    if (player) {
+                        vlc_player_open_file(player, filePath);
+                        vlc_player_play(player);
+                    }
+                }
+            }
+            DragFinish(hDrop);
+            break;
+        }
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
 // Main server loop
 int main(int argc, char *argv[]) {
     // Parse command line arguments for debug flag
@@ -71,7 +156,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("VLC Status Server starting...\n");
+    printf("VLC Status Server with LibVLC starting...\n");
 
     // Initialize Winsock
     if (!initialize_winsock()) {
@@ -87,6 +172,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Create VLC player instance
+    vlc_player_t *vlc_player = vlc_player_create();
+    if (!vlc_player) {
+        fprintf(stderr, "Failed to create VLC player instance\n");
+        closesocket(multicast_sock);
+        cleanup_winsock();
+        return 1;
+    }
+
     printf("Server started successfully\n");
 
     // Display connection info
@@ -95,139 +189,119 @@ int main(int argc, char *argv[]) {
     char time_str[64];
     snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    printf("[%s] Connecting to VLC RC at %s:%d\n", time_str, VLC_RC_HOST, VLC_RC_PORT);
-    printf("[%s] Broadcasting to %s:%d\n", time_str, MULTICAST_GROUP, MULTICAST_PORT);
+    printf("VLC player created with native VLC interface\n");
+    printf("[%s] Broadcasting status to %s:%d\n", time_str, MULTICAST_GROUP, MULTICAST_PORT);
+    printf("[%s] Use VLC's native interface to control playback\n", time_str);
 
     vlc_status_t current_status = {0};
     vlc_status_t last_status = {0};
-    vlc_rc_connection_t *vlc_conn = NULL;
 
     // Main loop
+    MSG msg;
+    DWORD last_update = GetTickCount();
+
     while (1) {
-        DWORD frame_start = GetTickCount();
-
-        if (debug_mode) {
-            static DWORD last_query_time = 0;
-            DWORD current_time = GetTickCount();
-            if (last_query_time > 0) {
-                printf("[DEBUG] Query interval: %lu ms\n", current_time - last_query_time);
+        // Process Windows messages (non-blocking)
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                goto cleanup;
             }
-            last_query_time = current_time;
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
 
-        // Get server timestamp at poll time (UTC milliseconds)
-        long long server_timestamp_ms = getUnixTimeMs();
-
-        // Connect to VLC RC if not connected
-        if (!vlc_conn || !vlc_conn->connected) {
-            if (vlc_conn) {
-                vlc_rc_disconnect(vlc_conn);
-            }
-            vlc_conn = vlc_rc_connect(VLC_RC_HOST, VLC_RC_PORT);
-        }
-
-        // Query VLC status via RC interface
-        int status_ok = 0;
-        if (vlc_conn && vlc_conn->connected) {
-            status_ok = query_vlc_status_rc(vlc_conn, &current_status);
-        }
-
-        if (status_ok) {
-            // Check if status has changed (excluding timestamp field)
-            int status_changed = 0;
-            if (current_status.is_playing != last_status.is_playing ||
-                current_status.time != last_status.time ||
-                current_status.duration != last_status.duration ||
-                strcmp(current_status.title, last_status.title) != 0 ||
-                strcmp(current_status.filename, last_status.filename) != 0) {
-                status_changed = 1;
-            }
+        DWORD current_time = GetTickCount();
+        if (current_time - last_update >= UPDATE_INTERVAL_MS) {
 
             if (debug_mode) {
-                printf("[DEBUG] Query result - Playing: %s, Time: %lld ms, Status changed: %s\n",
-                       current_status.is_playing ? "Yes" : "No",
-                       current_status.time,
-                       status_changed ? "Yes" : "No");
+                static DWORD last_query_time = 0;
+                if (last_query_time > 0) {
+                    printf("[DEBUG] Query interval: %lu ms\n", current_time - last_query_time);
+                }
+                last_query_time = current_time;
             }
 
-            if (status_changed) {
-                // Update last status
+            // Get server timestamp at poll time (UTC milliseconds)
+            long long server_timestamp_ms = getUnixTimeMs();
+
+            // Query VLC status directly from libvlc
+            int status_ok = query_vlc_status(vlc_player, &current_status);
+
+            if (status_ok) {
+                // Check if status has changed (excluding timestamp field)
+                int status_changed = 0;
+                if (current_status.is_playing != last_status.is_playing ||
+                    current_status.time != last_status.time ||
+                    current_status.duration != last_status.duration ||
+                    strcmp(current_status.title, last_status.title) != 0 ||
+                    strcmp(current_status.filename, last_status.filename) != 0) {
+                    status_changed = 1;
+                }
+
+                if (debug_mode) {
+                    printf("[DEBUG] Query result - Playing: %s, Time: %lld ms, Status changed: %s\n",
+                           current_status.is_playing ? "Yes" : "No",
+                           current_status.time,
+                           status_changed ? "Yes" : "No");
+                }
+
+                if (status_changed) {
+                    // Update last status
+                    memcpy(&last_status, &current_status, sizeof(vlc_status_t));
+                }
+
+                // Always send the current status
+                char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
+                if (json_message) {
+                    if (debug_mode) {
+                        printf("[DEBUG] Multicast JSON: %s\n", json_message);
+                    }
+                    // Send via multicast
+                    if (send_multicast_data(multicast_sock, json_message)) {
+                        // Get current timestamp with subsecond precision (UTC)
+                        SYSTEMTIME st;
+                        GetSystemTime(&st);
+                        char time_str[32];
+                        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                               st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+                        printf("[%s] Status broadcast: %s - %s\n",
+                               time_str,
+                               current_status.is_playing ? "Playing" : "Stopped",
+                               current_status.title[0] ? current_status.title : "No media");
+                        if (debug_mode) {
+                            print_status(&current_status);
+                        }
+                    }
+                    free(json_message);
+                }
+            } else {
+                // VLC error - send stopped status
+                current_status.is_playing = 0;
+                current_status.time = 0;
+                current_status.duration = 0;
+                strcpy(current_status.title, "No media");
+                strcpy(current_status.filename, "");
+
+                char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
+                if (json_message) {
+                    send_multicast_data(multicast_sock, json_message);
+                    free(json_message);
+                }
+
                 memcpy(&last_status, &current_status, sizeof(vlc_status_t));
             }
 
-            // Always send the current status
-            char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
-            if (json_message) {
-                if (debug_mode) {
-                    printf("[DEBUG] Multicast JSON: %s\n", json_message);
-                }
-                // Send via multicast
-                if (send_multicast_data(multicast_sock, json_message)) {
-                    // Get current timestamp with subsecond precision (UTC)
-                    SYSTEMTIME st;
-                    GetSystemTime(&st);
-                    char time_str[32];
-                    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-                           st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-                    printf("[%s] Status broadcast: %s - %s\n",
-                           time_str,
-                           current_status.is_playing ? "Playing" : "Stopped",
-                           current_status.title[0] ? current_status.title : "Unknown");
-                    if (debug_mode) {
-                        print_status(&current_status);
-                    }
-                }
-                free(json_message);
-            }
-        } else {
-            // VLC not responding - always send stopped status
-            current_status.is_playing = 0;
-            current_status.time = 0;
-            current_status.duration = 0;
-            strcpy(current_status.title, "No media");
-            strcpy(current_status.filename, "");
-
-            char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
-            if (json_message) {
-                send_multicast_data(multicast_sock, json_message);
-                free(json_message);
-            }
-
-            memcpy(&last_status, &current_status, sizeof(vlc_status_t));
-            // Get current timestamp with subsecond precision (UTC)
-            SYSTEMTIME st;
-            GetSystemTime(&st);
-            char time_str[32];
-            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-            printf("[%s] VLC not responding - sent stopped status\n", time_str);
-            if (debug_mode) {
-                printf("[DEBUG] VLC not responding, sent stopped status\n");
-            }
+            last_update = current_time;
         }
 
-        // Calculate sleep time to maintain fixed frame rate
-        DWORD frame_end = GetTickCount();
-        DWORD frame_duration = frame_end - frame_start;
-        DWORD sleep_time = 0;
-
-        if (frame_duration < UPDATE_INTERVAL_MS) {
-            sleep_time = UPDATE_INTERVAL_MS - frame_duration;
-        }
-        // If frame took longer than UPDATE_INTERVAL_MS, sleep_time remains 0
-
-        if (sleep_time > 0) {
-            Sleep(sleep_time);
-        }
-        // Note: If sleep_time is 0, we skip sleep to maintain responsiveness
+        // Small sleep to prevent busy waiting
+        Sleep(10);
     }
 
-    // Cleanup (this code is never reached in normal operation)
-    if (vlc_conn) {
-        vlc_rc_disconnect(vlc_conn);
-    }
+cleanup:
+    // Cleanup
+    vlc_player_destroy(vlc_player);
     closesocket(multicast_sock);
     cleanup_winsock();
     return 0;
@@ -285,144 +359,155 @@ int send_multicast_data(SOCKET sock, const char *data) {
     return len > 0;
 }
 
-// Connect to VLC RC interface
-vlc_rc_connection_t *vlc_rc_connect(const char *host, int port) {
-    vlc_rc_connection_t *conn = malloc(sizeof(vlc_rc_connection_t));
-    if (!conn) {
+// Create VLC player with native VLC interface
+vlc_player_t *vlc_player_create() {
+    vlc_player_t *player = malloc(sizeof(vlc_player_t));
+    if (!player) {
         return NULL;
     }
 
-    conn->socket = INVALID_SOCKET;
-    conn->connected = 0;
+    memset(player, 0, sizeof(vlc_player_t));
 
-    // Create TCP socket
-    conn->socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (conn->socket == INVALID_SOCKET) {
-        free(conn);
+    // Initialize VLC instance with full interface enabled
+    const char *vlc_args[] = {
+        "--intf", "qt",             // Use Qt interface (full VLC UI)
+        "--volume", "50",           // Set initial volume
+        "--video-title-show",       // Show video title
+        "--mouse-events",           // Enable mouse events
+        "--keyboard-events"         // Enable keyboard events
+    };
+
+    player->vlc_instance = libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
+    if (!player->vlc_instance) {
+        printf("Error: Failed to create VLC instance: %s\n", libvlc_errmsg());
+        free(player);
         return NULL;
     }
 
-    // Set socket timeout
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    setsockopt(conn->socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    setsockopt(conn->socket, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
-
-    // Connect to VLC RC interface
-    struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
-        closesocket(conn->socket);
-        free(conn);
+    // Create media player
+    player->media_player = libvlc_media_player_new(player->vlc_instance);
+    if (!player->media_player) {
+        printf("Error: Failed to create media player: %s\n", libvlc_errmsg());
+        libvlc_release(player->vlc_instance);
+        free(player);
         return NULL;
     }
 
-    if (connect(conn->socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        if (debug_mode) {
-            printf("[DEBUG] Failed to connect to VLC RC interface at %s:%d\n", host, port);
-        }
-        closesocket(conn->socket);
-        free(conn);
-        return NULL;
-    }
+    // VLC will create its own window - no need to set hwnd
+    player->initialized = 1;
 
-    // Read welcome message and discard it
-    char buffer[4096];
-    int received = recv(conn->socket, buffer, sizeof(buffer) - 1, 0);
-    if (received > 0) {
-        buffer[received] = '\0';
-        if (debug_mode) {
-            printf("[DEBUG] VLC RC welcome: %s\n", buffer);
-        }
-    } else {
-        if (debug_mode) {
-            printf("[DEBUG] No welcome message received\n");
-        }
-    }
-
-    conn->connected = 1;
     if (debug_mode) {
-        printf("[DEBUG] Connected to VLC RC interface\n");
+        printf("[DEBUG] VLC player created successfully with native interface\n");
     }
-    return conn;
+
+    return player;
+
+    if (debug_mode) {
+        printf("[DEBUG] VLC player created successfully\n");
+    }
+
+    return player;
 }
 
-// Disconnect from VLC RC interface
-void vlc_rc_disconnect(vlc_rc_connection_t *conn) {
-    if (!conn) return;
+// Destroy VLC player
+void vlc_player_destroy(vlc_player_t *player) {
+    if (!player) return;
 
-    if (conn->socket != INVALID_SOCKET) {
-        closesocket(conn->socket);
+    if (player->current_media) {
+        libvlc_media_release(player->current_media);
     }
-    conn->connected = 0;
-    free(conn);
+
+    if (player->media_player) {
+        libvlc_media_player_stop(player->media_player);
+        libvlc_media_player_release(player->media_player);
+    }
+
+    if (player->vlc_instance) {
+        libvlc_release(player->vlc_instance);
+    }
+
+    // VLC manages its own windows, no need to destroy them manually
+
+    free(player);
 }
 
-// Send command to VLC RC and get response
-char *vlc_rc_command(vlc_rc_connection_t *conn, const char *command) {
-    if (!conn || !conn->connected || conn->socket == INVALID_SOCKET) {
-        return NULL;
+// Open file in VLC player
+int vlc_player_open_file(vlc_player_t *player, const char *filepath) {
+    if (!player || !filepath) {
+        return 0;
     }
 
-    // Send command with newline
-    char cmd_with_newline[512];
-    snprintf(cmd_with_newline, sizeof(cmd_with_newline), "%s\n", command);
-
-    if (send(conn->socket, cmd_with_newline, strlen(cmd_with_newline), 0) < 0) {
-        conn->connected = 0;
-        return NULL;
+    // Release previous media
+    if (player->current_media) {
+        libvlc_media_release(player->current_media);
+        player->current_media = NULL;
     }
 
-    // Read response
-    char *response = malloc(4096);
-    if (!response) {
-        return NULL;
+    // Create new media from file path
+    player->current_media = libvlc_media_new_path(player->vlc_instance, filepath);
+    if (!player->current_media) {
+        printf("Error: Failed to create media from path: %s\n", libvlc_errmsg());
+        return 0;
     }
 
-    int received = recv(conn->socket, response, 4095, 0);
-    if (received <= 0) {
-        free(response);
-        if (received < 0) {
-            conn->connected = 0;
-        }
-        return NULL;
+    // Set media to player
+    libvlc_media_player_set_media(player->media_player, player->current_media);
+
+    if (debug_mode) {
+        printf("[DEBUG] Opened file: %s\n", filepath);
     }
 
-    response[received] = '\0';
-
-    // Clean up response - remove trailing whitespace and prompt
-    char *end = response + received - 1;
-    while (end >= response && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '>')) {
-        *end = '\0';
-        end--;
-    }
-
-    // Remove leading whitespace
-    char *start = response;
-    while (*start == ' ' || *start == '\n' || *start == '\r') {
-        start++;
-    }
-
-    // Create cleaned response
-    char *cleaned = malloc(strlen(start) + 1);
-    if (cleaned) {
-        strcpy(cleaned, start);
-    }
-    free(response);
-
-    if (debug_mode && cleaned) {
-        printf("[DEBUG] VLC RC command '%s' response: '%s'\n", command, cleaned);
-    }
-
-    return cleaned;
+    return 1;
 }
 
-// Query VLC status using RC interface
-int query_vlc_status_rc(vlc_rc_connection_t *conn, vlc_status_t *status) {
-    if (!conn || !status) {
+// Play media
+int vlc_player_play(vlc_player_t *player) {
+    if (!player || !player->media_player) {
+        return 0;
+    }
+
+    int result = libvlc_media_player_play(player->media_player);
+
+    if (debug_mode) {
+        printf("[DEBUG] Play command sent, result: %d\n", result);
+    }
+
+    return result == 0; // libvlc_media_player_play returns 0 on success
+}
+
+// Pause media
+int vlc_player_pause(vlc_player_t *player) {
+    if (!player || !player->media_player) {
+        return 0;
+    }
+
+    libvlc_media_player_pause(player->media_player);
+
+    if (debug_mode) {
+        printf("[DEBUG] Pause command sent\n");
+    }
+
+    return 1;
+}
+
+// Stop media
+int vlc_player_stop(vlc_player_t *player) {
+    if (!player || !player->media_player) {
+        return 0;
+    }
+
+    libvlc_media_player_stop(player->media_player);
+
+    if (debug_mode) {
+        printf("[DEBUG] Stop command sent\n");
+    }
+
+    return 1;
+}
+
+// Query VLC status using libvlc API
+int query_vlc_status(vlc_player_t *player, vlc_status_t *status) {
+    if (!player || !status) {
         return 0;
     }
 
@@ -430,36 +515,41 @@ int query_vlc_status_rc(vlc_rc_connection_t *conn, vlc_status_t *status) {
     memset(status, 0, sizeof(vlc_status_t));
 
     // Get playing status
-    char *is_playing_resp = vlc_rc_command(conn, "is_playing");
-    if (is_playing_resp) {
-        status->is_playing = (strstr(is_playing_resp, "1") != NULL);
-        free(is_playing_resp);
-    }
+    status->is_playing = libvlc_media_player_is_playing(player->media_player);
 
-    // Get current time (in seconds, convert to milliseconds)
-    char *time_resp = vlc_rc_command(conn, "get_time");
-    if (time_resp) {
-        double time_sec = atof(time_resp);
-        status->time = (long long)(time_sec * 1000);
-        free(time_resp);
-    }
+    // Get current time and duration
+    status->time = libvlc_media_player_get_time(player->media_player);
+    status->duration = libvlc_media_player_get_length(player->media_player);
 
-    // Get duration (in seconds, convert to milliseconds)
-    char *length_resp = vlc_rc_command(conn, "get_length");
-    if (length_resp) {
-        double length_sec = atof(length_resp);
-        status->duration = (long long)(length_sec * 1000);
-        free(length_resp);
-    }
+    // Get media info (title/filename)
+    if (player->current_media) {
+        char *meta_title = libvlc_media_get_meta(player->current_media, 0);  // libvlc_meta_Title = 0
+        char *meta_filename = libvlc_media_get_meta(player->current_media, 15); // libvlc_meta_URL = 15
 
-    // Get title/filename
-    char *title_resp = vlc_rc_command(conn, "get_title");
-    if (title_resp && strlen(title_resp) > 0) {
-        strncpy(status->title, title_resp, sizeof(status->title) - 1);
-        strncpy(status->filename, title_resp, sizeof(status->filename) - 1);
-        free(title_resp);
+        if (meta_title && strlen(meta_title) > 0) {
+            strncpy(status->title, meta_title, sizeof(status->title) - 1);
+        } else if (meta_filename && strlen(meta_filename) > 0) {
+            // Extract just the filename from the path
+            const char *filename_only = strrchr(meta_filename, '\\');
+            if (!filename_only) filename_only = strrchr(meta_filename, '/');
+            if (filename_only) {
+                filename_only++; // Skip the slash
+            } else {
+                filename_only = meta_filename;
+            }
+            strncpy(status->title, filename_only, sizeof(status->title) - 1);
+        } else {
+            strcpy(status->title, "Unknown");
+        }
+
+        if (meta_filename) {
+            strncpy(status->filename, meta_filename, sizeof(status->filename) - 1);
+        }
+
+        if (meta_title) free(meta_title);
+        if (meta_filename) free(meta_filename);
     } else {
-        strcpy(status->title, "Unknown");
+        strcpy(status->title, "No media");
         strcpy(status->filename, "");
     }
 
@@ -511,17 +601,16 @@ void print_status(const vlc_status_t *status) {
 
 // Print usage information
 void print_usage(const char *program_name) {
-    printf("VLC Status Server - Broadcasts VLC playback status via UDP multicast\n\n");
+    printf("VLC Status Server with LibVLC - Creates native VLC instance and broadcasts status\n\n");
     printf("Usage: %s [--debug]\n\n", program_name);
     printf("Arguments:\n");
     printf("  --debug     Enable verbose debug output\n");
     printf("  --help, -h  Show this help message\n\n");
+    printf("Features:\n");
+    printf("  - Creates a full VLC media player with native VLC interface\n");
+    printf("  - Use VLC's built-in controls to open files, play, pause, seek, etc.\n");
+    printf("  - Broadcasts playback status to UDP multicast group 239.255.0.100:8888\n\n");
     printf("Examples:\n");
-    printf("  %s                    # Connect to VLC RC interface\n", program_name);
+    printf("  %s                    # Start VLC player with status server\n", program_name);
     printf("  %s --debug            # Enable debug output\n", program_name);
-    printf("  %s --help             # Show this help message\n\n", program_name);
-    printf("VLC must be started with RC interface enabled:\n");
-    printf("  vlc --rc-host=127.0.0.1 --rc-port=4212\n\n");
-    printf("The server will connect to VLC RC at 127.0.0.1:4212\n");
-    printf("and broadcast status updates to UDP multicast group 239.255.0.100:8888\n");
 }

@@ -1,6 +1,6 @@
 @echo off
-REM VLC Status Broadcaster Launcher
-REM Starts VLC with RC interface and the status server
+REM VLC Status Broadcaster Launcher - System VLC Mode
+REM Starts the VLC Status Server using system-installed VLC DLLs
 
 REM Default settings
 set "DEBUG=0"
@@ -8,63 +8,86 @@ set "DEBUG=0"
 REM Check for debug flag in command line arguments
 if /I "%~1"=="debug" set "DEBUG=1"
 
-echo VLC Status Broadcaster Launcher
-echo ================================
-echo VLC RC: 127.0.0.1:4212
+echo VLC Status Broadcaster Launcher - System VLC Mode
+echo ==================================================
+echo Uses system-installed VLC DLLs via PATH
 echo Multicast: 239.255.0.100:8888
-echo ================================
+echo ==================================================
 echo.
-
-REM Check if VLC executable exists
-set "VLC_EXE=C:\Program Files\VideoLAN\VLC\vlc.exe"
-if not exist "%VLC_EXE%" (
-    echo ERROR: VLC executable not found
-    echo Please ensure VLC is installed and set VLC_EXE in this script correctly
-    pause
-    exit /b 1
-)
 
 REM Check if server executable exists
 set "SERVER_EXE=server\build\bin\vlc_status_server.exe"
 if not exist "%SERVER_EXE%" (
     echo ERROR: vlc_status_server.exe not found
-    echo Please build the server first or ensure it's in the same directory
+    echo Please build the server first:
+    echo   cd server
+    echo   cmake --preset windows-x64
+    echo   cmake --build build
     pause
     exit /b 1
 )
 
-echo Starting VLC with RC interface...
-start "VLC Media Player" "%VLC_EXE%" ^
-    --extraintf=rc ^
-    --rc-host=127.0.0.1:4212
+REM Check if VLC is installed in system (check common locations)
+set "VLC_FOUND=0"
+set "VLC_PATH="
 
-echo Waiting 2 seconds for VLC to start...
-timeout /t 2 /nobreak >nul
+REM Check common VLC installation paths
+if exist "C:\Program Files\VideoLAN\VLC\vlc.exe" (
+    set "VLC_PATH=C:\Program Files\VideoLAN\VLC"
+    set "VLC_FOUND=1"
+) else if exist "C:\Program Files (x86)\VideoLAN\VLC\vlc.exe" (
+    set "VLC_PATH=C:\Program Files (x86)\VideoLAN\VLC"
+    set "VLC_FOUND=1"
+)
 
-echo Starting VLC Status Server...
+REM If not found in common paths, check if vlc.exe is in PATH
+if "%VLC_FOUND%"=="0" (
+    where vlc.exe >nul 2>&1
+    if !errorlevel!==0 (
+        echo VLC found in system PATH
+        set "VLC_FOUND=1"
+    )
+)
+
+if "%VLC_FOUND%"=="0" (
+    echo ERROR: VLC not found on system
+    echo Please install VLC or use the bundled DLL version instead
+    echo Try running: start_vlc_status.bat
+    pause
+    exit /b 1
+)
+
+if not "%VLC_PATH%"=="" (
+    echo Found VLC installation: %VLC_PATH%
+    echo Adding VLC directory to PATH for this session...
+    set "PATH=%VLC_PATH%;%PATH%"
+) else (
+    echo Using VLC from system PATH
+)
+
+echo Found server executable: %SERVER_EXE%
+echo Using system VLC DLLs
+echo.
+
+echo Starting VLC Status Server with system VLC...
 if "%DEBUG%"=="1" (
     echo Debug mode enabled: passing --debug to server
-    start "VLC Status Server" "%SERVER_EXE%" --debug
+    "%SERVER_EXE%" --debug
 ) else (
-    start "VLC Status Server" "%SERVER_EXE%"
+    "%SERVER_EXE%"
 )
 
 echo.
 echo VLC Status Broadcaster is now running!
 echo.
-echo - VLC is running with RC interface at 127.0.0.1:4212
 echo - Status server is broadcasting to UDP multicast 239.255.0.100:8888
-echo - No authentication required for RC interface
 echo.
-echo Press any key to stop both VLC and the status server...
+echo Press any key to stop the status server...
 pause >nul
 
 echo.
 echo Stopping VLC Status Server...
 taskkill /IM vlc_status_server.exe /F >nul 2>&1
-
-echo Stopping VLC...
-taskkill /IM vlc.exe /F >nul 2>&1
 
 echo.
 echo VLC Status Broadcaster stopped.
