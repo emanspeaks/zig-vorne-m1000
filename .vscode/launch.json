@@ -41,6 +41,43 @@
         {
             "type": "cppdbg",
             "request": "launch",
+            "name": "Run server vlc",
+            "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
+            "args": ["--vlc"],
+            "stopAtEntry": true,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "zig build",
+            "MIMode": "gdb",
+            // "miDebuggerPath": "${workspaceFolder}/gdbroot.sh",
+            "miDebuggerArgs": "-q",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set new-console off",
+                    "text": "set new-console off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set pagination off",
+                    "text": "set pagination off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Force target architecture for debuggee (MI-style)",
+                    "text": "-gdb-set architecture aarch64",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "type": "cppdbg",
+            "request": "launch",
             "name": "Run server bluray",
             "program": "${workspaceFolder}/zig-out/bin/zig_vorne_m1000",
             "args": ["--bluray"],
