@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <time.h>
 #include <ws2tcpip.h>
+#include <stdint.h>
 
 // Windows-specific headers
 #pragma comment(lib, "ws2_32.lib")
@@ -53,6 +54,7 @@ int parse_vlc_status(const char *json, vlc_status_t *status);
 char *create_status_json(const vlc_status_t *status);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
+char *base64_encode(const char *input);
 
 // Main server loop
 int main(int argc, char *argv[]) {
@@ -256,13 +258,14 @@ http_response_t *http_get(const char *host, int port, const char *path, const ch
         char credentials[256];
         snprintf(credentials, sizeof(credentials), ":%s", password);
 
-        // Simple base64 encoding for basic auth (basic implementation)
-        char auth_encoded[512];
-        // For simplicity, we'll use a basic encoding approach
-        // In production, you'd want proper base64 encoding
-        snprintf(auth_encoded, sizeof(auth_encoded), "Basic %s", password);
-
-        snprintf(auth_header, sizeof(auth_header), "Authorization: %s\r\n", auth_encoded);
+        // Base64 encode the credentials
+        char *auth_encoded = base64_encode(credentials);
+        if (auth_encoded) {
+            snprintf(auth_header, sizeof(auth_header), "Authorization: Basic %s\r\n", auth_encoded);
+            free(auth_encoded);
+        } else {
+            fprintf(stderr, "Failed to encode authentication credentials\n");
+        }
     }
 
     // Send HTTP request
@@ -530,4 +533,39 @@ void print_usage(const char *program_name) {
     printf("  vlc --http-host=127.0.0.1 --http-port=8080 --http-password=mypassword\n\n");
     printf("The server will query VLC at http://127.0.0.1:8080/requests/status.json\n");
     printf("and broadcast status updates to UDP multicast group 239.255.0.100:8888\n");
+}
+
+// Base64 encoding function
+char *base64_encode(const char *input) {
+    static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t input_len = strlen(input);
+    size_t output_len = 4 * ((input_len + 2) / 3);
+    char *output = malloc(output_len + 1);
+    if (!output) return NULL;
+
+    size_t i, j;
+    for (i = 0, j = 0; i < input_len; ) {
+        uint32_t octet_a = i < input_len ? (unsigned char)input[i++] : 0;
+        uint32_t octet_b = i < input_len ? (unsigned char)input[i++] : 0;
+        uint32_t octet_c = i < input_len ? (unsigned char)input[i++] : 0;
+
+        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
+
+        output[j++] = base64_chars[(triple >> 3 * 6) & 0x3F];
+        output[j++] = base64_chars[(triple >> 2 * 6) & 0x3F];
+        output[j++] = base64_chars[(triple >> 1 * 6) & 0x3F];
+        output[j++] = base64_chars[(triple >> 0 * 6) & 0x3F];
+    }
+
+    // Add padding
+    size_t padding = input_len % 3;
+    if (padding > 0) {
+        output[output_len - 1] = '=';
+        if (padding == 1) {
+            output[output_len - 2] = '=';
+        }
+    }
+
+    output[output_len] = '\0';
+    return output;
 }
