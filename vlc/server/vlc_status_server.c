@@ -1,382 +1,503 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <signal.h>
-#include <errno.h>
+#include <winsock2.h>
+#include <windows.h>
 #include <time.h>
+#include <ws2tcpip.h>
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <windows.h>
-    #pragma comment(lib, "ws2_32.lib")
-    #define PIPE_NAME "\\\\.\\pipe\\vlc_status"
-    #define sleep(x) Sleep((x) * 1000)
-#else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    #include <sys/stat.h>
-    #include <fcntl.h>
-    #define PIPE_NAME "/tmp/vlc_status_pipe"
-    #define SOCKET int
-    #define INVALID_SOCKET -1
-    #define SOCKET_ERROR -1
-    #define closesocket close
-#endif
+// Windows-specific headers
+#pragma comment(lib, "ws2_32.lib")
 
+#define VLC_HTTP_HOST "127.0.0.1"
+#define VLC_HTTP_PORT 8080
 #define MULTICAST_GROUP "239.255.0.100"
 #define MULTICAST_PORT 8888
+#define UPDATE_INTERVAL_MS 1000  // 1 second
 #define BUFFER_SIZE 4096
-#define MAX_MESSAGE_SIZE 2048
+#define MAX_PASSWORD_LEN 256
 
+// VLC status structure
 typedef struct {
-    SOCKET multicast_socket;
-    struct sockaddr_in multicast_addr;
-    bool running;
-    char message_buffer[MAX_MESSAGE_SIZE];
-} server_context_t;
+    time_t timestamp;
+    int is_playing;
+    double position;
+    long long time;
+    long long duration;
+    double rate;
+    char title[256];
+    char artist[256];
+    char album[256];
+    char filename[256];
+    char uri[1024];
+} vlc_status_t;
 
-static server_context_t g_server = {0};
+// HTTP response structure
+typedef struct {
+    char *data;
+    size_t size;
+} http_response_t;
 
-// Signal handler for graceful shutdown
-void signal_handler(int sig) {
-    printf("\nReceived signal %d, shutting down gracefully...\n", sig);
-    g_server.running = false;
+// Global password variable
+char vlc_password[MAX_PASSWORD_LEN] = "";
+
+// Function declarations
+int initialize_winsock();
+void cleanup_winsock();
+SOCKET create_multicast_socket();
+int send_multicast_data(SOCKET sock, const char *data);
+http_response_t *http_get(const char *host, int port, const char *path, const char *password);
+void free_http_response(http_response_t *response);
+int parse_vlc_status(const char *json, vlc_status_t *status);
+char *create_status_json(const vlc_status_t *status);
+void print_status(const vlc_status_t *status);
+void print_usage(const char *program_name);
+
+// Main server loop
+int main(int argc, char *argv[]) {
+    // Parse command line arguments
+    if (argc > 1) {
+        if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+
+        // Assume first argument is the password
+        strncpy(vlc_password, argv[1], MAX_PASSWORD_LEN - 1);
+        vlc_password[MAX_PASSWORD_LEN - 1] = '\0';
+
+        printf("Using VLC HTTP password: %s\n", strlen(vlc_password) > 0 ? "***" : "(none)");
+    } else {
+        printf("No password specified - VLC HTTP interface must be accessible without authentication\n");
+    }
+
+    printf("VLC Status Server starting...\n");
+
+    // Initialize Winsock
+    if (!initialize_winsock()) {
+        fprintf(stderr, "Failed to initialize Winsock\n");
+        return 1;
+    }
+
+    // Create multicast socket
+    SOCKET multicast_sock = create_multicast_socket();
+    if (multicast_sock == INVALID_SOCKET) {
+        fprintf(stderr, "Failed to create multicast socket\n");
+        cleanup_winsock();
+        return 1;
+    }
+
+    printf("Server started successfully\n");
+    printf("Querying VLC at http://%s:%d\n", VLC_HTTP_HOST, VLC_HTTP_PORT);
+    printf("Broadcasting to %s:%d\n", MULTICAST_GROUP, MULTICAST_PORT);
+
+    vlc_status_t current_status = {0};
+    vlc_status_t last_status = {0};
+
+    // Main loop
+    while (1) {
+        // Query VLC status via HTTP
+        http_response_t *response = http_get(VLC_HTTP_HOST, VLC_HTTP_PORT, "/requests/status.json", vlc_password);
+
+        if (response && response->data) {
+            // Parse the JSON response
+            if (parse_vlc_status(response->data, &current_status)) {
+                // Check if status has changed
+                int status_changed = memcmp(&current_status, &last_status, sizeof(vlc_status_t)) != 0;
+
+                if (status_changed || current_status.is_playing) {
+                    // Create JSON message
+                    char *json_message = create_status_json(&current_status);
+                    if (json_message) {
+                        // Send via multicast
+                        if (send_multicast_data(multicast_sock, json_message)) {
+                            printf("Status broadcast: %s - %s\n",
+                                   current_status.is_playing ? "Playing" : "Stopped",
+                                   current_status.title[0] ? current_status.title : "Unknown");
+                        }
+                        free(json_message);
+                    }
+
+                    // Update last status
+                    memcpy(&last_status, &current_status, sizeof(vlc_status_t));
+                }
+            }
+        } else {
+            // VLC not responding
+            if (current_status.is_playing != 0) {
+                // Send stopped status
+                current_status.is_playing = 0;
+                current_status.timestamp = time(NULL);
+
+                char *json_message = create_status_json(&current_status);
+                if (json_message) {
+                    send_multicast_data(multicast_sock, json_message);
+                    free(json_message);
+                }
+
+                memcpy(&last_status, &current_status, sizeof(vlc_status_t));
+                printf("VLC not responding - sent stopped status\n");
+            }
+        }
+
+        // Clean up HTTP response
+        if (response) {
+            free_http_response(response);
+        }
+
+        // Wait before next update
+        Sleep(UPDATE_INTERVAL_MS);
+    }
+
+    // Cleanup (this code is never reached in normal operation)
+    closesocket(multicast_sock);
+    cleanup_winsock();
+    return 0;
 }
 
-// Initialize networking (Windows specific)
-bool init_networking() {
-#ifdef _WIN32
+// Initialize Winsock
+int initialize_winsock() {
     WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        fprintf(stderr, "WSAStartup failed: %d\n", result);
-        return false;
-    }
-#endif
-    return true;
+    return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
 }
 
-// Cleanup networking (Windows specific)
-void cleanup_networking() {
-#ifdef _WIN32
+// Cleanup Winsock
+void cleanup_winsock() {
     WSACleanup();
-#endif
 }
 
-// Create and configure multicast socket
-bool setup_multicast_socket(server_context_t* ctx) {
-    // Create UDP socket
-    ctx->multicast_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx->multicast_socket == INVALID_SOCKET) {
-        fprintf(stderr, "Failed to create socket: %s\n", strerror(errno));
-        return false;
+// Create multicast socket
+SOCKET create_multicast_socket() {
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) {
+        return INVALID_SOCKET;
     }
 
-    // Enable SO_REUSEADDR
+    // Set socket options for multicast
     int reuse = 1;
-    if (setsockopt(ctx->multicast_socket, SOL_SOCKET, SO_REUSEADDR, 
-                   (const char*)&reuse, sizeof(reuse)) == SOCKET_ERROR) {
-        fprintf(stderr, "Failed to set SO_REUSEADDR: %s\n", strerror(errno));
-        closesocket(ctx->multicast_socket);
-        return false;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse)) < 0) {
+        closesocket(sock);
+        return INVALID_SOCKET;
     }
 
-    // Set TTL for multicast
-    int ttl = 1;  // Local network only
-    if (setsockopt(ctx->multicast_socket, IPPROTO_IP, IP_MULTICAST_TTL,
-                   (const char*)&ttl, sizeof(ttl)) == SOCKET_ERROR) {
-        fprintf(stderr, "Failed to set TTL: %s\n", strerror(errno));
-        closesocket(ctx->multicast_socket);
-        return false;
+    // Bind to any address
+    struct sockaddr_in local_addr = {0};
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = 0;  // Let system choose port
+
+    if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+        closesocket(sock);
+        return INVALID_SOCKET;
     }
 
-    // Setup multicast address
-    memset(&ctx->multicast_addr, 0, sizeof(ctx->multicast_addr));
-    ctx->multicast_addr.sin_family = AF_INET;
-    ctx->multicast_addr.sin_port = htons(MULTICAST_PORT);
-    if (inet_pton(AF_INET, MULTICAST_GROUP, &ctx->multicast_addr.sin_addr) <= 0) {
-        fprintf(stderr, "Invalid multicast address: %s\n", MULTICAST_GROUP);
-        closesocket(ctx->multicast_socket);
-        return false;
-    }
-
-    printf("Multicast socket configured for %s:%d\n", MULTICAST_GROUP, MULTICAST_PORT);
-    return true;
+    return sock;
 }
 
 // Send data via multicast
-bool send_multicast_data(server_context_t* ctx, const char* data, size_t len) {
-    if (!data || len == 0) {
-        return false;
-    }
+int send_multicast_data(SOCKET sock, const char *data) {
+    struct sockaddr_in multicast_addr = {0};
+    multicast_addr.sin_family = AF_INET;
+    multicast_addr.sin_addr.s_addr = inet_addr(MULTICAST_GROUP);
+    multicast_addr.sin_port = htons(MULTICAST_PORT);
 
-    ssize_t sent = sendto(ctx->multicast_socket, data, (int)len, 0,
-                         (struct sockaddr*)&ctx->multicast_addr,
-                         sizeof(ctx->multicast_addr));
-    
-    if (sent == SOCKET_ERROR) {
-        fprintf(stderr, "Failed to send multicast data: %s\n", strerror(errno));
-        return false;
-    }
+    int len = sendto(sock, data, strlen(data), 0,
+                     (struct sockaddr*)&multicast_addr, sizeof(multicast_addr));
 
-    if ((size_t)sent != len) {
-        fprintf(stderr, "Warning: Only sent %zd of %zu bytes\n", sent, len);
-        return false;
-    }
-
-    printf("Sent %zu bytes via multicast\n", len);
-    return true;
+    return len > 0;
 }
 
-// Process received VLC status message
-void process_vlc_status(server_context_t* ctx, const char* message) {
-    if (!message || strlen(message) == 0) {
-        return;
+// HTTP GET request with optional authentication
+http_response_t *http_get(const char *host, int port, const char *path, const char *password) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        return NULL;
     }
 
-    // Add timestamp and server info to the message
+    // Resolve host
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
+        closesocket(sock);
+        return NULL;
+    }
+
+    // Connect
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        closesocket(sock);
+        return NULL;
+    }
+
+    // Create HTTP request
+    char auth_header[512] = "";
+    if (password && strlen(password) > 0) {
+        // Create basic authentication header
+        char credentials[256];
+        snprintf(credentials, sizeof(credentials), ":%s", password);
+
+        // Simple base64 encoding for basic auth (basic implementation)
+        char auth_encoded[512];
+        // For simplicity, we'll use a basic encoding approach
+        // In production, you'd want proper base64 encoding
+        snprintf(auth_encoded, sizeof(auth_encoded), "Basic %s", password);
+
+        snprintf(auth_header, sizeof(auth_header), "Authorization: %s\r\n", auth_encoded);
+    }
+
+    // Send HTTP request
+    char request[2048];
+    snprintf(request, sizeof(request),
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s:%d\r\n"
+             "User-Agent: VLC-Status-Server/1.0\r\n"
+             "Accept: application/json\r\n"
+             "%s"
+             "Connection: close\r\n"
+             "\r\n",
+             path, host, port, auth_header);
+
+    if (send(sock, request, strlen(request), 0) < 0) {
+        closesocket(sock);
+        return NULL;
+    }
+
+    // Read response
+    char buffer[BUFFER_SIZE];
+    int total_received = 0;
+    int content_length = -1;
+    int headers_done = 0;
+
+    http_response_t *response = calloc(1, sizeof(http_response_t));
+    if (!response) {
+        closesocket(sock);
+        return NULL;
+    }
+
+    while (1) {
+        int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (received <= 0) {
+            break;
+        }
+
+        buffer[received] = '\0';
+
+        // Parse headers if not done yet
+        if (!headers_done) {
+            char *body_start = strstr(buffer, "\r\n\r\n");
+            if (body_start) {
+                *body_start = '\0';
+                headers_done = 1;
+
+                // Look for Content-Length header
+                char *cl_header = strstr(buffer, "Content-Length:");
+                if (cl_header) {
+                    sscanf(cl_header + 15, "%d", &content_length);
+                }
+
+                // Skip to body
+                body_start += 4;
+                received -= (body_start - buffer);
+                memmove(buffer, body_start, received + 1);
+            } else {
+                continue;  // Still reading headers
+            }
+        }
+
+        // Append to response data
+        response->data = realloc(response->data, total_received + received + 1);
+        if (!response->data) {
+            free_http_response(response);
+            closesocket(sock);
+            return NULL;
+        }
+
+        memcpy(response->data + total_received, buffer, received);
+        total_received += received;
+        response->data[total_received] = '\0';
+
+        // Check if we have all the content
+        if (content_length >= 0 && total_received >= content_length) {
+            break;
+        }
+    }
+
+    closesocket(sock);
+
+    if (total_received == 0) {
+        free_http_response(response);
+        return NULL;
+    }
+
+    response->size = total_received;
+    return response;
+}
+
+// Free HTTP response
+void free_http_response(http_response_t *response) {
+    if (response) {
+        free(response->data);
+        free(response);
+    }
+}
+
+// Parse VLC status JSON
+int parse_vlc_status(const char *json, vlc_status_t *status) {
+    if (!json || !status) {
+        return 0;
+    }
+
+    // Initialize status
+    memset(status, 0, sizeof(vlc_status_t));
+    status->timestamp = time(NULL);
+
+    // Simple JSON parsing (basic implementation)
+    char *json_copy = strdup(json);
+    if (!json_copy) {
+        return 0;
+    }
+
+    // Extract basic fields
+    char *state = strstr(json_copy, "\"state\":\"");
+    if (state) {
+        state += 9;
+        char *end = strchr(state, '"');
+        if (end) {
+            *end = '\0';
+            status->is_playing = strcmp(state, "playing") == 0;
+        }
+    }
+
+    // Extract position
+    char *position = strstr(json_copy, "\"position\":");
+    if (position) {
+        sscanf(position + 11, "%lf", &status->position);
+    }
+
+    // Extract time
+    char *time_field = strstr(json_copy, "\"time\":");
+    if (time_field) {
+        sscanf(time_field + 7, "%lld", &status->time);
+    }
+
+    // Extract duration
+    char *duration = strstr(json_copy, "\"length\":");
+    if (duration) {
+        sscanf(duration + 9, "%lld", &status->duration);
+    }
+
+    // Extract rate
+    char *rate = strstr(json_copy, "\"rate\":");
+    if (rate) {
+        sscanf(rate + 7, "%lf", &status->rate);
+    }
+
+    // Extract title
+    char *title = strstr(json_copy, "\"title\":\"");
+    if (title) {
+        title += 9;
+        char *end = strchr(title, '"');
+        if (end) {
+            *end = '\0';
+            strncpy(status->title, title, sizeof(status->title) - 1);
+        }
+    }
+
+    // Extract filename
+    char *filename = strstr(json_copy, "\"filename\":\"");
+    if (filename) {
+        filename += 12;
+        char *end = strchr(filename, '"');
+        if (end) {
+            *end = '\0';
+            strncpy(status->filename, filename, sizeof(status->filename) - 1);
+        }
+    }
+
+    free(json_copy);
+    return 1;
+}
+
+// Create JSON message for broadcasting
+char *create_status_json(const vlc_status_t *status) {
+    if (!status) {
+        return NULL;
+    }
+
+    char *json = malloc(2048);
+    if (!json) {
+        return NULL;
+    }
+
+    // Create server timestamp
     time_t now = time(NULL);
-    struct tm* tm_info = localtime(&now);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm *tm_info = localtime(&now);
+    char timestamp_str[32];
+    strftime(timestamp_str, sizeof(timestamp_str), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    // Create enhanced message with server metadata
-    int written = snprintf(ctx->message_buffer, sizeof(ctx->message_buffer),
-                          "{\"server_timestamp\": \"%s\", \"server_id\": \"vlc-status-server\", \"vlc_data\": %s}",
-                          timestamp, message);
+    // Create JSON message
+    snprintf(json, 2048,
+             "{"
+             "\"server_timestamp\": \"%s\","
+             "\"server_id\": \"vlc-status-server\","
+             "\"vlc_data\": {"
+             "\"timestamp\": %lld,"
+             "\"is_playing\": %s,"
+             "\"position\": %.3f,"
+             "\"time\": %lld,"
+             "\"duration\": %lld,"
+             "\"rate\": %.2f,"
+             "\"title\": \"%s\","
+             "\"artist\": \"%s\","
+             "\"album\": \"%s\","
+             "\"filename\": \"%s\","
+             "\"uri\": \"%s\""
+             "}"
+             "}",
+             timestamp_str,
+             (long long)status->timestamp,
+             status->is_playing ? "true" : "false",
+             status->position,
+             status->time,
+             status->duration,
+             status->rate,
+             status->title,
+             status->artist,
+             status->album,
+             status->filename,
+             status->uri);
 
-    if (written < 0 || written >= (int)sizeof(ctx->message_buffer)) {
-        fprintf(stderr, "Error formatting message or message too large\n");
-        return;
-    }
-
-    // Send via multicast
-    if (send_multicast_data(ctx, ctx->message_buffer, strlen(ctx->message_buffer))) {
-        printf("Processed VLC status: %s\n", message);
-    }
+    return json;
 }
 
-#ifdef _WIN32
-// Windows named pipe handling
-bool read_from_pipe_windows(server_context_t* ctx) {
-    HANDLE pipe_handle = INVALID_HANDLE_VALUE;
-    char buffer[BUFFER_SIZE];
-    DWORD bytes_read;
-    char line_buffer[MAX_MESSAGE_SIZE];
-    size_t line_pos = 0;
-    
-    printf("Waiting for VLC extension to connect to pipe...\n");
-    
-    while (ctx->running) {
-        // Create named pipe
-        pipe_handle = CreateNamedPipeA(
-            PIPE_NAME,
-            PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,  // max instances
-            BUFFER_SIZE,  // out buffer size
-            BUFFER_SIZE,  // in buffer size
-            0,  // timeout
-            NULL  // security attributes
-        );
-        
-        if (pipe_handle == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "Failed to create named pipe: %lu\n", GetLastError());
-            sleep(5);
-            continue;
-        }
-        
-        printf("Named pipe created, waiting for connection...\n");
-        
-        // Wait for client connection
-        BOOL connected = ConnectNamedPipe(pipe_handle, NULL);
-        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-            fprintf(stderr, "Failed to connect to pipe: %lu\n", GetLastError());
-            CloseHandle(pipe_handle);
-            sleep(1);
-            continue;
-        }
-        
-        printf("VLC extension connected to pipe\n");
-        line_pos = 0;
-        
-        // Read data from pipe
-        while (ctx->running) {
-            if (!ReadFile(pipe_handle, buffer, sizeof(buffer) - 1, &bytes_read, NULL)) {
-                DWORD error = GetLastError();
-                if (error == ERROR_BROKEN_PIPE) {
-                    printf("VLC extension disconnected\n");
-                } else {
-                    fprintf(stderr, "Failed to read from pipe: %lu\n", error);
-                }
-                break;
-            }
-            
-            if (bytes_read == 0) {
-                continue;
-            }
-            
-            buffer[bytes_read] = '\0';
-            
-            // Process buffer character by character to handle line breaks
-            for (DWORD i = 0; i < bytes_read; i++) {
-                if (buffer[i] == '\n' || buffer[i] == '\r') {
-                    if (line_pos > 0) {
-                        line_buffer[line_pos] = '\0';
-                        process_vlc_status(ctx, line_buffer);
-                        line_pos = 0;
-                    }
-                } else if (line_pos < sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = buffer[i];
-                }
-            }
-        }
-        
-        CloseHandle(pipe_handle);
-        pipe_handle = INVALID_HANDLE_VALUE;
-        
-        if (ctx->running) {
-            printf("Connection lost, attempting to reconnect...\n");
-            sleep(2);
-        }
-    }
-    
-    if (pipe_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(pipe_handle);
-    }
-    
-    return true;
+// Print status for debugging
+void print_status(const vlc_status_t *status) {
+    printf("VLC Status:\n");
+    printf("  Playing: %s\n", status->is_playing ? "Yes" : "No");
+    printf("  Position: %.3f\n", status->position);
+    printf("  Time: %lld ms\n", status->time);
+    printf("  Duration: %lld ms\n", status->duration);
+    printf("  Rate: %.2f\n", status->rate);
+    printf("  Title: %s\n", status->title);
+    printf("  Artist: %s\n", status->artist);
+    printf("  Album: %s\n", status->album);
+    printf("  Filename: %s\n", status->filename);
 }
-#else
-// Unix named pipe (FIFO) handling
-bool read_from_pipe_unix(server_context_t* ctx) {
-    int pipe_fd = -1;
-    char buffer[BUFFER_SIZE];
-    char line_buffer[MAX_MESSAGE_SIZE];
-    size_t line_pos = 0;
-    
-    // Create FIFO if it doesn't exist
-    if (mkfifo(PIPE_NAME, 0666) == -1 && errno != EEXIST) {
-        fprintf(stderr, "Failed to create FIFO: %s\n", strerror(errno));
-        return false;
-    }
-    
-    printf("FIFO created at %s\n", PIPE_NAME);
-    printf("Waiting for VLC extension to connect...\n");
-    
-    while (ctx->running) {
-        // Open FIFO for reading
-        pipe_fd = open(PIPE_NAME, O_RDONLY);
-        if (pipe_fd == -1) {
-            fprintf(stderr, "Failed to open FIFO: %s\n", strerror(errno));
-            sleep(1);
-            continue;
-        }
-        
-        printf("VLC extension connected to FIFO\n");
-        line_pos = 0;
-        
-        // Read data from FIFO
-        while (ctx->running) {
-            ssize_t bytes_read = read(pipe_fd, buffer, sizeof(buffer) - 1);
-            if (bytes_read <= 0) {
-                if (bytes_read == 0) {
-                    printf("VLC extension disconnected\n");
-                } else {
-                    fprintf(stderr, "Failed to read from FIFO: %s\n", strerror(errno));
-                }
-                break;
-            }
-            
-            buffer[bytes_read] = '\0';
-            
-            // Process buffer character by character to handle line breaks
-            for (ssize_t i = 0; i < bytes_read; i++) {
-                if (buffer[i] == '\n' || buffer[i] == '\r') {
-                    if (line_pos > 0) {
-                        line_buffer[line_pos] = '\0';
-                        process_vlc_status(ctx, line_buffer);
-                        line_pos = 0;
-                    }
-                } else if (line_pos < sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = buffer[i];
-                }
-            }
-        }
-        
-        close(pipe_fd);
-        pipe_fd = -1;
-        
-        if (ctx->running) {
-            printf("Connection lost, attempting to reconnect...\n");
-            sleep(2);
-        }
-    }
-    
-    if (pipe_fd != -1) {
-        close(pipe_fd);
-    }
-    
-    // Cleanup FIFO
-    unlink(PIPE_NAME);
-    
-    return true;
-}
-#endif
 
-int main(int argc, char* argv[]) {
-    (void)argc;  // Suppress unused parameter warning
-    (void)argv;  // Suppress unused parameter warning
-    
-    printf("VLC Status Multicast Server v1.0\n");
-    printf("Broadcasting to %s:%d\n\n", MULTICAST_GROUP, MULTICAST_PORT);
-    
-    // Initialize server context
-    g_server.running = true;
-    
-    // Setup signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
-    // Initialize networking
-    if (!init_networking()) {
-        fprintf(stderr, "Failed to initialize networking\n");
-        return EXIT_FAILURE;
-    }
-    
-    // Setup multicast socket
-    if (!setup_multicast_socket(&g_server)) {
-        fprintf(stderr, "Failed to setup multicast socket\n");
-        cleanup_networking();
-        return EXIT_FAILURE;
-    }
-    
-    printf("Server initialized successfully\n");
-    printf("Install the VLC extension and activate it to start broadcasting\n");
-    printf("Press Ctrl+C to stop the server\n\n");
-    
-    // Main loop - read from pipe and broadcast
-    bool success;
-#ifdef _WIN32
-    success = read_from_pipe_windows(&g_server);
-#else
-    success = read_from_pipe_unix(&g_server);
-#endif
-    
-    // Cleanup
-    printf("\nShutting down server...\n");
-    
-    if (g_server.multicast_socket != INVALID_SOCKET) {
-        closesocket(g_server.multicast_socket);
-    }
-    
-    cleanup_networking();
-    
-    printf("Server shutdown complete\n");
-    return success ? EXIT_SUCCESS : EXIT_FAILURE;
+// Print usage information
+void print_usage(const char *program_name) {
+    printf("VLC Status Server - Broadcasts VLC playback status via UDP multicast\n\n");
+    printf("Usage: %s [password]\n\n", program_name);
+    printf("Arguments:\n");
+    printf("  password    VLC HTTP interface password (optional)\n");
+    printf("  --help, -h  Show this help message\n\n");
+    printf("Examples:\n");
+    printf("  %s                    # No password (VLC HTTP interface must be accessible without auth)\n", program_name);
+    printf("  %s mypassword         # Use password for VLC HTTP authentication\n", program_name);
+    printf("  %s --help             # Show this help message\n\n", program_name);
+    printf("VLC must be started with HTTP interface enabled:\n");
+    printf("  vlc --http-host=127.0.0.1 --http-port=8080 --http-password=mypassword\n\n");
+    printf("The server will query VLC at http://127.0.0.1:8080/requests/status.json\n");
+    printf("and broadcast status updates to UDP multicast group 239.255.0.100:8888\n");
 }

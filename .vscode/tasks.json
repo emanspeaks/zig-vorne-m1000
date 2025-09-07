@@ -14,6 +14,41 @@
 					"fileLocation": "autoDetect"
 				}
 			]
+		},
+		{
+			"type": "shell",
+			"label": "cmake configure",
+			"command": "cmake",
+			"args": ["--preset", "windows-x64"],
+			"options": {
+				"cwd": "${workspaceFolder}/vlc/server"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"type": "shell",
+			"label": "cmake build",
+			"command": "cmake",
+			"args": ["--build", "--preset", "windows-x64"],
+			"options": {
+				"cwd": "${workspaceFolder}/vlc/server"
+			},
+			"group": "build",
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
+			"type": "shell",
+			"label": "clean build",
+			"command": "rm",
+			"args": ["-rf", "build"],
+			"options": {
+				"cwd": "${workspaceFolder}/vlc/server"
+			},
+			"group": "build",
+			"problemMatcher": []
 		}
 	]
 }

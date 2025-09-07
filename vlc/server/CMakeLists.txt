@@ -33,6 +33,12 @@ set_target_properties(vlc_status_server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Windows-specific: Force console subsystem
+set_target_properties(vlc_status_server PROPERTIES
+    WIN32_EXECUTABLE FALSE
+)
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--subsystem,console")
+
 # Installation rules
 install(TARGETS vlc_status_server
     RUNTIME DESTINATION bin
