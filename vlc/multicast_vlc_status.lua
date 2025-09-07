@@ -20,11 +20,16 @@ local mcast_addr = "239.255.0.1"
 local mcast_port = 5005
 local running = false
 local last_send = 0
-local timer_id = nil
+local callback_id = nil
+
+-- Callback for time changes
+local function time_changed()
+    push_status()
+end
 
 -- Add menu item to VLC interface
 function menu()
-    return {"Start Broadcasting", "Stop Broadcasting", "Send Test Message"}
+    return {"Start Broadcasting", "Stop Broadcasting", "Send Test Message", "Send Current Status"}
 end
 
 -- Handle menu selections
@@ -40,6 +45,9 @@ function trigger_menu(id)
     elseif id == 3 then
         vlc.msg.info("[multicast_time] Manual test requested")
         test_multicast()
+    elseif id == 4 then
+        vlc.msg.info("[multicast_time] Manual status requested")
+        push_status()
     end
 end
 
@@ -53,18 +61,6 @@ function activate()
     end
 
     running = true
-    vlc.msg.info("[multicast_time] Starting timer with 250ms interval")
-
-    -- Register the timer
-    timer_id = vlc.timer.register(250, push_status)
-    if timer_id then
-        vlc.msg.info("[multicast_time] Timer registered successfully (ID: " .. tostring(timer_id) .. ")")
-    else
-        vlc.msg.err("[multicast_time] Failed to register timer!")
-        running = false
-        return
-    end
-
     vlc.msg.info("[multicast_time] Extension activated successfully!")
 
     -- Send an initial test message
@@ -74,9 +70,9 @@ end
 -- Deactivate on exit
 function deactivate()
     vlc.msg.info("[multicast_time] Deactivated")
-    if timer_id then
-        vlc.timer.unregister(timer_id)
-        timer_id = nil
+    if callback_id then
+        vlc.var.del_callback(callback_id)
+        callback_id = nil
     end
     running = false
 end
@@ -87,6 +83,17 @@ function input_changed()
     if not running then
         vlc.msg.info("[multicast_time] Auto-starting due to media load")
         running = true
+    end
+    -- Remove previous callback if exists
+    if callback_id then
+        vlc.var.del_callback(callback_id)
+        callback_id = nil
+    end
+    -- Add callback for time changes
+    local input = vlc.object.input()
+    if input then
+        callback_id = vlc.var.add_callback(input, "time", time_changed)
+        vlc.msg.info("[multicast_time] Added time callback")
     end
     push_status()
 end
