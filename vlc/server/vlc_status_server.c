@@ -112,6 +112,7 @@ int main(int argc, char *argv[]) {
 
     // Main loop
     while (1) {
+        DWORD frame_start = GetTickCount();
         // Query VLC status via HTTP
         http_response_t *response = http_get(VLC_HTTP_HOST, VLC_HTTP_PORT, "/requests/status.json", vlc_password);
 
@@ -183,8 +184,20 @@ int main(int argc, char *argv[]) {
             free_http_response(response);
         }
 
-        // Wait before next update
-        Sleep(UPDATE_INTERVAL_MS);
+        // Calculate sleep time to maintain fixed frame rate
+        DWORD frame_end = GetTickCount();
+        DWORD frame_duration = frame_end - frame_start;
+        DWORD sleep_time = 0;
+
+        if (frame_duration < UPDATE_INTERVAL_MS) {
+            sleep_time = UPDATE_INTERVAL_MS - frame_duration;
+        }
+        // If frame took longer than UPDATE_INTERVAL_MS, sleep_time remains 0
+
+        if (sleep_time > 0) {
+            Sleep(sleep_time);
+        }
+        // Note: If sleep_time is 0, we skip sleep to maintain responsiveness
     }
 
     // Cleanup (this code is never reached in normal operation)
