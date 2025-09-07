@@ -42,6 +42,7 @@ char vlc_password[MAX_PASSWORD_LEN] = "";
 int debug_mode = 0; // Global debug flag
 
 // Function declarations
+long long getUnixTimeMs();
 int initialize_winsock();
 void cleanup_winsock();
 SOCKET create_multicast_socket();
@@ -53,6 +54,18 @@ char *create_status_json(const vlc_status_t *status);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
 char *base64_encode(const char *input);
+
+// Get Unix timestamp in milliseconds (UTC)
+long long getUnixTimeMs() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER ull;
+    ull.LowPart = ft.dwLowDateTime;
+    ull.HighPart = ft.dwHighDateTime;
+    ull.QuadPart /= 10000; // Convert to milliseconds since 1601
+    ull.QuadPart -= 11644473600000LL; // Subtract milliseconds from 1601 to 1970
+    return ull.QuadPart;
+}
 
 // Main server loop
 int main(int argc, char *argv[]) {
@@ -100,9 +113,9 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Server started successfully\n");
-    // Get current timestamp with subsecond precision
+    // Get current timestamp with subsecond precision (UTC)
     SYSTEMTIME st;
-    GetLocalTime(&st);
+    GetSystemTime(&st);
     char time_str[64];
     snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
@@ -150,62 +163,59 @@ int main(int argc, char *argv[]) {
                            status_changed ? "Yes" : "No");
                 }
 
-                if (status_changed || current_status.is_playing) {
-                    // Create JSON message
-                    char *json_message = create_status_json(&current_status);
-                    if (json_message) {
-                        if (debug_mode) {
-                            printf("[DEBUG] Multicast JSON: %s\n", json_message);
-                        }
-                        // Send via multicast
-                        if (send_multicast_data(multicast_sock, json_message)) {
-                            // Get current timestamp with subsecond precision
-                            SYSTEMTIME st;
-                            GetLocalTime(&st);
-                            char time_str[32];
-                            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-                                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-                            printf("[%s] Status broadcast: %s - %s\n",
-                                   time_str,
-                                   current_status.is_playing ? "Playing" : "Stopped",
-                                   current_status.title[0] ? current_status.title : "Unknown");
-                            if (debug_mode) {
-                                print_status(&current_status);
-                            }
-                        }
-                        free(json_message);
-                    }
-
+                if (status_changed) {
                     // Update last status
                     memcpy(&last_status, &current_status, sizeof(vlc_status_t));
                 }
-            }
-        } else {
-            // VLC not responding
-            if (current_status.is_playing != 0) {
-                // Send stopped status
-                current_status.is_playing = 0;
-                current_status.timestamp = time(NULL);
 
+                // Always send the current status
                 char *json_message = create_status_json(&current_status);
                 if (json_message) {
-                    send_multicast_data(multicast_sock, json_message);
+                    if (debug_mode) {
+                        printf("[DEBUG] Multicast JSON: %s\n", json_message);
+                    }
+                    // Send via multicast
+                    if (send_multicast_data(multicast_sock, json_message)) {
+                        // Get current timestamp with subsecond precision (UTC)
+                        SYSTEMTIME st;
+                        GetSystemTime(&st);
+                        char time_str[32];
+                        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                               st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+                        printf("[%s] Status broadcast: %s - %s\n",
+                               time_str,
+                               current_status.is_playing ? "Playing" : "Stopped",
+                               current_status.title[0] ? current_status.title : "Unknown");
+                        if (debug_mode) {
+                            print_status(&current_status);
+                        }
+                    }
                     free(json_message);
                 }
+            }
+        } else {
+            // VLC not responding - always send stopped status
+            current_status.is_playing = 0;
+            // current_status.timestamp = time(NULL); // Removed to avoid redundancy
 
-                memcpy(&last_status, &current_status, sizeof(vlc_status_t));
-                // Get current timestamp with subsecond precision
-                SYSTEMTIME st;
-                GetLocalTime(&st);
-                char time_str[32];
-                snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            char *json_message = create_status_json(&current_status);
+            if (json_message) {
+                send_multicast_data(multicast_sock, json_message);
+                free(json_message);
+            }
 
-                printf("[%s] VLC not responding - sent stopped status\n", time_str);
-                if (debug_mode) {
-                    printf("[DEBUG] VLC not responding, sent stopped status\n");
-                }
+            memcpy(&last_status, &current_status, sizeof(vlc_status_t));
+            // Get current timestamp with subsecond precision (UTC)
+            SYSTEMTIME st;
+            GetSystemTime(&st);
+            char time_str[32];
+            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+            printf("[%s] VLC not responding - sent stopped status\n", time_str);
+            if (debug_mode) {
+                printf("[DEBUG] VLC not responding, sent stopped status\n");
             }
         }
 
@@ -442,7 +452,7 @@ int parse_vlc_status(const char *json, vlc_status_t *status) {
 
     // Initialize status
     memset(status, 0, sizeof(vlc_status_t));
-    status->timestamp = time(NULL);
+    // status->timestamp = time(NULL); // Removed to avoid redundancy
 
     // Simple JSON parsing (basic implementation)
     char *json_copy = strdup(json);
@@ -569,20 +579,15 @@ char *create_status_json(const vlc_status_t *status) {
         return NULL;
     }
 
-    // Create server timestamp with subsecond precision
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char timestamp_str[64];
-    snprintf(timestamp_str, sizeof(timestamp_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
-           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    // Get server timestamp as Unix milliseconds (UTC)
+    long long server_timestamp_ms = getUnixTimeMs();
 
     // Create JSON message
     snprintf(json, 2048,
              "{"
-             "\"server_timestamp\": \"%s\","
+             "\"server_timestamp\": %lld,"
              "\"server_id\": \"vlc-status-server\","
              "\"vlc_data\": {"
-             "\"timestamp\": %lld,"
              "\"is_playing\": %s,"
              "\"position\": %.3f,"
              "\"time\": %lld,"
@@ -595,8 +600,7 @@ char *create_status_json(const vlc_status_t *status) {
              "\"uri\": \"%s\""
              "}"
              "}",
-             timestamp_str,
-             (long long)status->timestamp,
+             server_timestamp_ms,
              status->is_playing ? "true" : "false",
              status->position,
              status->time,

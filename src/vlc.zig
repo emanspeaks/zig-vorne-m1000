@@ -155,7 +155,7 @@ pub const VlcPlayer = struct {
 
         // Receive all available messages, keeping only the latest
         var latest_message: ?[]const u8 = null;
-        var latest_server_ts: ?[]const u8 = null;
+        var latest_server_ts_ms: ?i64 = null;
         var latest_bytes: usize = 0;
 
         while (true) {
@@ -179,12 +179,12 @@ pub const VlcPlayer = struct {
                 };
                 defer json.deinit();
 
-                var server_ts: ?[]const u8 = null;
+                var server_ts_ms: ?i64 = null;
                 if (json.value == .object) {
                     const obj = &json.value.object;
                     if (obj.get("server_timestamp")) |ts_val| {
-                        if (ts_val == .string) {
-                            server_ts = ts_val.string;
+                        if (ts_val == .integer) {
+                            server_ts_ms = ts_val.integer;
                         }
                     }
                 }
@@ -194,7 +194,7 @@ pub const VlcPlayer = struct {
                     self.allocator.free(old_msg);
                 }
                 latest_message = message;
-                latest_server_ts = server_ts;
+                latest_server_ts_ms = server_ts_ms;
                 latest_bytes = bytes_read;
             } else |err| switch (err) {
                 error.WouldBlock => {
@@ -220,37 +220,19 @@ pub const VlcPlayer = struct {
             };
             defer json.deinit();
 
-            var server_ts: ?[]const u8 = null;
+            var server_ts_ms: ?i64 = null;
             if (json.value == .object) {
                 const obj = &json.value.object;
                 if (obj.get("server_timestamp")) |ts_val| {
-                    if (ts_val == .string) {
-                        server_ts = ts_val.string;
+                    if (ts_val == .integer) {
+                        server_ts_ms = ts_val.integer;
                     }
                 }
             }
 
             var delta_sec: ?i64 = null;
-            if (server_ts) |ts| {
-                // Parse timestamp string: "YYYY-MM-DD HH:MM:SS"
-                const year = try std.fmt.parseInt(u16, ts[0..4], 10);
-                const month = try std.fmt.parseInt(u8, ts[5..7], 10);
-                const day = try std.fmt.parseInt(u8, ts[8..10], 10);
-                const hour = try std.fmt.parseInt(u8, ts[11..13], 10);
-                const min = try std.fmt.parseInt(u8, ts[14..16], 10);
-                const sec = try std.fmt.parseInt(u8, ts[17..19], 10);
-                const server_epoch_local = time.ymdhmsToTimestamp(time.Ymdhms{
-                    .year = year,
-                    .month = month,
-                    .day = day,
-                    .hour = hour,
-                    .minute = min,
-                    .second = sec,
-                });
-                // Server time is in local timezone, get dynamic offset to UTC
-                const zi = time.getTimezoneInfo();
-                const tz_offset_sec = zi.offset_sec;
-                const server_epoch_utc = server_epoch_local - tz_offset_sec;
+            if (server_ts_ms) |ts_ms| {
+                const server_epoch_utc = @divTrunc(ts_ms, 1000);
                 const now_epoch = std.time.timestamp();
 
                 // Discard if message is older than last processed
@@ -262,7 +244,7 @@ pub const VlcPlayer = struct {
                 delta_sec = now_epoch - server_epoch_utc;
                 self.last_processed_ts = server_epoch_utc;
             }
-            std.debug.print("VLC: Received {} bytes. Server ts: {s}, Local ts: {}, Delta: {any} sec\n", .{ latest_bytes, server_ts orelse "(none)", std.time.timestamp(), delta_sec });
+            std.debug.print("VLC: Received {} bytes. Server ts: {any}, Local ts: {}, Delta: {any} sec\n", .{ latest_bytes, latest_server_ts_ms, std.time.timestamp(), delta_sec });
             try self.parseMessage(message);
         }
     }
@@ -315,7 +297,7 @@ pub const VlcPlayer = struct {
     fn parseMessage(self: *Self, message: []const u8) !void {
         std.debug.print("VLC: Parsing message: {s}\n", .{message});
 
-        // Parse the new JSON format from C server: {"server_timestamp":"...","server_id":"...","vlc_data":{...}}
+        // Parse the new JSON format from C server: {"server_timestamp":<ms>,"server_id":"...","vlc_data":{...}}
         var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
             std.debug.print("VLC: JSON parse error\n", .{});
             return;
