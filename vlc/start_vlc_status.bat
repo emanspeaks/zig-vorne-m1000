@@ -43,11 +43,12 @@ if not exist "%SERVER_EXE%" (
 
 echo Starting VLC with HTTP interface...
 start "VLC Media Player" "%VLC_EXE%" ^
+    --extraintf=http ^
     --http-password=%PASSWORD%
     @REM --no-http-acl
 
-echo Waiting 3 seconds for VLC to start...
-timeout /t 3 /nobreak >nul
+echo Waiting 1 second for VLC to start...
+timeout /t 1 /nobreak >nul
 
 echo Starting VLC Status Server...
 if "%DEBUG%"=="1" (
