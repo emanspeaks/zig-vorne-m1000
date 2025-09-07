@@ -21,6 +21,7 @@ local mcast_port = 5005
 local running = false
 local last_send = 0
 local callback_id = nil
+local stream = nil
 
 -- Callback for time changes
 local function time_changed()
@@ -61,6 +62,13 @@ function activate()
     end
 
     running = true
+    -- Create UDP stream for multicast
+    stream = vlc.stream("udp://@" .. mcast_addr .. ":" .. mcast_port)
+    if not stream then
+        vlc.msg.err("[multicast_time] Failed to create UDP stream!")
+        running = false
+        return
+    end
     vlc.msg.info("[multicast_time] Extension activated successfully!")
 
     -- Send an initial test message
@@ -73,6 +81,10 @@ function deactivate()
     if callback_id then
         vlc.var.del_callback(callback_id)
         callback_id = nil
+    end
+    if stream then
+        stream:close()
+        stream = nil
     end
     running = false
 end
@@ -118,11 +130,15 @@ end
 function test_multicast()
     vlc.msg.info("[multicast_time] MANUAL TEST: Creating test message...")
     local test_payload = '{"test":"manual_test","time":12345,"length":67890,"state":"playing"}'
-    local result = vlc.net.sendto(test_payload, mcast_addr, mcast_port)
-    if result then
-        vlc.msg.info("[multicast_time] MANUAL TEST: Sent successfully: " .. test_payload)
+    if stream then
+        local result = stream:write(test_payload .. "\n")
+        if result then
+            vlc.msg.info("[multicast_time] MANUAL TEST: Sent successfully: " .. test_payload)
+        else
+            vlc.msg.err("[multicast_time] MANUAL TEST: Failed to send!")
+        end
     else
-        vlc.msg.err("[multicast_time] MANUAL TEST: Failed to send!")
+        vlc.msg.err("[multicast_time] MANUAL TEST: No stream available!")
     end
     return result
 end
@@ -173,11 +189,15 @@ function push_status()
 
     vlc.msg.dbg("[multicast_time] Sending payload: " .. payload)
 
-    -- Send directly to multicast address (don't connect first)
-    local result = vlc.net.sendto(payload, mcast_addr, mcast_port)
-    if result then
-        vlc.msg.info("[multicast_time] Sent successfully: " .. payload)
+    -- Send via UDP stream
+    if stream then
+        local result = stream:write(payload .. "\n")
+        if result then
+            vlc.msg.info("[multicast_time] Sent successfully: " .. payload)
+        else
+            vlc.msg.err("[multicast_time] Failed to send message!")
+        end
     else
-        vlc.msg.err("[multicast_time] Failed to send message!")
+        vlc.msg.err("[multicast_time] No stream available!")
     end
 end
