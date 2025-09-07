@@ -120,6 +120,9 @@ int main(int argc, char *argv[]) {
                     // Create JSON message
                     char *json_message = create_status_json(&current_status);
                     if (json_message) {
+                        if (debug_mode) {
+                            printf("[DEBUG] Multicast JSON: %s\n", json_message);
+                        }
                         // Send via multicast
                         if (send_multicast_data(multicast_sock, json_message)) {
                             printf("Status broadcast: %s - %s\n",
@@ -400,7 +403,10 @@ int parse_vlc_status(const char *json, vlc_status_t *status) {
     // Extract position (0-1 scalar)
     char *position = strstr(json_copy, "\"position\":");
     if (position) {
-        sscanf(position + 11, "%lf", &status->position);
+        position += 11;
+        // Skip whitespace after colon
+        while (*position == ' ' || *position == '\t') position++;
+        sscanf(position, "%lf", &status->position);
     }
 
     // Extract time (current time in seconds)
