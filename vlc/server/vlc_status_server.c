@@ -40,6 +40,7 @@ typedef struct {
 
 // Global password variable
 char vlc_password[MAX_PASSWORD_LEN] = "";
+int debug_mode = 0; // Global debug flag
 
 // Function declarations
 int initialize_winsock();
@@ -56,17 +57,28 @@ void print_usage(const char *program_name);
 // Main server loop
 int main(int argc, char *argv[]) {
     // Parse command line arguments
+    int arg_idx = 1;
     if (argc > 1) {
         if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
         }
-
-        // Assume first argument is the password
-        strncpy(vlc_password, argv[1], MAX_PASSWORD_LEN - 1);
-        vlc_password[MAX_PASSWORD_LEN - 1] = '\0';
-
+        // Check for debug flag in first or second argument
+        if (strcmp(argv[1], "--debug") == 0) {
+            debug_mode = 1;
+            arg_idx = 2;
+        } else if (argc > 2 && strcmp(argv[2], "--debug") == 0) {
+            debug_mode = 1;
+        }
+        // Assume first argument is the password (unless it's --debug)
+        if (arg_idx < argc && strcmp(argv[arg_idx], "--debug") != 0) {
+            strncpy(vlc_password, argv[arg_idx], MAX_PASSWORD_LEN - 1);
+            vlc_password[MAX_PASSWORD_LEN - 1] = '\0';
+        }
         printf("Using VLC HTTP password: %s\n", strlen(vlc_password) > 0 ? "***" : "(none)");
+        if (debug_mode) {
+            printf("Debug mode enabled.\n");
+        }
     } else {
         printf("No password specified - VLC HTTP interface must be accessible without authentication\n");
     }
@@ -114,6 +126,9 @@ int main(int argc, char *argv[]) {
                             printf("Status broadcast: %s - %s\n",
                                    current_status.is_playing ? "Playing" : "Stopped",
                                    current_status.title[0] ? current_status.title : "Unknown");
+                            if (debug_mode) {
+                                print_status(&current_status);
+                            }
                         }
                         free(json_message);
                     }
@@ -137,6 +152,9 @@ int main(int argc, char *argv[]) {
 
                 memcpy(&last_status, &current_status, sizeof(vlc_status_t));
                 printf("VLC not responding - sent stopped status\n");
+                if (debug_mode) {
+                    printf("[DEBUG] VLC not responding, sent stopped status\n");
+                }
             }
         }
 
@@ -209,6 +227,7 @@ int send_multicast_data(SOCKET sock, const char *data) {
 
 // HTTP GET request with optional authentication
 http_response_t *http_get(const char *host, int port, const char *path, const char *password) {
+    extern int debug_mode;
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         return NULL;
@@ -280,8 +299,12 @@ http_response_t *http_get(const char *host, int port, const char *path, const ch
         if (received <= 0) {
             break;
         }
-
         buffer[received] = '\0';
+
+        // Print all received data if debug mode is enabled
+        if (debug_mode) {
+            printf("[DEBUG] HTTP received chunk (%d bytes):\n%s\n", received, buffer);
+        }
 
         // Parse headers if not done yet
         if (!headers_done) {
@@ -331,6 +354,11 @@ http_response_t *http_get(const char *host, int port, const char *path, const ch
     }
 
     response->size = total_received;
+
+    if (debug_mode && response && response->data) {
+        printf("[DEBUG] Full HTTP response (%zu bytes):\n%s\n", response->size, response->data);
+    }
+
     return response;
 }
 
@@ -488,13 +516,15 @@ void print_status(const vlc_status_t *status) {
 // Print usage information
 void print_usage(const char *program_name) {
     printf("VLC Status Server - Broadcasts VLC playback status via UDP multicast\n\n");
-    printf("Usage: %s [password]\n\n", program_name);
+    printf("Usage: %s [password] [--debug]\n\n", program_name);
     printf("Arguments:\n");
     printf("  password    VLC HTTP interface password (optional)\n");
+    printf("  --debug     Enable verbose debug output\n");
     printf("  --help, -h  Show this help message\n\n");
     printf("Examples:\n");
     printf("  %s                    # No password (VLC HTTP interface must be accessible without auth)\n", program_name);
     printf("  %s mypassword         # Use password for VLC HTTP authentication\n", program_name);
+    printf("  %s mypassword --debug # Use password and enable debug output\n", program_name);
     printf("  %s --help             # Show this help message\n\n", program_name);
     printf("VLC must be started with HTTP interface enabled:\n");
     printf("  vlc --http-host=127.0.0.1 --http-port=8080 --http-password=mypassword\n\n");

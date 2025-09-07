@@ -4,11 +4,16 @@ REM Starts VLC with HTTP interface and the status server
 
 REM Default password (can be overridden by command line argument)
 set "PASSWORD=vlcstatus"
+set "DEBUG=0"
 
 REM Check if password was provided as command line argument
 if "%~1" NEQ "" (
     set "PASSWORD=%~1"
 )
+
+REM Check for debug flag in command line arguments
+if /I "%~2"=="debug" set "DEBUG=1"
+if /I "%~1"=="debug" set "DEBUG=1"
 
 echo VLC Status Broadcaster Launcher
 echo ================================
@@ -19,10 +24,10 @@ echo ================================
 echo.
 
 REM Check if VLC executable exists
-where vlc >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: VLC executable not found in PATH
-    echo Please ensure VLC is installed and in your PATH
+set "VLC_EXE=C:\Program Files\VideoLAN\VLC\vlc.exe"
+if not exist "%VLC_EXE%" (
+    echo ERROR: VLC executable not found
+    echo Please ensure VLC is installed and set VLC_EXE in this script correctly
     pause
     exit /b 1
 )
@@ -37,17 +42,20 @@ if not exist "%SERVER_EXE%" (
 )
 
 echo Starting VLC with HTTP interface...
-start "VLC Media Player" vlc.exe ^
-    --http-host=127.0.0.1 ^
-    --http-port=8080 ^
-    --http-password=%PASSWORD% ^
-    --no-http-acl
+start "VLC Media Player" "%VLC_EXE%" ^
+    --http-password=%PASSWORD%
+    @REM --no-http-acl
 
 echo Waiting 3 seconds for VLC to start...
 timeout /t 3 /nobreak >nul
 
 echo Starting VLC Status Server...
-start "VLC Status Server" "%SERVER_EXE%" "%PASSWORD%"
+if "%DEBUG%"=="1" (
+    echo Debug mode enabled: passing --debug to server
+    start "VLC Status Server" "%SERVER_EXE%" "%PASSWORD%" --debug
+) else (
+    start "VLC Status Server" "%SERVER_EXE%" "%PASSWORD%"
+)
 
 echo.
 echo VLC Status Broadcaster is now running!
