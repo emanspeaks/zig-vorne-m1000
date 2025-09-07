@@ -72,9 +72,9 @@ echo.
 echo Starting VLC Status Server with system VLC...
 if "%DEBUG%"=="1" (
     echo Debug mode enabled: passing --debug to server
-    "%SERVER_EXE%" --debug
+    start "VLC Status Server" "%SERVER_EXE%" --debug
 ) else (
-    "%SERVER_EXE%"
+    start "VLC Status Server" "%SERVER_EXE%"
 )
 
 echo.
