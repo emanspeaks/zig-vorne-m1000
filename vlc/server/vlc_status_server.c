@@ -13,29 +13,15 @@
 #define MULTICAST_GROUP "239.255.0.100"
 #define MULTICAST_PORT 8888
 #define UPDATE_INTERVAL_MS 200  // 5Hz (every 200ms)
-#define BUFFER_SIZE 4096
-#define MAX_PASSWORD_LEN 256
 
 // VLC status structure
 typedef struct {
-    time_t timestamp;
     int is_playing;
-    double position;
     long long time;
     long long duration;
-    double rate;
     char title[256];
-    char artist[256];
-    char album[256];
     char filename[256];
-    char uri[1024];
 } vlc_status_t;
-
-// HTTP response structure
-typedef struct {
-    char *data;
-    size_t size;
-} http_response_t;
 
 // RC connection structure
 typedef struct {
@@ -43,9 +29,7 @@ typedef struct {
     int connected;
 } vlc_rc_connection_t;
 
-// Global password variable
-char vlc_password[MAX_PASSWORD_LEN] = "";
-int debug_mode = 0; // Global debug flag
+int debug_mode = 0;
 
 // Function declarations
 long long getUnixTimeMs();
@@ -75,31 +59,16 @@ long long getUnixTimeMs() {
 
 // Main server loop
 int main(int argc, char *argv[]) {
-    // Parse command line arguments
-    int arg_idx = 1;
+    // Parse command line arguments for debug flag
     if (argc > 1) {
         if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
         }
-        // Check for debug flag in first or second argument
         if (strcmp(argv[1], "--debug") == 0) {
             debug_mode = 1;
-            arg_idx = 2;
-        } else if (argc > 2 && strcmp(argv[2], "--debug") == 0) {
-            debug_mode = 1;
-        }
-        // Assume first argument is the password (unless it's --debug)
-        if (arg_idx < argc && strcmp(argv[arg_idx], "--debug") != 0) {
-            strncpy(vlc_password, argv[arg_idx], MAX_PASSWORD_LEN - 1);
-            vlc_password[MAX_PASSWORD_LEN - 1] = '\0';
-        }
-        printf("VLC RC interface does not require authentication\n");
-        if (debug_mode) {
             printf("Debug mode enabled.\n");
         }
-    } else {
-        printf("No arguments provided - connecting to VLC RC interface without authentication\n");
     }
 
     printf("VLC Status Server starting...\n");
@@ -119,7 +88,8 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Server started successfully\n");
-    // Get current timestamp with subsecond precision (UTC)
+
+    // Display connection info
     SYSTEMTIME st;
     GetSystemTime(&st);
     char time_str[64];
@@ -334,7 +304,7 @@ vlc_rc_connection_t *vlc_rc_connect(const char *host, int port) {
 
     // Set socket timeout
     struct timeval timeout;
-    timeout.tv_sec = 2;  // 2 second timeout
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
     setsockopt(conn->socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(conn->socket, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
@@ -359,17 +329,20 @@ vlc_rc_connection_t *vlc_rc_connect(const char *host, int port) {
         return NULL;
     }
 
-    // Read welcome message and initial prompt
-    char buffer[512];
+    // Read welcome message and discard it
+    char buffer[4096];
     int received = recv(conn->socket, buffer, sizeof(buffer) - 1, 0);
     if (received > 0) {
         buffer[received] = '\0';
         if (debug_mode) {
             printf("[DEBUG] VLC RC welcome: %s\n", buffer);
         }
+    } else {
+        if (debug_mode) {
+            printf("[DEBUG] No welcome message received\n");
+        }
     }
 
-    // RC interface doesn't require authentication - it's ready to use immediately
     conn->connected = 1;
     if (debug_mode) {
         printf("[DEBUG] Connected to VLC RC interface\n");
@@ -394,7 +367,7 @@ char *vlc_rc_command(vlc_rc_connection_t *conn, const char *command) {
         return NULL;
     }
 
-    // Send command
+    // Send command with newline
     char cmd_with_newline[512];
     snprintf(cmd_with_newline, sizeof(cmd_with_newline), "%s\n", command);
 
@@ -404,58 +377,47 @@ char *vlc_rc_command(vlc_rc_connection_t *conn, const char *command) {
     }
 
     // Read response
-    char *response = malloc(1024);
+    char *response = malloc(4096);
     if (!response) {
         return NULL;
     }
 
-    int total_received = 0;
-    int max_attempts = 10;
-    int attempts = 0;
-
-    while (attempts < max_attempts) {
-        int received = recv(conn->socket, response + total_received, 1023 - total_received, 0);
-        if (received < 0) {
-            free(response);
-            conn->connected = 0;
-            return NULL;
-        } else if (received == 0) {
-            break;
-        }
-
-        total_received += received;
-        response[total_received] = '\0';
-
-        // Check if we have a complete response (ends with "> " prompt)
-        if (total_received >= 2 && strstr(response + (total_received - 50 < 0 ? 0 : total_received - 50), "> ")) {
-            break;
-        }
-
-        attempts++;
-        Sleep(10); // Small delay between attempts
-    }
-
-    if (total_received == 0) {
+    int received = recv(conn->socket, response, 4095, 0);
+    if (received <= 0) {
         free(response);
+        if (received < 0) {
+            conn->connected = 0;
+        }
         return NULL;
     }
 
-    // Remove the prompt from the end
-    char *prompt_pos = strstr(response, "> ");
-    if (prompt_pos) {
-        *prompt_pos = '\0';
+    response[received] = '\0';
+
+    // Clean up response - remove trailing whitespace and prompt
+    char *end = response + received - 1;
+    while (end >= response && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '>')) {
+        *end = '\0';
+        end--;
     }
 
-    // Trim whitespace
-    while (total_received > 0 && (response[total_received - 1] == '\n' || response[total_received - 1] == '\r' || response[total_received - 1] == ' ')) {
-        response[--total_received] = '\0';
+    // Remove leading whitespace
+    char *start = response;
+    while (*start == ' ' || *start == '\n' || *start == '\r') {
+        start++;
     }
 
-    if (debug_mode) {
-        printf("[DEBUG] VLC RC command '%s' response: '%s'\n", command, response);
+    // Create cleaned response
+    char *cleaned = malloc(strlen(start) + 1);
+    if (cleaned) {
+        strcpy(cleaned, start);
+    }
+    free(response);
+
+    if (debug_mode && cleaned) {
+        printf("[DEBUG] VLC RC command '%s' response: '%s'\n", command, cleaned);
     }
 
-    return response;
+    return cleaned;
 }
 
 // Query VLC status using RC interface
@@ -490,13 +452,6 @@ int query_vlc_status_rc(vlc_rc_connection_t *conn, vlc_status_t *status) {
         free(length_resp);
     }
 
-    // Calculate position
-    if (status->duration > 0 && status->time >= 0) {
-        status->position = (double)status->time / (double)status->duration;
-    } else {
-        status->position = 0.0;
-    }
-
     // Get title/filename
     char *title_resp = vlc_rc_command(conn, "get_title");
     if (title_resp && strlen(title_resp) > 0) {
@@ -507,9 +462,6 @@ int query_vlc_status_rc(vlc_rc_connection_t *conn, vlc_status_t *status) {
         strcpy(status->title, "Unknown");
         strcpy(status->filename, "");
     }
-
-    // Set default rate
-    status->rate = 1.0;
 
     return 1;
 }
@@ -550,7 +502,6 @@ char *create_status_json_with_timestamp(const vlc_status_t *status, long long se
 
 // Print status for debugging
 void print_status(const vlc_status_t *status) {
-    printf("VLC Status:\n");
     printf("  Playing: %s\n", status->is_playing ? "Yes" : "No");
     printf("  Time: %lld ms (%.2f sec)\n", status->time, status->time / 1000.0);
     printf("  Duration: %lld ms (%.2f sec)\n", status->duration, status->duration / 1000.0);
