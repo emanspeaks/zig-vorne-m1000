@@ -11,7 +11,7 @@
             "cwd": "${workspaceFolder}",
             "environment": [
                 {"name": "PATH", "value": "C:\\Program Files\\VideoLAN\\VLC;${env:PATH}"},
-                // {"name": "VLC_NO_STATUS_LOG", "value": "1"}
+                {"name": "VLC_NO_STATUS_LOG", "value": "1"}
             ],
             "externalConsole": false,
             "preLaunchTask": "cmake build",
@@ -87,7 +87,7 @@
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
             "environment": [
-                {"name": "DEBUG_VLC", "value": "1"}
+                // {"name": "DEBUG_VLC", "value": "1"}
             ],
             "externalConsole": false,
             "preLaunchTask": "zig build",
