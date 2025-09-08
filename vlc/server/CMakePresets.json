@@ -9,8 +9,8 @@
             "generator": "MinGW Makefiles",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_DLLTOOL": "dlltool",
-                "GENDEF_EXECUTABLE": "gendef",
+                "CMAKE_DLLTOOL": "C:/msys64/ucrt64/bin/dlltool",
+                "GENDEF_EXECUTABLE": "C:/msys64/ucrt64/bin/gendef",
                 "VLC_INSTALL_DIR": "C:/Program Files/VideoLAN/VLC"
             }
         },
