@@ -32,6 +32,17 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(vlc_headers)
 
+if (DOWNLOAD_VLC_BINARIES)
+    message(STATUS "Downloading VLC Windows binaries...")
+    # Download VLC Windows binaries
+    FetchContent_Declare(
+        vlc_binaries
+        URL https://download.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(vlc_binaries)
+endif()
+
 # Set VLC directories
 set(VLC_INCLUDE_DIR ${vlc_headers_SOURCE_DIR}/include)
 set(VLC_BIN_DIR ${VLC_INSTALL_DIR})

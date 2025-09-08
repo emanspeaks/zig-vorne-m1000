@@ -10,7 +10,8 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_DLLTOOL": "dlltool",
-                "GENDEF_EXECUTABLE": "gendef"
+                "GENDEF_EXECUTABLE": "gendef",
+                "VLC_INSTALL_DIR": "C:/Program Files/VideoLAN/VLC"
             }
         },
         {
@@ -25,7 +26,10 @@
                 "CMAKE_RC_COMPILER": "x86_64-w64-mingw32-windres",
                 "CMAKE_SYSTEM_NAME": "Windows",
                 "CMAKE_SYSTEM_PROCESSOR": "x86_64",
-                "CMAKE_DLLTOOL": "x86_64-w64-mingw32-dlltool"
+                "CMAKE_DLLTOOL": "x86_64-w64-mingw32-dlltool",
+                "GENDEF_EXECUTABLE": "gendef",
+                "DOWNLOAD_VLC_BINARIES": "ON",
+                "VLC_INSTALL_DIR": "_deps/vlc_binaries-src"
             }
         }
     ],
