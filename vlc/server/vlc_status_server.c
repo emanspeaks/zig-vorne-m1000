@@ -29,6 +29,7 @@
 #include "src/ui.h"
 #include "src/utils.h"
 #include "src/http_server.h"
+#include "src/status_monitor.h"
 
 // Constants
 #define UPDATE_INTERVAL_MS 250
@@ -130,11 +131,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Create status monitor
+    status_monitor_t* status_monitor = status_monitor_create();
+    if (!status_monitor) {
+        printf("Failed to create status monitor\n");
+        vlc_player_destroy(g_vlc_player);
+        closesocket(multicast_sock);
+        cleanup_winsock();
+        return 1;
+    }
+
     // Main event loop with status broadcasting
     MSG msg;
-    DWORD last_update = 0;
-    vlc_status_t current_status = {0};
-    vlc_status_t last_status = {0};
 
     while (1) {
         // Handle Windows messages (non-blocking)
@@ -147,112 +155,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Update VLC status and broadcast at regular intervals
-        DWORD current_time = GetTickCount();
-        if (current_time - last_update >= UPDATE_INTERVAL_MS) {
-
-            if (debug_mode && !suppress_vlc_status_log) {
-                static DWORD last_query_time = 0;
-                if (last_query_time > 0) {
-                    printf("[DEBUG] Query interval: %lu ms\n", current_time - last_query_time);
-                }
-                last_query_time = current_time;
-            }
-
-            // Get server timestamp at poll time (UTC milliseconds)
-            long long server_timestamp_ms = getUnixTimeMs();
-
-            // Query VLC status directly from libvlc
-            if (debug_mode && !suppress_vlc_status_log) {
-                printf("[DEBUG] About to query VLC status...\n");
-            }
-
-            int status_ok = query_vlc_status(g_vlc_player, &current_status);
-
-            if (debug_mode && !suppress_vlc_status_log) {
-                printf("[DEBUG] Query VLC status completed, status_ok: %d\n", status_ok);
-            }
-
-            if (status_ok) {
-                // Update status bar with current playback info
-                update_status_bar(&current_status);
-
-                // Check if status changed significantly
-                int status_changed = 0;
-                if (current_status.is_playing != last_status.is_playing ||
-                    current_status.is_paused != last_status.is_paused ||
-                    current_status.is_stopped != last_status.is_stopped ||
-                    abs((int)(current_status.time - last_status.time)) > 2000 ||  // Time diff > 2 sec
-                    strcmp(current_status.title, last_status.title) != 0 ||
-                    strcmp(current_status.filename, last_status.filename) != 0) {
-                    status_changed = 1;
-                }
-
-                if (debug_mode && (!suppress_vlc_status_log || status_changed)) {
-                    printf("[DEBUG] Query result - Playing: %s, Time: %lld ms, Status changed: %s\n",
-                           current_status.is_playing ? "Yes" : "No",
-                           current_status.time,
-                           status_changed ? "Yes" : "No");
-                }
-
-                if (status_changed) {
-                    // Update last status
-                    memcpy(&last_status, &current_status, sizeof(vlc_status_t));
-                }
-
-                // Always send the current status
-                char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
-                if (json_message) {
-                    if (debug_mode && !suppress_vlc_status_log) {
-                        printf("[DEBUG] Multicast JSON: %s\n", json_message);
-                    }
-                    // Send via multicast
-                    if (send_multicast_data(multicast_sock, json_message)) {
-                        // Get current timestamp with subsecond precision (UTC)
-                        SYSTEMTIME st;
-                        GetSystemTime(&st);
-                        char time_str[32];
-                        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-                               st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-                        if (!suppress_vlc_status_log) {
-                            // Determine status text for broadcast
-                            const char *status_text;
-                            if (g_vlc_player && g_vlc_player->is_loading) {
-                                status_text = "Loading";
-                            } else if (current_status.is_playing) {
-                                status_text = "Playing";
-                            } else if (current_status.is_paused) {
-                                status_text = "Paused";
-                            } else if (current_status.is_stopped) {
-                                status_text = "Stopped";
-                            } else {
-                                status_text = "Unknown";
-                            }
-
-                            printf("[%s] %s | %s\n", time_str, status_text, current_status.filename);
-                        }
-                    } else {
-                        printf("Failed to send multicast data\n");
-                    }
-                    
-                    free(json_message);
-                }
-            } else {
-                // VLC query failed - set default stopped status
-                current_status.is_playing = 0;
-                current_status.is_paused = 0;
-                current_status.is_stopped = 1;
-                current_status.is_loading = 0;
-                current_status.time = 0;
-                current_status.duration = 0;
-                strcpy(current_status.title, "No media");
-                strcpy(current_status.filename, "No media");
-                
-                update_status_bar(&current_status);
-            }
-
-            last_update = current_time;
-        }
+        status_monitor_update(status_monitor, multicast_sock, UPDATE_INTERVAL_MS);
 
         // Small sleep to prevent busy waiting
         Sleep(10);
@@ -260,6 +163,9 @@ int main(int argc, char *argv[]) {
 
 cleanup:
     printf("\nShutting down VLC Status Server...\n");
+    
+    // Cleanup status monitor
+    status_monitor_destroy(status_monitor);
     
     // Cleanup VLC player
     if (g_vlc_player) {

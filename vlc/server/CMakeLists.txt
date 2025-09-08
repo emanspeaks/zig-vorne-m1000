@@ -112,6 +112,7 @@ add_executable(vlc_status_server
     src/ui.c
     src/utils.c
     src/http_server.c
+    src/status_monitor.c
 )
 
 # Make executable depend on import library
