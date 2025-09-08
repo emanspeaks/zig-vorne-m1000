@@ -71,6 +71,7 @@ file(APPEND ${CMAKE_BINARY_DIR}/libvlc.def "libvlc_media_player_get_hwnd\n")
 
 # Define the executable
 add_executable(vlc_status_server vlc_status_server.c)
+# add_executable(vlc_status_server vlc_dll_test.c)
 
 # Make executable depend on import library
 add_dependencies(vlc_status_server libvlc_import)  # copy_vlc_runtime)
@@ -88,11 +89,10 @@ target_compile_definitions(vlc_status_server PRIVATE
     _GNU_SOURCE
 )
 
-# Link against Windows libraries and libvlc import library
+# Link against Windows libraries only (dynamic loading for VLC)
 target_link_libraries(vlc_status_server
     ws2_32
     m
-    ${CMAKE_BINARY_DIR}/libvlc.lib
 )
 
 # Set output directory

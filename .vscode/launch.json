@@ -7,10 +7,11 @@
             "name": "Run VLC server",
             "program": "${workspaceFolder}/vlc/server/build/bin/vlc_status_server.exe",
             // "args": ["--bluray"],
-            "stopAtEntry": true,
+            "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [
-                {"name": "PATH", "value": "C:\\Program Files\\VideoLAN\\VLC;${env:PATH}"}
+                {"name": "PATH", "value": "C:\\Program Files\\VideoLAN\\VLC;${env:PATH}"},
+                {"name": "VLC_NO_STATUS_LOG", "value": "1"}
             ],
             "externalConsole": false,
             "preLaunchTask": "cmake build",
