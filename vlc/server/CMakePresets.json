@@ -9,7 +9,8 @@
             "generator": "MinGW Makefiles",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_DLLTOOL": "dlltool"
+                "CMAKE_DLLTOOL": "dlltool",
+                "GENDEF_EXECUTABLE": "gendef"
             }
         },
         {

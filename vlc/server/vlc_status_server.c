@@ -1,9 +1,8 @@
-// Include VLC headers for type safety
+// Include VLC headers for static linking
 #include <vlc/vlc.h>
 #include <vlc/libvlc.h>
 #include <vlc/libvlc_media.h>
 #include <vlc/libvlc_media_player.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,43 +13,7 @@
 #include <ws2tcpip.h>
 #include <stdint.h>
 #include <shellapi.h>
-
-
-// Dynamic loading for VLC
-typedef void* (*libvlc_new_t)(int, const char **);
-typedef void (*libvlc_release_t)(void*);
-typedef void* (*libvlc_media_player_new_t)(void*);
-typedef void (*libvlc_media_player_release_t)(void*);
-typedef int (*libvlc_media_player_play_t)(void*);
-typedef void (*libvlc_media_player_pause_t)(void*);
-typedef void (*libvlc_media_player_stop_t)(void*);
-typedef int (*libvlc_media_player_is_playing_t)(void*);
-typedef int64_t (*libvlc_media_player_get_time_t)(void*);
-typedef void (*libvlc_media_player_set_time_t)(void*, int64_t);
-typedef int64_t (*libvlc_media_player_get_length_t)(void*);
-typedef void (*libvlc_media_player_set_hwnd_t)(void*, void*);
-typedef void (*libvlc_media_release_t)(void*);
-typedef void (*libvlc_media_player_set_media_t)(void*, void*);
-typedef char* (*libvlc_media_get_meta_t)(void*, int);
-typedef const char* (*libvlc_errmsg_t)(void);
-
-// Function pointers
-libvlc_new_t p_libvlc_new = NULL;
-libvlc_release_t p_libvlc_release = NULL;
-libvlc_media_player_new_t p_libvlc_media_player_new = NULL;
-libvlc_media_player_release_t p_libvlc_media_player_release = NULL;
-libvlc_media_player_play_t p_libvlc_media_player_play = NULL;
-libvlc_media_player_pause_t p_libvlc_media_player_pause = NULL;
-libvlc_media_player_stop_t p_libvlc_media_player_stop = NULL;
-libvlc_media_player_is_playing_t p_libvlc_media_player_is_playing = NULL;
-libvlc_media_player_get_time_t p_libvlc_media_player_get_time = NULL;
-libvlc_media_player_set_time_t p_libvlc_media_player_set_time = NULL;
-libvlc_media_player_get_length_t p_libvlc_media_player_get_length = NULL;
-libvlc_media_new_path_t p_libvlc_media_new_path = NULL;
-libvlc_media_release_t p_libvlc_media_release = NULL;
-libvlc_media_player_set_media_t p_libvlc_media_player_set_media = NULL;
-libvlc_media_get_meta_t p_libvlc_media_get_meta = NULL;
-libvlc_errmsg_t p_libvlc_errmsg = NULL;
+#include <commctrl.h>
 
 #define MULTICAST_GROUP "239.255.0.100"
 #define MULTICAST_PORT 8888
@@ -73,10 +36,12 @@ typedef struct {
     int initialized;
 } vlc_player_t;
 
+// Global variables
 int debug_mode = 0;
+vlc_player_t *g_vlc_player = NULL;  // Global player instance for window callbacks
+HWND g_status_bar = NULL;          // Global status bar handle
 
 // Function declarations
-int check_vlc_and_qt_libraries();
 long long getUnixTimeMs();
 int initialize_winsock();
 void cleanup_winsock();
@@ -88,142 +53,16 @@ int vlc_player_open_file(vlc_player_t *player, const char *filepath);
 int vlc_player_play(vlc_player_t *player);
 int vlc_player_pause(vlc_player_t *player);
 int vlc_player_stop(vlc_player_t *player);
+int vlc_player_toggle_play_pause(vlc_player_t *player);
 int query_vlc_status(vlc_player_t *player, vlc_status_t *status);
 char *create_status_json_with_timestamp(const vlc_status_t *status, long long server_timestamp_ms);
 void print_status(const vlc_status_t *status);
 void print_usage(const char *program_name);
-HWND create_player_window(vlc_player_t *player);
+HWND create_player_window();
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-
-// Check for Qt DLLs required for VLC Qt interface
-int check_vlc_and_qt_libraries() {
-    int missing = 0;
-    HMODULE qt5core_dll = LoadLibrary("Qt5Core.dll");
-    if (!qt5core_dll) {
-        printf("Warning: Could not load Qt5Core.dll. VLC Qt interface may not work.\n");
-        missing = 1;
-    } else {
-        FreeLibrary(qt5core_dll);
-    }
-    HMODULE qt5gui_dll = LoadLibrary("Qt5Gui.dll");
-    if (!qt5gui_dll) {
-        printf("Warning: Could not load Qt5Gui.dll. VLC Qt interface may not work.\n");
-        missing = 1;
-    } else {
-        FreeLibrary(qt5gui_dll);
-    }
-    HMODULE qt5widgets_dll = LoadLibrary("Qt5Widgets.dll");
-    if (!qt5widgets_dll) {
-        printf("Warning: Could not load Qt5Widgets.dll. VLC Qt interface may not work.\n");
-        missing = 1;
-    } else {
-        FreeLibrary(qt5widgets_dll);
-    }
-    return missing ? 0 : 1;
-}
-
-// Dynamically load VLC and resolve functions
-int load_vlc_functions() {
-    HMODULE vlc_dll = LoadLibrary("libvlc.dll");
-    if (!vlc_dll) {
-        printf("Error: Could not load libvlc.dll\n");
-        return 0;
-    }
-
-    {
-        union { FARPROC fp; libvlc_new_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_new");
-        p_libvlc_new = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_release_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_release");
-        p_libvlc_release = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_new_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_new");
-        p_libvlc_media_player_new = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_release_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_release");
-        p_libvlc_media_player_release = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_play_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_play");
-        p_libvlc_media_player_play = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_pause_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_pause");
-        p_libvlc_media_player_pause = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_stop_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_stop");
-        p_libvlc_media_player_stop = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_is_playing_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_is_playing");
-        p_libvlc_media_player_is_playing = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_get_time_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_get_time");
-        p_libvlc_media_player_get_time = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_set_time_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_set_time");
-        p_libvlc_media_player_set_time = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_get_length_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_get_length");
-        p_libvlc_media_player_get_length = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_new_path_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_new_path");
-        p_libvlc_media_new_path = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_release_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_release");
-        p_libvlc_media_release = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_player_set_media_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_player_set_media");
-        p_libvlc_media_player_set_media = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_media_get_meta_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_media_get_meta");
-        p_libvlc_media_get_meta = caster.fn;
-    }
-    {
-        union { FARPROC fp; libvlc_errmsg_t fn; } caster;
-        caster.fp = GetProcAddress(vlc_dll, "libvlc_errmsg");
-        p_libvlc_errmsg = caster.fn;
-    }
-
-    if (!p_libvlc_new || !p_libvlc_release || !p_libvlc_media_player_new || !p_libvlc_media_player_release ||
-        !p_libvlc_media_player_play || !p_libvlc_media_player_pause || !p_libvlc_media_player_stop ||
-        !p_libvlc_media_player_is_playing || !p_libvlc_media_player_get_time || !p_libvlc_media_player_set_time ||
-        !p_libvlc_media_player_get_length || !p_libvlc_media_new_path || !p_libvlc_media_release ||
-        !p_libvlc_media_player_set_media || !p_libvlc_media_get_meta || !p_libvlc_errmsg) {
-        printf("Error: One or more VLC functions could not be loaded.\n");
-        FreeLibrary(vlc_dll);
-        return 0;
-    }
-
-    printf("VLC functions loaded dynamically.\n");
-    return 1;
-}
+void open_file_dialog(HWND parent_window);
+void update_status_bar(const vlc_status_t *status);
+void format_time_with_ms(long long time_ms, char *buffer, size_t buffer_size);
 
 // Get Unix timestamp in milliseconds (UTC)
 long long getUnixTimeMs() {
@@ -237,119 +76,162 @@ long long getUnixTimeMs() {
     return ull.QuadPart;
 }
 
+// Open file dialog
+void open_file_dialog(HWND parent_window) {
+    OPENFILENAME ofn;
+    char szFile[MAX_PATH] = "";
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = parent_window;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "All Files\0*.*\0Video Files\0*.mp4;*.avi;*.mkv;*.mov;*.wmv;*.flv;*.webm;*.m4v\0Audio Files\0*.mp3;*.wav;*.flac;*.aac;*.ogg;*.m4a\0";
+    ofn.nFilterIndex = 2;  // Default to video files
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileName(&ofn) == TRUE) {
+        if (g_vlc_player) {
+            if (vlc_player_open_file(g_vlc_player, szFile)) {
+                printf("Opened file: %s\n", szFile);
+                vlc_player_play(g_vlc_player);
+            } else {
+                printf("Failed to open file: %s\n", szFile);
+            }
+        }
+    }
+}
+
 // Create player window
-HWND create_player_window(vlc_player_t *player) {
+HWND create_player_window() {
     WNDCLASS wc = {0};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = "VLCPlayerWindow";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+
     if (!RegisterClass(&wc)) {
         printf("Error: Failed to register window class\n");
         return NULL;
     }
-    
-    // Create window with player as parameter
+
+    // Create window
     HWND hwnd = CreateWindowEx(
         0,
         "VLCPlayerWindow",
-        "VLC Player",
+        "VLC Status Server Player",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         800, 600,
-        NULL, NULL, GetModuleHandle(NULL), player
+        NULL, NULL, GetModuleHandle(NULL), NULL
     );
-    
+
     if (!hwnd) {
         printf("Error: Failed to create window\n");
         return NULL;
     }
-    
+
     // Enable drag and drop
     DragAcceptFiles(hwnd, TRUE);
-    
+
     return hwnd;
 }
 
 // Window procedure for VLC player window
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    static vlc_player_t *player = NULL;
-    
     switch (uMsg) {
-        case WM_CREATE: {
-            // Store player pointer in window data
-            CREATESTRUCT *cs = (CREATESTRUCT*)lParam;
-            player = (vlc_player_t*)cs->lpCreateParams;
-            SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)player);
-            break;
-        }
+        case WM_CREATE:
+            // Initialize common controls
+            InitCommonControls();
+
+            // Create status bar
+            g_status_bar = CreateWindowEx(
+                0,
+                STATUSCLASSNAME,
+                NULL,
+                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                0, 0, 0, 0,
+                hwnd,
+                (HMENU)1001,
+                GetModuleHandle(NULL),
+                NULL
+            );
+
+            if (g_status_bar) {
+                // Set initial status bar text
+                SendMessage(g_status_bar, SB_SETTEXT, 0, (LPARAM)"Ready - Right-click to open file, Space to play/pause");
+            }
+            return 0;
+
         case WM_CLOSE:
+            // Stop VLC playback and clear the window handle before destroying
+            if (g_vlc_player && g_vlc_player->media_player) {
+                // Stop playback first
+                libvlc_media_player_stop(g_vlc_player->media_player);
+
+                // Clear the window handle to prevent VLC from trying to render
+                libvlc_media_player_set_hwnd(g_vlc_player->media_player, NULL);
+
+                // Give VLC a moment to cleanup
+                Sleep(100);
+            }
+
+            // Now destroy the window
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
+
         case WM_KEYDOWN:
-            // Handle keyboard shortcuts for VLC player
             switch (wParam) {
-                case VK_SPACE: {
+                case VK_SPACE:
                     // Space bar to play/pause
-                    if (player && player->media_player) {
-                        if (p_libvlc_media_player_is_playing(player->media_player)) {
-                            p_libvlc_media_player_pause(player->media_player);
-                        } else {
-                            p_libvlc_media_player_play(player->media_player);
-                        }
+                    if (g_vlc_player) {
+                        vlc_player_toggle_play_pause(g_vlc_player);
                     }
-                    break;
-                }
+                    return 0;
+
                 case VK_ESCAPE:
                     // Escape to stop
-                    if (player && player->media_player) {
-                        p_libvlc_media_player_stop(player->media_player);
+                    if (g_vlc_player && g_vlc_player->media_player) {
+                        vlc_player_stop(g_vlc_player);
                     }
-                    break;
+                    return 0;
+
                 case VK_LEFT:
                     // Left arrow to seek backward (10 seconds)
-                    if (player && player->media_player) {
-                        int64_t current_time = p_libvlc_media_player_get_time(player->media_player);
-                        p_libvlc_media_player_set_time(player->media_player,
-                            current_time > 10000 ? current_time - 10000 : 0);
+                    if (g_vlc_player && g_vlc_player->media_player) {
+                        int64_t current_time = libvlc_media_player_get_time(g_vlc_player->media_player);
+                        if (current_time > 10000) {
+                            libvlc_media_player_set_time(g_vlc_player->media_player, current_time - 10000);
+                        } else {
+                            libvlc_media_player_set_time(g_vlc_player->media_player, 0);
+                        }
                     }
-                    break;
+                    return 0;
+
                 case VK_RIGHT:
                     // Right arrow to seek forward (10 seconds)
-                    if (player && player->media_player) {
-                        int64_t current_time = p_libvlc_media_player_get_time(player->media_player);
-                        p_libvlc_media_player_set_time(player->media_player, current_time + 10000);
+                    if (g_vlc_player && g_vlc_player->media_player) {
+                        int64_t current_time = libvlc_media_player_get_time(g_vlc_player->media_player);
+                        libvlc_media_player_set_time(g_vlc_player->media_player, current_time + 10000);
                     }
-                    break;
+                    return 0;
             }
             break;
-        case WM_RBUTTONDOWN: {
+
+        case WM_RBUTTONDOWN:
             // Right-click to open file dialog
-            OPENFILENAME ofn;
-            char szFile[MAX_PATH] = "";
-            
-            ZeroMemory(&ofn, sizeof(ofn));
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner = hwnd;
-            ofn.lpstrFile = szFile;
-            ofn.nMaxFile = sizeof(szFile);
-            ofn.lpstrFilter = "All Files\0*.*\0Video Files\0*.mp4;*.avi;*.mkv;*.mov;*.wmv;*.flv;*.webm\0Audio Files\0*.mp3;*.wav;*.flac;*.aac;*.ogg\0";
-            ofn.nFilterIndex = 1;
-            ofn.lpstrFileTitle = NULL;
-            ofn.nMaxFileTitle = 0;
-            ofn.lpstrInitialDir = NULL;
-            ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-            
-            if (GetOpenFileName(&ofn) == TRUE) {
-                if (player) {
-                    vlc_player_open_file(player, szFile);
-                    vlc_player_play(player);
-                }
-            }
-            break;
-        }
+            open_file_dialog(hwnd);
+            return 0;
+
         case WM_DROPFILES: {
             // Handle drag and drop of files
             HDROP hDrop = (HDROP)wParam;
@@ -357,33 +239,102 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (fileCount > 0) {
                 char filePath[MAX_PATH];
                 if (DragQueryFile(hDrop, 0, filePath, MAX_PATH)) {
-                    if (player) {
-                        vlc_player_open_file(player, filePath);
-                        vlc_player_play(player);
+                    if (g_vlc_player) {
+                        if (vlc_player_open_file(g_vlc_player, filePath)) {
+                            printf("Opened dropped file: %s\n", filePath);
+                            vlc_player_play(g_vlc_player);
+                        } else {
+                            printf("Failed to open dropped file: %s\n", filePath);
+                        }
                     }
                 }
             }
             DragFinish(hDrop);
-            break;
+            return 0;
         }
+
+        case WM_SIZE:
+            // Resize status bar
+            if (g_status_bar) {
+                SendMessage(g_status_bar, WM_SIZE, 0, 0);
+            }
+            // Handle window resize - VLC will automatically adjust video size
+            return 0;
     }
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+// Format time in HH:MM:SS.mmm format
+void format_time_with_ms(long long time_ms, char *buffer, size_t buffer_size) {
+    if (time_ms < 0) {
+        snprintf(buffer, buffer_size, "--:--:--.---");
+        return;
+    }
+
+    long long total_ms = time_ms;
+    int ms = total_ms % 1000;
+    total_ms /= 1000;
+
+    int seconds = total_ms % 60;
+    total_ms /= 60;
+
+    int minutes = total_ms % 60;
+    int hours = total_ms / 60;
+
+    if (hours > 0) {
+        snprintf(buffer, buffer_size, "%d:%02d:%02d.%03d", hours, minutes, seconds, ms);
+    } else {
+        snprintf(buffer, buffer_size, "%d:%02d.%03d", minutes, seconds, ms);
+    }
+}
+
+// Update status bar with current playback information
+void update_status_bar(const vlc_status_t *status) {
+    if (!g_status_bar) return;
+
+    char current_time_str[32];
+    char duration_str[32];
+    char status_text[512];  // Increased buffer size to avoid truncation warnings
+
+    // Format current time and duration
+    format_time_with_ms(status->time, current_time_str, sizeof(current_time_str));
+    format_time_with_ms(status->duration, duration_str, sizeof(duration_str));
+
+    // Create status bar text
+    if (status->duration > 0) {
+        // Calculate percentage
+        double percentage = (double)status->time / status->duration * 100.0;
+        snprintf(status_text, sizeof(status_text),
+                "%s | %s / %s (%.1f%%) | %.100s",  // Limit title to 100 chars
+                status->is_playing ? "Playing" : "Paused",
+                current_time_str,
+                duration_str,
+                percentage,
+                status->title[0] ? status->title : "No media");
+    } else {
+        snprintf(status_text, sizeof(status_text),
+                "%s | %s | %.100s",  // Limit title to 100 chars
+                status->is_playing ? "Playing" : "Stopped",
+                current_time_str,
+                status->title[0] ? status->title : "No media");
+    }
+
+    // Update status bar
+    SendMessage(g_status_bar, SB_SETTEXT, 0, (LPARAM)status_text);
 }
 
 // Main server loop
 int main(int argc, char *argv[]) {
     char *initial_file = NULL;
-    
-    // Check for Qt DLLs required for VLC Qt interface
-    check_vlc_and_qt_libraries();
-    
+
     // Check for VLC_NO_STATUS_LOG environment variable
     int suppress_status_log = 0;
     char *no_status_log_env = getenv("VLC_NO_STATUS_LOG");
     if (no_status_log_env && strcmp(no_status_log_env, "1") == 0) {
         suppress_status_log = 1;
     }
-    
+
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -406,12 +357,6 @@ int main(int argc, char *argv[]) {
 
     printf("VLC Status Server with custom window starting...\n");
 
-    // Dynamically load VLC functions
-    if (!load_vlc_functions()) {
-        fprintf(stderr, "VLC functions not available. Please ensure VLC is installed and in PATH.\n");
-        return 1;
-    }
-
     // Initialize Winsock
     if (!initialize_winsock()) {
         fprintf(stderr, "Failed to initialize Winsock\n");
@@ -427,8 +372,8 @@ int main(int argc, char *argv[]) {
     }
 
     // Create VLC player instance
-    vlc_player_t *vlc_player = vlc_player_create();
-    if (!vlc_player) {
+    g_vlc_player = vlc_player_create();
+    if (!g_vlc_player) {
         fprintf(stderr, "Failed to create VLC player instance\n");
         closesocket(multicast_sock);
         cleanup_winsock();
@@ -436,32 +381,24 @@ int main(int argc, char *argv[]) {
     }
 
     // Create player window
-    HWND player_window = create_player_window(vlc_player);
+    HWND player_window = create_player_window();
     if (!player_window) {
         fprintf(stderr, "Failed to create player window\n");
-        vlc_player_destroy(vlc_player);
+        vlc_player_destroy(g_vlc_player);
         closesocket(multicast_sock);
         cleanup_winsock();
         return 1;
     }
 
     // Set window handle for VLC video output
-    if (vlc_player->media_player) {
-        // Use libvlc_media_player_set_hwnd to set the window for video output
-        typedef void (*libvlc_media_player_set_hwnd_t)(void*, void*);
-        union { FARPROC fp; libvlc_media_player_set_hwnd_t fn; } caster;
-        caster.fp = GetProcAddress(GetModuleHandle("libvlc.dll"), "libvlc_media_player_set_hwnd");
-        if (caster.fn) {
-            caster.fn(vlc_player->media_player, player_window);
-            printf("Set custom window for VLC video output\n");
-        } else {
-            printf("Warning: Could not set custom window for VLC video output\n");
-        }
+    if (g_vlc_player->media_player) {
+        libvlc_media_player_set_hwnd(g_vlc_player->media_player, player_window);
+        printf("Set custom window for VLC video output\n");
     }
 
     // Load initial file if provided
     if (initial_file) {
-        if (vlc_player_open_file(vlc_player, initial_file)) {
+        if (vlc_player_open_file(g_vlc_player, initial_file)) {
             printf("Loaded initial file: %s\n", initial_file);
             // Don't auto-play, let user control playback
         } else {
@@ -484,19 +421,18 @@ int main(int argc, char *argv[]) {
     vlc_status_t current_status = {0};
     vlc_status_t last_status = {0};
 
-    // Main loop
+    // Main message loop with multicast broadcasting
     MSG msg;
     DWORD last_update = GetTickCount();
 
     while (1) {
-        // Process Windows messages (blocking)
-        if (GetMessage(&msg, NULL, 0, 0) > 0) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-            
+        // Process Windows messages (non-blocking)
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 goto cleanup;
             }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
 
         DWORD current_time = GetTickCount();
@@ -514,9 +450,20 @@ int main(int argc, char *argv[]) {
             long long server_timestamp_ms = getUnixTimeMs();
 
             // Query VLC status directly from libvlc
-            int status_ok = query_vlc_status(vlc_player, &current_status);
+            if (debug_mode) {
+                printf("[DEBUG] About to query VLC status...\n");
+            }
+
+            int status_ok = query_vlc_status(g_vlc_player, &current_status);
+
+            if (debug_mode) {
+                printf("[DEBUG] Query VLC status completed, status_ok: %d\n", status_ok);
+            }
 
             if (status_ok) {
+                // Update status bar with current playback info
+                update_status_bar(&current_status);
+
                 // Check if status has changed (excluding timestamp field)
                 int status_changed = 0;
                 if (current_status.is_playing != last_status.is_playing ||
@@ -574,6 +521,9 @@ int main(int argc, char *argv[]) {
                 strcpy(current_status.title, "No media");
                 strcpy(current_status.filename, "");
 
+                // Update status bar to show error state
+                update_status_bar(&current_status);
+
                 char *json_message = create_status_json_with_timestamp(&current_status, server_timestamp_ms);
                 if (json_message) {
                     send_multicast_data(multicast_sock, json_message);
@@ -592,7 +542,8 @@ int main(int argc, char *argv[]) {
 
 cleanup:
     // Cleanup
-    vlc_player_destroy(vlc_player);
+    vlc_player_destroy(g_vlc_player);
+    g_vlc_player = NULL;
     closesocket(multicast_sock);
     cleanup_winsock();
     return 0;
@@ -650,7 +601,7 @@ int send_multicast_data(SOCKET sock, const char *data) {
     return len > 0;
 }
 
-// Create VLC player with native VLC interface
+// Create VLC player with dummy interface (no UI, embedded in our window)
 vlc_player_t *vlc_player_create() {
     vlc_player_t *player = malloc(sizeof(vlc_player_t));
     if (!player) {
@@ -659,61 +610,37 @@ vlc_player_t *vlc_player_create() {
 
     memset(player, 0, sizeof(vlc_player_t));
 
-    // Initialize VLC instance with full Qt interface enabled
+    // Initialize VLC instance with minimal arguments
     const char *vlc_args[] = {
-        // "--intf", "qt",             // Use Qt interface (full VLC UI)
-        // "--volume", "50",           // Set initial volume
-        // "--video-title-show",       // Show video title
-        // "--mouse-events",           // Enable mouse events
-        // "--keyboard-events",        // Enable keyboard events
-        // "--no-qt-privacy-ask",      // Skip privacy dialog
-        // "--no-qt-updates-notif",    // Skip update notifications
-        // "--qt-start-minimized"      // Start minimized to reduce initial load
+        "--no-video-title-show",    // Don't show video title overlay
+        // "--no-stats",               // Disable statistics
+        // "--no-snapshot-preview",    // Disable snapshot preview
+        "--no-video-on-top",        // Don't keep video on top
+        // "--no-disable-screensaver", // Don't disable screensaver
+        "--avcodec-threads=1",      // Use single thread for decoding to reduce cleanup issues
+        // "--quiet",                  // Reduce VLC log verbosity
     };
 
-
-    player->vlc_instance = p_libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
+    player->vlc_instance = libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
     if (!player->vlc_instance) {
-        printf("Warning: Failed to create VLC instance with Qt interface: %s\n", p_libvlc_errmsg());
-        printf("Attempting fallback to dummy interface...\n");
-
-        // Fallback to dummy interface if Qt fails
-        const char *fallback_args[] = {
-            "--intf", "dummy",
-            "--quiet"
-        };
-
-        player->vlc_instance = p_libvlc_new(sizeof(fallback_args) / sizeof(fallback_args[0]), fallback_args);
-        if (!player->vlc_instance) {
-            printf("Error: Failed to create VLC instance even with fallback: %s\n", p_libvlc_errmsg());
-            free(player);
-            return NULL;
-        }
-        printf("Successfully created VLC instance with dummy interface fallback\n");
-    } else {
-        printf("Successfully created VLC instance with Qt interface\n");
-    }
-
-    // Create media player
-    player->media_player = p_libvlc_media_player_new(player->vlc_instance);
-    if (!player->media_player) {
-        printf("Error: Failed to create media player: %s\n", p_libvlc_errmsg());
-        p_libvlc_release(player->vlc_instance);
+        printf("Error: Failed to create VLC instance: %s\n", libvlc_errmsg());
         free(player);
         return NULL;
     }
 
-    // VLC will create its own window - no need to set hwnd
+    // Create media player
+    player->media_player = libvlc_media_player_new(player->vlc_instance);
+    if (!player->media_player) {
+        printf("Error: Failed to create media player: %s\n", libvlc_errmsg());
+        libvlc_release(player->vlc_instance);
+        free(player);
+        return NULL;
+    }
+
     player->initialized = 1;
 
     if (debug_mode) {
-        printf("[DEBUG] VLC player created successfully with native interface\n");
-    }
-
-    return player;
-
-    if (debug_mode) {
-        printf("[DEBUG] VLC player created successfully\n");
+        printf("[DEBUG] VLC player created successfully with static linking\n");
     }
 
     return player;
@@ -723,21 +650,34 @@ vlc_player_t *vlc_player_create() {
 void vlc_player_destroy(vlc_player_t *player) {
     if (!player) return;
 
-
-    if (player->current_media) {
-        p_libvlc_media_release(player->current_media);
-    }
-
+    // Stop playback first
     if (player->media_player) {
-        p_libvlc_media_player_stop(player->media_player);
-        p_libvlc_media_player_release(player->media_player);
+        libvlc_media_player_stop(player->media_player);
+
+        // Clear window handle to prevent rendering errors
+        libvlc_media_player_set_hwnd(player->media_player, NULL);
+
+        // Give VLC time to stop rendering threads
+        Sleep(150);
     }
 
+    // Release media
+    if (player->current_media) {
+        libvlc_media_release(player->current_media);
+        player->current_media = NULL;
+    }
+
+    // Release media player
+    if (player->media_player) {
+        libvlc_media_player_release(player->media_player);
+        player->media_player = NULL;
+    }
+
+    // Release VLC instance
     if (player->vlc_instance) {
-        p_libvlc_release(player->vlc_instance);
+        libvlc_release(player->vlc_instance);
+        player->vlc_instance = NULL;
     }
-
-    // VLC manages its own windows, no need to destroy them manually
 
     free(player);
 }
@@ -750,20 +690,19 @@ int vlc_player_open_file(vlc_player_t *player, const char *filepath) {
 
     // Release previous media
     if (player->current_media) {
-        p_libvlc_media_release(player->current_media);
+        libvlc_media_release(player->current_media);
         player->current_media = NULL;
     }
 
     // Create new media from file path
-
-    player->current_media = p_libvlc_media_new_path(player->vlc_instance, filepath);
+    player->current_media = libvlc_media_new_path(player->vlc_instance, filepath);
     if (!player->current_media) {
-        printf("Error: Failed to create media from path: %s\n", p_libvlc_errmsg());
+        printf("Error: Failed to create media from path: %s\n", libvlc_errmsg());
         return 0;
     }
 
     // Set media to player
-    p_libvlc_media_player_set_media(player->media_player, player->current_media);
+    libvlc_media_player_set_media(player->media_player, player->current_media);
 
     if (debug_mode) {
         printf("[DEBUG] Opened file: %s\n", filepath);
@@ -775,13 +714,27 @@ int vlc_player_open_file(vlc_player_t *player, const char *filepath) {
 // Play media
 int vlc_player_play(vlc_player_t *player) {
     if (!player || !player->media_player) {
+        if (debug_mode) {
+            printf("[DEBUG] Play failed: invalid player or media_player\n");
+        }
         return 0;
     }
 
-    int result = p_libvlc_media_player_play(player->media_player);
+    if (debug_mode) {
+        printf("[DEBUG] About to call libvlc_media_player_play...\n");
+    }
+
+    int result = libvlc_media_player_play(player->media_player);
 
     if (debug_mode) {
         printf("[DEBUG] Play command sent, result: %d\n", result);
+        if (result != 0) {
+            const char *error = libvlc_errmsg();
+            if (error) {
+                printf("[DEBUG] VLC error: %s\n", error);
+            }
+        }
+        printf("[DEBUG] Play function completed successfully\n");
     }
 
     return result == 0; // libvlc_media_player_play returns 0 on success
@@ -793,7 +746,7 @@ int vlc_player_pause(vlc_player_t *player) {
         return 0;
     }
 
-    p_libvlc_media_player_pause(player->media_player);
+    libvlc_media_player_pause(player->media_player);
 
     if (debug_mode) {
         printf("[DEBUG] Pause command sent\n");
@@ -808,13 +761,30 @@ int vlc_player_stop(vlc_player_t *player) {
         return 0;
     }
 
-    p_libvlc_media_player_stop(player->media_player);
+    // Stop the media player and wait a bit for cleanup
+    libvlc_media_player_stop(player->media_player);
+
+    // Give VLC time to stop decoding threads properly
+    Sleep(50);
 
     if (debug_mode) {
-        printf("[DEBUG] Stop command sent\n");
+        printf("[DEBUG] Stop command sent and cleanup delay completed\n");
     }
 
     return 1;
+}
+
+// Toggle play/pause
+int vlc_player_toggle_play_pause(vlc_player_t *player) {
+    if (!player || !player->media_player) {
+        return 0;
+    }
+
+    if (libvlc_media_player_is_playing(player->media_player)) {
+        return vlc_player_pause(player);
+    } else {
+        return vlc_player_play(player);
+    }
 }
 
 // Query VLC status using libvlc API
@@ -827,17 +797,16 @@ int query_vlc_status(vlc_player_t *player, vlc_status_t *status) {
     memset(status, 0, sizeof(vlc_status_t));
 
     // Get playing status
-
-    status->is_playing = p_libvlc_media_player_is_playing(player->media_player);
+    status->is_playing = libvlc_media_player_is_playing(player->media_player);
 
     // Get current time and duration
-    status->time = p_libvlc_media_player_get_time(player->media_player);
-    status->duration = p_libvlc_media_player_get_length(player->media_player);
+    status->time = libvlc_media_player_get_time(player->media_player);
+    status->duration = libvlc_media_player_get_length(player->media_player);
 
     // Get media info (title/filename)
     if (player->current_media) {
-        char *meta_title = p_libvlc_media_get_meta(player->current_media, 0);  // libvlc_meta_Title = 0
-        char *meta_filename = p_libvlc_media_get_meta(player->current_media, 15); // libvlc_meta_URL = 15
+        char *meta_title = libvlc_media_get_meta(player->current_media, libvlc_meta_Title);
+        char *meta_filename = libvlc_media_get_meta(player->current_media, libvlc_meta_URL);
 
         if (meta_title && strlen(meta_title) > 0) {
             strncpy(status->title, meta_title, sizeof(status->title) - 1);
@@ -914,16 +883,23 @@ void print_status(const vlc_status_t *status) {
 
 // Print usage information
 void print_usage(const char *program_name) {
-    printf("VLC Status Server with LibVLC - Creates native VLC instance and broadcasts status\n\n");
-    printf("Usage: %s [--debug]\n\n", program_name);
+    printf("VLC Status Server with Custom Window - Creates embedded VLC player and broadcasts status\n\n");
+    printf("Usage: %s [OPTIONS] [FILE]\n\n", program_name);
     printf("Arguments:\n");
-    printf("  --debug     Enable verbose debug output\n");
-    printf("  --help, -h  Show this help message\n\n");
+    printf("  FILE              Initial media file to load (optional)\n");
+    printf("  --file FILE, -f   Specify initial media file to load\n");
+    printf("  --debug           Enable verbose debug output\n");
+    printf("  --help, -h        Show this help message\n\n");
     printf("Features:\n");
-    printf("  - Creates a full VLC media player with native VLC interface\n");
-    printf("  - Use VLC's built-in controls to open files, play, pause, seek, etc.\n");
-    printf("  - Broadcasts playback status to UDP multicast group 239.255.0.100:8888\n\n");
+    printf("  - Custom window with embedded VLC video/audio playback\n");
+    printf("  - Keyboard controls: Space=Play/Pause, Left/Right=Seek ±10s, Escape=Stop\n");
+    printf("  - Right-click to open file dialog\n");
+    printf("  - Drag and drop files to play\n");
+    printf("  - Broadcasts playback status to UDP multicast group 239.255.0.100:8888\n");
+    printf("  - Static linking to libVLC (no dynamic loading)\n\n");
     printf("Examples:\n");
-    printf("  %s                    # Start VLC player with status server\n", program_name);
-    printf("  %s --debug            # Enable debug output\n", program_name);
+    printf("  %s                           # Start with blank window\n", program_name);
+    printf("  %s video.mp4                 # Start with video.mp4 loaded\n", program_name);
+    printf("  %s --file audio.mp3          # Start with audio.mp3 loaded\n", program_name);
+    printf("  %s --debug                   # Enable debug output\n", program_name);
 }

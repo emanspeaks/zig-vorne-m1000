@@ -11,12 +11,35 @@
             "cwd": "${workspaceFolder}",
             "environment": [
                 {"name": "PATH", "value": "C:\\Program Files\\VideoLAN\\VLC;${env:PATH}"},
-                {"name": "VLC_NO_STATUS_LOG", "value": "1"}
+                // {"name": "VLC_NO_STATUS_LOG", "value": "1"}
             ],
             "externalConsole": false,
             "preLaunchTask": "cmake build",
             "MIMode": "gdb",
+            "miDebuggerArgs": "-q",
             // "miDebuggerPath": "gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                // {
+                //     "description": "Skip specific ntdll function that always breaks",
+                //     "text": "skip function ntdll!RtlSetProcessPreferredUILanguages",
+                //     "ignoreFailures": true
+                // },
+                // {
+                //     "description": "Handle SIGTRAP signals from system DLLs",
+                //     "text": "handle SIGTRAP nostop noprint pass",
+                //     "ignoreFailures": true
+                // }
+                {
+                    // "description": "Set pagination off",
+                    "text": "handle SIGTRAP noprint nostop",
+                    // "ignoreFailures": true
+                }
+            ]
         },
         {
             "type": "cppdbg",

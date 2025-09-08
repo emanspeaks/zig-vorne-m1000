@@ -42,8 +42,8 @@
 		{
 			"type": "shell",
 			"label": "clean build",
-			"command": "rm",
-			"args": ["-rf", "build"],
+			"command": "cmd",
+			"args": ["/c", "if exist build rmdir /s /q build"],
 			"options": {
 				"cwd": "${workspaceFolder}/vlc/server"
 			},
