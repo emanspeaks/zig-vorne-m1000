@@ -6,7 +6,7 @@
             "request": "launch",
             "name": "Run VLC server",
             "program": "${workspaceFolder}/vlc/server/build/bin/vlc_status_server.exe",
-            // "args": ["--bluray"],
+            "args": ["--debug"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [
@@ -17,27 +17,15 @@
             "preLaunchTask": "cmake build",
             "MIMode": "gdb",
             "miDebuggerArgs": "-q",
-            // "miDebuggerPath": "gdb.exe",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
                     "text": "-enable-pretty-printing",
                     "ignoreFailures": true
                 },
-                // {
-                //     "description": "Skip specific ntdll function that always breaks",
-                //     "text": "skip function ntdll!RtlSetProcessPreferredUILanguages",
-                //     "ignoreFailures": true
-                // },
-                // {
-                //     "description": "Handle SIGTRAP signals from system DLLs",
-                //     "text": "handle SIGTRAP nostop noprint pass",
-                //     "ignoreFailures": true
-                // }
                 {
-                    // "description": "Set pagination off",
+                    "description": "Handle SIGTRAP signals from system DLLs",
                     "text": "handle SIGTRAP noprint nostop",
-                    // "ignoreFailures": true
                 }
             ]
         },
@@ -87,7 +75,7 @@
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",
             "environment": [
-                // {"name": "DEBUG_VLC", "value": "1"}
+                {"name": "DEBUG_VLC", "value": "1"}
             ],
             "externalConsole": false,
             "preLaunchTask": "zig build",

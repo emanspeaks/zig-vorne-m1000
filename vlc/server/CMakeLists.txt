@@ -104,8 +104,15 @@ add_custom_command(
 )
 add_custom_target(libvlc_import DEPENDS ${CMAKE_BINARY_DIR}/libvlc.lib)
 
-# Define the executable
-add_executable(vlc_status_server vlc_status_server.c)
+# Define the executable with modular source files
+add_executable(vlc_status_server 
+    vlc_status_server.c
+    src/vlc_player.c
+    src/network.c
+    src/ui.c
+    src/utils.c
+    src/http_server.c
+)
 
 # Make executable depend on import library
 add_dependencies(vlc_status_server libvlc_import)

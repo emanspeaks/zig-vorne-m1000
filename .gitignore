@@ -9,3 +9,4 @@ build/
 # vlc/server/build/bin/*
 # !/vlc/server/build/bin/vlc_status_server.exe
 CLAUDE.md
+.claude/
