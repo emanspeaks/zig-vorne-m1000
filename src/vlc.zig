@@ -41,7 +41,7 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
     var playtime_buf: [maxbufsz]u8 = undefined;
     var linebuf: [maxbufsz]u8 = undefined;
     var playtime_ms: u64 = 0;
-    var filename: []const u8 = "No media";
+    var filename: []const u8 = "(No media)";
 
     // Initialize frame timer for real-time operation
     var timer = frame_timer.FrameTimer.init(4.0); // 5 FPS target to match server
@@ -100,19 +100,24 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
             .Paused => PAUSECHAR,
         };
 
-        // Display filename on first line, time on second
+        // Display filename on first line
+        try str_utils.clearVorneLineBuf(&linebuf);
         try str_utils.copyLeftJustify(&linebuf, filename, 20, null);
+        cmd_parts.clearAndFree(allocator);
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+        const cmd1_slice = try cmd_parts.toOwnedSlice(allocator);
+        defer allocator.free(cmd1_slice);
+        protocol.sendUnitDisplayCmd(allocator, port, 1, cmd1_slice) catch |err| return err;
 
+        // Display time on second line
         try str_utils.clearVorneLineBuf(&linebuf);
         try str_utils.copyLeftJustify(&linebuf, playtime_str, 20 - runstatus_str.len, null);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
+        cmd_parts.clearAndFree(allocator);
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &linebuf);
-
-        const cmd_slice = try cmd_parts.toOwnedSlice(allocator);
-        if (cmd_slice.len > 0) {
-            protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_slice) catch |err| return err;
-        }
+        const cmd2_slice = try cmd_parts.toOwnedSlice(allocator);
+        defer allocator.free(cmd2_slice);
+        protocol.sendUnitDisplayCmd(allocator, port, 1, cmd2_slice) catch |err| return err;
 
         // Handle frame timing and sleep
         timer.frameEnd();
@@ -357,15 +362,26 @@ pub const VlcPlayer = struct {
 
         const data_obj = &vlc_data.object;
 
-        // Parse filename
-        if (data_obj.get("filename")) |filename_val| {
-            if (filename_val == .string) {
-                const new_filename = filename_val.string;
-                debugPrint("VLC: Parsed filename: {s}\n", .{new_filename});
-                // Free old filename and allocate new one
-                self.allocator.free(self.state.filename);
-                self.state.filename = try self.allocator.dupe(u8, new_filename);
+        // Parse title or filename
+        var new_display_name: ?[]const u8 = null;
+        if (data_obj.get("title")) |title_val| {
+            if (title_val == .string and title_val.string.len > 0) {
+                new_display_name = title_val.string;
+                debugPrint("VLC: Parsed title: {s}\n", .{title_val.string});
             }
+        }
+        if (new_display_name == null) {
+            if (data_obj.get("filename")) |filename_val| {
+                if (filename_val == .string) {
+                    new_display_name = filename_val.string;
+                    debugPrint("VLC: Parsed filename: {s}\n", .{filename_val.string});
+                }
+            }
+        }
+        if (new_display_name) |name| {
+            // Free old filename and allocate new one
+            self.allocator.free(self.state.filename);
+            self.state.filename = try self.allocator.dupe(u8, name);
         }
 
         // Parse duration (in milliseconds)
