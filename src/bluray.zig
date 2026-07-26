@@ -1069,17 +1069,23 @@ pub const BlurayPlayer = struct {
         // would bias every sample late by roughly a full round trip.
         const sample_ms = sent_ms + @divFloor(recv_ms - sent_ms, 2);
         // Empirically, the estimator converged cleanly on real hardware but
-        // consistently landed about one round trip behind the true position
-        // -- expected, since by the time a response is in hand the player has
-        // already moved on by roughly `last_rtt_ms` from whatever it reported.
-        // Shifting the timestamp fed to the lock earlier by the full round
-        // trip is algebraically exactly equivalent to adding `last_rtt_ms` to
-        // the *value* instead (fully worked through in CLAUDE.md's "Timing
-        // accuracy"), without needing `sampleRunning`'s `value_sec: u32`
-        // parameter to carry sub-second precision it cannot represent. Only
-        // the lock sees this; `sample_ms` itself stays the true midpoint for
-        // `last_update_time` and freshness tracking.
-        const lock_sample_ms = sample_ms - self.last_rtt_ms;
+        // consistently landed behind the true position. Assuming the latency
+        // is ordinary network/processing overhead split roughly evenly
+        // between the two legs of the round trip, the player actually reads
+        // its clock close to when our request *arrives* -- i.e. close to
+        // `sample_ms` itself, half the round trip in -- not at `sent_ms`. The
+        // interval-intersection math, though, treats `sample_ms` as "the
+        // instant the counter reached `value_sec`" (see `sampleRunning`'s
+        // `into` calculation), with no separate allowance for the *response*
+        // leg still being in flight after that. Shifting the timestamp fed to
+        // the lock earlier by half the round trip corrects for exactly that
+        // remaining leg, and is algebraically exactly equivalent to adding
+        // `last_rtt_ms / 2` to the *value* instead (fully worked through in
+        // CLAUDE.md's "Timing accuracy"), without needing `sampleRunning`'s
+        // `value_sec: u32` parameter to carry sub-second precision it cannot
+        // represent. Only the lock sees this; `sample_ms` itself stays the
+        // true midpoint for `last_update_time` and freshness tracking.
+        const lock_sample_ms = sample_ms - @divFloor(self.last_rtt_ms, 2);
 
         const parsed = self.parseResponse(response) catch |err| {
             return err;
