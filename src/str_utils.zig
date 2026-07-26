@@ -163,6 +163,32 @@ test "idxChar2Str matches the character index directly when there is no DLE byte
     }
 }
 
+test "truncating to a column boundary never leaves a dangling DLE" {
+    // How a pinned (non-scrolling) cue wider than the display gets cut down.
+    // Doing it by byte -- `text[0..maxchars]` -- can land the cut between a
+    // DLE and the code byte it escapes. The panel then reads the *next* byte
+    // on the wire as the escaped code, and that byte is the CR ending the SPP
+    // frame: the frame is malformed, its CRC fails, and the whole frame is
+    // discarded, so nothing renders at all even though the write succeeded.
+    //
+    // 19 plain columns then a DLE pair, so column 20 begins at byte 19 and the
+    // naive byte cut at 20 falls squarely inside the pair.
+    const text = "0123456789ABCDEFGHI" ++ "\x10P" ++ "XYZ";
+    try testing.expectEqual(@as(u8, DLE), text[19]);
+
+    // The bug, stated directly: a byte cut ends on a DLE with nothing after it.
+    try testing.expectEqual(@as(u8, DLE), text[0..maxchars][maxchars - 1]);
+
+    // The fix: cut at the byte where column 20 starts, keeping the pair whole.
+    const cut = try idxChar2Str(text, maxchars);
+    try testing.expectEqual(@as(usize, 19), cut);
+    try testing.expectEqualStrings("0123456789ABCDEFGHI", text[0..cut]);
+    // 19 columns, not 20 -- the DLE glyph did not fit, so it is left out
+    // entirely rather than half-included.
+    try testing.expectEqual(@as(usize, 19), (try strlensz(text[0..cut]))[0]);
+    try testing.expect(text[0..cut][cut - 1] != DLE);
+}
+
 test "copyLeftJustify copies a DLE-escaped glyph without splitting the pair" {
     var dest: [maxbufsz]u8 = undefined;
     try clearVorneLineBuf(&dest);

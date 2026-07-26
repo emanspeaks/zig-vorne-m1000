@@ -38,6 +38,22 @@ pub const Marquee = struct {
     text_id: u64 = 0,
     started: bool = false,
 
+    /// Forget the current sweep, so the next message starts from the left.
+    ///
+    /// Must be called whenever line 2 shows something this marquee did not
+    /// produce -- a pinned warning cue, a filename, a blank line. `window`
+    /// only restarts a sweep when the text *hash* differs from the last one
+    /// it saw, and it never sees the messages it did not render: so after
+    /// scrolling cue A, showing pinned cue B, and returning to A, `window`
+    /// finds the hash unchanged and resumes A's sweep at
+    /// `@mod(now - started_ms, cycle)` -- an arbitrary point mid-sweep,
+    /// determined by how long B happened to be on screen. A returns already
+    /// scrolled partway through, with its opening columns never shown.
+    pub fn reset(self: *Marquee) void {
+        self.started = false;
+        self.text_id = 0;
+    }
+
     /// The `width`-column window of `text` to show at `now_ms`.
     ///
     /// Returns `text` unchanged when it already fits.
@@ -265,6 +281,44 @@ test "steps are evenly spaced, including across the end holds" {
     try testing.expect(gaps_at_hold > 0);
     // Roughly one hold per traverse.
     try testing.expect(gaps_at_hold <= 40 / @as(usize, @intCast(overflow)) + 2);
+}
+
+test "reset makes a returning message start from the left, not mid-sweep" {
+    // The real sequence this guards: a long cue scrolls, a pinned warning cue
+    // (or a filename, or a blank line) replaces it for a while, and then the
+    // long cue comes back. `window` is never called for the message in
+    // between, so without a reset the text hash still matches and the sweep
+    // silently resumes wherever wall-clock time has carried it -- the message
+    // reappears already scrolled, and its opening columns are never shown.
+    var m: Marquee = .{};
+    const into_sweep = m.hold_ms + 6 * m.step_ms;
+
+    _ = m.window(long_text, cols, 0);
+    try testing.expectEqualStrings(long_text[6..][0..cols], m.window(long_text, cols, into_sweep));
+
+    // The pinned message is rendered without the marquee, which resets it.
+    m.reset();
+
+    // Back to the same text: it must start over, not resume at column 6.
+    try testing.expectEqualStrings(long_text[0..cols], m.window(long_text, cols, into_sweep));
+    // ...and hold at the left for the full hold, as a fresh sweep does.
+    try testing.expectEqualStrings(
+        long_text[0..cols],
+        m.window(long_text, cols, into_sweep + m.hold_ms - 1),
+    );
+    // ...then step off exactly one column, on the new sweep's own timebase.
+    try testing.expectEqualStrings(
+        long_text[1..][0..cols],
+        m.window(long_text, cols, into_sweep + m.hold_ms + m.step_ms),
+    );
+}
+
+test "reset also stops nextStepMs scheduling a wake for a sweep that is gone" {
+    var m: Marquee = .{};
+    _ = m.window(long_text, cols, 0);
+    try testing.expect(m.nextStepMs(long_text, cols, 0) != null);
+    m.reset();
+    try testing.expectEqual(@as(?i64, null), m.nextStepMs(long_text, cols, 0));
 }
 
 test "nextStepMs is null when there is nothing to animate" {

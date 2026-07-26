@@ -54,10 +54,17 @@ const DEADLINE_SLACK_MS: i64 = 12;
 /// step, a cue boundary, a mode change.
 const DISPLAY_IDLE_SLICE_MS: i64 = 25;
 
-/// How old a snapshot may be before its play position stops being trusted for
-/// cue lookup. Long enough to ride out a couple of failed polls, short enough
-/// that a message cannot sit on screen after playback has moved on.
-const stale_position_ms: i64 = 2500;
+/// How often both lines are re-sent even though nothing about them changed.
+///
+/// Redraw suppression (see `last_line1`/`last_line2`) assumes a byte written to
+/// the port is a byte the panel rendered. Nothing in this protocol guarantees
+/// that: there is no flow control, and the unit's reply is drained without ever
+/// being inspected, so a frame the panel misses is indistinguishable from one it
+/// drew. Suppression then makes that permanent -- the content has not changed,
+/// so it is never sent again, and the line stays stale until something unrelated
+/// alters it. A periodic unconditional redraw bounds how long that can last, at
+/// a cost of one extra frame every interval.
+const FORCE_REFRESH_MS: i64 = 3000;
 
 /// Why line 2 currently holds whatever it holds. Logged only when it changes
 /// (`runBlurayClocks`'s `seen_line2_source`), the same "log on change, not
@@ -68,8 +75,7 @@ const stale_position_ms: i64 = 2500;
 const Line2Source = enum {
     /// Armed, live position, a cue covers it: showing that cue's text.
     cue,
-    /// Armed, but the position is not live (not playing, or the last poll is
-    /// too old) -- see `Snapshot.positionIsLive`.
+    /// Armed, but the player is stopped -- see `Snapshot.positionIsLive`.
     armed_not_live,
     /// Armed and live, but `cueLoop` has not published a parsed file yet (or
     /// the selection was cleared).
@@ -99,18 +105,22 @@ pub fn runBlurayClocks(
     // Last content written to each line, so only a line that actually changed
     // is re-clocked out. At 19200 baud a full 20 column line costs about 17 ms
     // to transmit, and the playback second usually ticks while line 2 is
-    // unchanged, so sending them separately halves the time between the tick
-    // and the display catching up with it.
+    // unchanged, so skipping an unchanged line halves the time between the
+    // tick and the display catching up with it.
+    //
+    // One flag covers both records because both are assigned together, on the
+    // single frame's success, and never independently.
     var last_line1: [maxbufsz]u8 = undefined;
     var last_line2: [maxbufsz]u8 = undefined;
     var have_last = false;
+    // See `FORCE_REFRESH_MS`.
+    var last_refresh_ms: i64 = 0;
 
     var playtime_buf: [maxbufsz]u8 = undefined;
     var clock_buf: [maxbufsz]u8 = undefined;
     var linebuf: [maxbufsz]u8 = undefined;
     var line2buf: [maxbufsz]u8 = undefined;
     var playtime: u32 = 0;
-
 
     // Line 2 comes from the cue file chosen on the web page. The file is
     // watched and parsed on the cue thread; what arrives here is a ready-made
@@ -259,7 +269,7 @@ pub fn runBlurayClocks(
             // and a frozen position pins whatever cue happened to cover it on
             // screen indefinitely -- which is exactly what happens when you
             // work the transport controls mid-message.
-            if (!snap.positionIsLive(now_ms)) {
+            if (!snap.positionIsLive()) {
                 line2_source = .armed_not_live;
                 seen_cue_span = null;
                 break :blk "";
@@ -315,69 +325,104 @@ pub fn runBlurayClocks(
             seen_line2_source = line2_source;
             std.debug.print(
                 "bluray: line2 source -> {s} (armed={}, live={}, name='{s}', has_cue_list={})\n",
-                .{ @tagName(line2_source), cue_state.isArmed(), snap.positionIsLive(now_ms), name_buf[0..name_len], cue_list != null },
+                .{ @tagName(line2_source), cue_state.isArmed(), snap.positionIsLive(), name_buf[0..name_len], cue_list != null },
             );
         }
 
         const line2_window = if (may_scroll)
             scroller.window(line2, str_utils.maxchars, now_ms)
-        else
-            line2[0..@min(line2.len, str_utils.maxchars)];
+        else blk: {
+            // Nothing this marquee produced is on screen, so drop its sweep
+            // state -- otherwise returning to a message it scrolled before
+            // resumes it mid-sweep instead of restarting. See `Marquee.reset`.
+            scroller.reset();
+            // Truncate by *column*, not by byte. A DLE-escaped glyph is two
+            // bytes for one column, so a byte cut can land between the DLE
+            // and the code byte it escapes and leave a dangling DLE at the
+            // end of the text. The panel then takes the next byte on the wire
+            // as the escaped code -- and that byte is the CR terminating the
+            // SPP frame. The frame is left malformed, its CRC fails, and the
+            // panel discards the whole thing, line 1 included: the write
+            // reports success and nothing renders at all.
+            const cols = (str_utils.strlensz(line2) catch unreachable)[0];
+            if (cols <= str_utils.maxchars) break :blk line2;
+            break :blk line2[0..(str_utils.idxChar2Str(line2, str_utils.maxchars) catch line2.len)];
+        };
 
-        try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_window.len, 20), null);
+        // `copyLeftJustify`'s limit is a column count, so it needs the
+        // window's width in columns -- `line2_window.len` is its width in
+        // bytes, which is larger for any text holding a DLE pair.
+        const line2_cols = (str_utils.strlensz(line2_window) catch unreachable)[0];
+        try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_cols, str_utils.maxchars), null);
 
-        // Send only the lines that actually changed, and as two independent
-        // writes rather than one combined one -- previously they were bundled
-        // into a single `cmd_parts`/`sendUnitDisplayCmd` call whenever both
-        // changed in the same pass, which meant line 2's own ~17 ms of serial
-        // time (see the module doc) sat directly in front of line 1's, on the
-        // wire, every time. That is invisible most of the time, since the two
-        // rarely change in the same pass -- except during a marquee sweep,
-        // which touches line 2 roughly every 400 ms and so collides with a
-        // real-time clock tick often enough to be visible as the clock
-        // advancing unevenly specifically while scrolling. Two separate
-        // writes mean line 1 is never delayed by line 2's content, or the
-        // reverse.
-        // `sendUnitDisplayCmd` failing (a short or failed serial write --
-        // see `SerialPort.write`) is logged and skipped, not propagated: a
-        // transient hiccup here should not take the whole display service
-        // down. Critically, `last_lineN` is only updated on a *successful*
-        // send, so a failure does not get recorded as "shown" -- the same
-        // content is retried on the very next pass instead of silently
-        // never reaching the panel until something else happens to change
-        // it. Before this, a failed write and a real "nothing changed"
-        // looked identical from here, which is exactly the class of bug
-        // that presented as line 2 randomly not updating.
-        var sent_anything = false;
-        if (!have_last or !std.mem.eql(u8, &linebuf, &last_line1)) {
-            cmd_parts.clearRetainingCapacity();
+        // Both lines go out in ONE frame, not two back-to-back ones.
+        //
+        // They were split apart earlier today on the theory that line 2's
+        // ~17 ms of serial time sitting in front of line 1's was what made the
+        // real-time clock advance unevenly during a marquee sweep. That
+        // reasoning does not hold up: in a combined frame line 1's escape
+        // sequence is written *first*, so its bytes still reach the wire
+        // first, and splitting saves it nothing. What splitting did change is
+        // that the panel started receiving two separate SPP frames with no gap
+        // between them, and it has no flow control and a small input buffer --
+        // bytes arriving while it is still parsing and rendering the previous
+        // frame have nowhere to go. That lines up exactly with the observed
+        // regression: line 1 (first frame) always updated, line 2 (second
+        // frame) was silently dropped precisely when both changed in the same
+        // pass, which is every cue transition and 2 of every 5 scroll steps.
+        // One frame per pass is also what this code did before today, when
+        // this transition worked.
+        //
+        // `sendUnitDisplayCmd` failing (a short, failed, or timed-out serial
+        // write -- see `SerialPort.write`) is logged and skipped rather than
+        // propagated, so a transient hiccup does not take the display service
+        // down. Both records are updated together and only on success, so a
+        // failure is never recorded as "shown": the same content is retried on
+        // the very next pass. Assigning both is right even though only the
+        // changed lines were appended -- an unchanged line is being assigned
+        // the value it already holds.
+        cmd_parts.clearRetainingCapacity();
+        const line1_changed = !have_last or !std.mem.eql(u8, &linebuf, &last_line1);
+        // Whether the *content* changed, kept separate from whether it gets
+        // sent: a periodic refresh re-sends identical content, and reporting
+        // that as a line-2 update every few seconds would bury the
+        // transitions actually worth reading in the log.
+        const line2_changed = !have_last or !std.mem.eql(u8, &line2buf, &last_line2);
+
+        const forced = now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
+        if (forced) last_refresh_ms = now_ms;
+
+        if (line1_changed or forced) {
             try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
-            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
-                last_line1 = linebuf;
-                sent_anything = true;
-            } else |err| {
-                std.debug.print("bluray: failed to send line 1: {}\n", .{err});
-            }
         }
-        if (!have_last or !std.mem.eql(u8, &line2buf, &last_line2)) {
-            cmd_parts.clearRetainingCapacity();
+        if (line2_changed or forced) {
             try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
-            // Every attempt, not just failures -- this is the one point that
-            // can confirm or rule out the send path itself when the panel
-            // and the `bluray: cue -> ...`/`line2 source ->` logs disagree
+        }
+
+        if (cmd_parts.items.len > 0) {
+            // Logged on every attempt, not just failures -- this is the one
+            // point that can confirm or rule out the send path itself when the
+            // panel and the `cue -> ...`/`line2 source -> ...` logs disagree
             // about what should be on screen.
             var readable: std.ArrayList(u8) = .empty;
             defer readable.deinit(allocator);
-            vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
+            if (line2_changed) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
+
             if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
+                last_line1 = linebuf;
                 last_line2 = line2buf;
-                sent_anything = true;
-                std.debug.print("bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+                have_last = true;
+                if (line2_changed) {
+                    std.debug.print("bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+                }
             } else |err| {
-                std.debug.print("bluray: sending line 2: \"{s}\" send status: {}\n", .{ readable.items, err });
+                if (line2_changed) {
+                    std.debug.print("bluray: sending line 2: \"{s}\" send status: {}\n", .{ readable.items, err });
+                } else {
+                    std.debug.print("bluray: failed to send display frame: {}\n", .{err});
+                }
             }
         }
-        if (sent_anything) have_last = true;
 
         // Sleep until the next moment something on the display is due to
         // change: the next playback tick, the next real-time second, or the
@@ -402,7 +447,7 @@ pub fn runBlurayClocks(
         // sample risks stepping over one entirely -- and a warning that never
         // appears is worse than one that appears a little late.
         if (cue_list) |list| {
-            if (snap.positionIsLive(now_ms)) {
+            if (snap.positionIsLive()) {
                 const position_ms = snap.playTimeMillis(now_ms);
                 if (list.nextBoundaryMs(position_ms)) |boundary_ms| {
                     wake_ms = @min(wake_ms, now_ms + (boundary_ms - position_ms));
@@ -593,33 +638,39 @@ pub const Snapshot = struct {
     /// seconds old without anything looking wrong about it.
     sampled_ms: i64 = 0,
 
-    /// Whether the play position is fresh enough to be trusted for anything
-    /// that keys off *where* playback is -- cue lookups and boundary waits.
+    /// Whether the play position means anything for keying cue lookups and
+    /// boundary waits off it.
     ///
-    /// Deliberately does not require `has_anchor`. `playTimeMillis` already
-    /// falls back to the raw last-polled value when there is no anchor, so
-    /// gating on the anchor here bought nothing but *silence*: while the lock
-    /// is re-acquiring (which can take a while right after a seek, a resume,
-    /// or simply a fresh start), this used to blank cues -- or leave a stale
-    /// one on screen from before arming -- until the PLL caught back up,
-    /// which reads exactly like a bug even though the underlying position was
-    /// perfectly usable the whole time. A poll landing every second or so
-    /// without smooth extrapolation between them is a worse position signal
-    /// than a locked one, but a much better one than nothing.
+    /// Only a stopped player is excluded, and deliberately nothing else.
     ///
-    /// `.Paused` counts as live too, deliberately, not just `.Playing`.
-    /// `playTimeMillisLeadBy` already returns the frozen last-polled value
-    /// whenever `run_status != .Playing` -- so a paused position never
-    /// extrapolates forward, it just stays put -- and a frozen-but-known
-    /// position is exactly as valid a cue-lookup key as a moving one.
-    /// Blanking line 2 on pause (the previous behavior) threw away a
-    /// perfectly good, unambiguous position and, worse, interrupted a
-    /// message mid-read the moment someone paused to read it; a scrolling
-    /// cue should keep sweeping through a pause too, since the sweep is
-    /// driven by wall-clock time, not play position.
-    pub fn positionIsLive(self: Snapshot, now_ms: i64) bool {
-        return (self.run_status == .Playing or self.run_status == .Paused) and
-            now_ms - self.sampled_ms <= stale_position_ms;
+    /// It does not require `has_anchor`: `playTimeMillis` already falls back
+    /// to the raw last-polled value when there is no anchor, so gating on the
+    /// anchor bought nothing but *silence* -- while the lock re-acquires
+    /// (after a seek, a resume, or simply a fresh start) this blanked cues, or
+    /// pinned a stale one from before arming, even though the underlying
+    /// position was perfectly usable throughout.
+    ///
+    /// It does not require the snapshot to be *fresh* either, which is the
+    /// less obvious half. A staleness gate here reads as an obviously good
+    /// idea -- don't show a message once playback has moved on -- but the
+    /// round trip to this player is around a second, so `sampled_ms` is
+    /// already several hundred ms old the instant it is recorded, and the
+    /// poller staggers its cadence and backs off after an error. Any stretch
+    /// where a poll slips past the threshold blanks line 2 outright, and the
+    /// symptom is cues that vanish and reappear for no reason visible
+    /// anywhere in the log. A position that is a second or two old is a far
+    /// better cue key than no position at all, so the gate cost much more
+    /// than it bought.
+    ///
+    /// `.Paused` counts, not just `.Playing`: `playTimeMillisLeadBy` returns
+    /// the frozen last-polled value whenever `run_status != .Playing`, so a
+    /// paused position never extrapolates forward, it just stays put -- and a
+    /// frozen-but-known position is exactly as valid a lookup key as a moving
+    /// one. Blanking on pause also interrupts a message at the moment someone
+    /// paused to read it, and a scrolling cue should keep sweeping through a
+    /// pause, since the sweep runs on wall-clock time, not play position.
+    pub fn positionIsLive(self: Snapshot) bool {
+        return self.run_status != .Stopped;
     }
 
     /// Play position in milliseconds at `now_ms`, `display_lead_ms` included.
@@ -1118,8 +1169,8 @@ pub const BlurayPlayer = struct {
             const drift = @as(i64, reported) - @as(i64, predicted);
             const into_ms = @mod(sample_ms - before.anchor_ms, 1000);
             std.debug.print("pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}\n", .{
-                @tagName(kind),   reported,            predicted,
-                drift,            into_ms,             after.anchor_err_ms,
+                @tagName(kind),   reported,                                  predicted,
+                drift,            into_ms,                                   after.anchor_err_ms,
                 self.last_rtt_ms, if (after.locked) "locked" else "hunting",
             });
         } else {
