@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     var cue_state: cues.State = .{};
 
     // One-shot "force a PLL resync now" signal from the web page, consumed by
-    // `pollLoop`. `swap`-based, so a request cannot be lost or double-fired.
+    // `pollWorker`. `swap`-based, so a request cannot be lost or double-fired.
     var resync_requested = std.atomic.Value(bool).init(false);
 
     // Start HTTP server in a separate thread
@@ -187,8 +187,9 @@ fn handleConnection(
 
         w.writeAll(
             \\<h2>Blu-Ray Sync</h2>
-            \\<p>Re-hunts the phase lock immediately instead of waiting for its
-            \\own periodic re-sync. The clock keeps running while it re-locks.</p>
+            \\<p>Drops the phase lock's current confidence immediately, rather
+            \\than waiting for new samples to out-vote it on their own. The
+            \\clock keeps running while it re-locks.</p>
             \\<form action="/resync" method="post">
             \\<button type="submit">Force PLL Resync</button>
             \\</form>
@@ -346,8 +347,8 @@ fn handleConnection(
         try out.writeAll(response);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/resync")) {
         // No body to parse: this is a single one-shot signal, picked up by
-        // `pollLoop` and consumed via `swap` so a request can never be lost or
-        // fire twice. Setting it while not in Blu-ray mode is harmless -- the
+        // `pollWorker` and consumed via `swap` so a request can never be lost
+        // or fire twice. Setting it while not in Blu-ray mode is harmless -- the
         // next time that mode starts, a freshly initialized phase lock has
         // nothing to resync anyway.
         resync_requested.store(true, .release);

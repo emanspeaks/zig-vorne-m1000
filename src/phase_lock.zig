@@ -397,14 +397,21 @@ const Sim = struct {
 
                     self.worker_state[idx] = .idle;
                     // Back on cycle if the round trip left slack, immediately
-                    // if it ran long -- mirrors `bluray.pollWorker`'s own
-                    // catch-up behavior. The jitter keeps the cycle from ever
-                    // being an exact, repeating multiple of
-                    // `sim_frame_interval_ms`; see `sim_stagger_step_ms`.
+                    // (plus the same small jitter) if it ran long -- mirrors
+                    // `bluray.pollWorker`'s own catch-up behavior. The jitter
+                    // keeps a worker's own successive samples from settling
+                    // into an exact, repeating multiple of
+                    // `sim_frame_interval_ms`; see `sim_stagger_step_ms`. It
+                    // has to apply to *both* branches: an round trip long
+                    // enough to overrun the cycle target skips the "wait out
+                    // the slack" branch entirely, and if that round trip is
+                    // itself a whole number of seconds (an even slower or
+                    // struggling player is not implausible), every worker
+                    // would otherwise resettle onto a fixed phase forever.
                     const jitter = sim_stagger_step_ms * @as(i64, @intCast(self.stagger % sim_stagger_cycle));
                     self.stagger +%= 1;
                     const cycle_ms = @as(i64, @intCast(sim_workers)) * sim_frame_interval_ms + jitter;
-                    self.next_event_ms[idx] = @max(self.dispatch_ms[idx] + cycle_ms, self.now_ms);
+                    self.next_event_ms[idx] = @max(self.dispatch_ms[idx] + cycle_ms, self.now_ms + jitter);
 
                     if (running) {
                         lock.sampleRunning(sample_ms, value);
