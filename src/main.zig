@@ -177,6 +177,7 @@ fn handleConnection(
         , .{mode_str}) catch return;
 
         writeCuesSection(io, allocator, w, cue_state) catch return;
+        writeDisplayLeadSection(w) catch return;
 
         w.writeAll(
             \\</body>
@@ -298,6 +299,35 @@ fn handleConnection(
         // Redirect back to main page
         const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
         try out.writeAll(response);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/display-lead")) {
+        // Find the body
+        var body_start: usize = 0;
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "")) {
+                body_start = @intFromPtr(line.ptr) - @intFromPtr(request.ptr) + line.len + 2;
+                break;
+            }
+        }
+        const body = request[body_start..];
+
+        var iter = std.mem.splitSequence(u8, body, "&");
+        while (iter.next()) |pair| {
+            if (!std.mem.startsWith(u8, pair, "lead=")) continue;
+            const raw_value = formDecode(allocator, pair[5..]) catch continue;
+            defer allocator.free(raw_value);
+
+            if (bluray.parseDisplayLeadConfig(raw_value)) |value| {
+                // Applies to the running process immediately and persists to
+                // bluray_display_lead_ms.txt so it survives a restart too.
+                bluray.setDisplayLead(io, value);
+            } else {
+                std.debug.print("Rejected display lead value: {s}\n", .{raw_value});
+            }
+        }
+
+        // Redirect back to main page
+        const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
+        try out.writeAll(response);
     } else {
         const response = "HTTP/1.1 404 Not Found\r\n\r\n";
         try out.writeAll(response);
@@ -360,6 +390,25 @@ fn writeCuesSection(
         \\</form>
         \\
     , .{if (armed) "running" else "stopped"});
+}
+
+/// Render the Blu-ray display-lead control: `bluray.display_lead_ms`, editable
+/// and applied live (see `bluray.setDisplayLead`) without a rebuild.
+fn writeDisplayLeadSection(w: *Io.Writer) !void {
+    const current = bluray.display_lead_ms.load(.acquire);
+    try w.print(
+        \\<h2>Blu-Ray Display Lead</h2>
+        \\<p>Compensates for latency downstream of an accurate lock (player
+        \\decode/output buffering, TV processing delay) -- not for a stalled
+        \\clock, which this cannot fix. Positive moves the panel further ahead;
+        \\adjust in small steps while comparing the panel against the picture.</p>
+        \\<form action="/display-lead" method="post">
+        \\<label for="lead">Lead (ms):</label>
+        \\<input type="number" id="lead" name="lead" step="10" value="{d}">
+        \\<button type="submit">Set</button>
+        \\</form>
+        \\
+    , .{current});
 }
 
 /// Escape text for interpolation into HTML. File names come from the

@@ -336,16 +336,19 @@ pub const BlurayPlayerRunStatus = enum {
 /// not a constant offset. Re-check after confirming the clock keeps advancing
 /// through a resume before tuning this.
 ///
-/// Runtime-configurable via `display_lead_config_path` (one line, a signed
-/// integer of milliseconds) so it can be dialed in by comparing the panel
-/// against the picture without a rebuild for every trial.
-pub var DISPLAY_LEAD_MS: i64 = 0;
+/// Settable two ways, both funnelled through `setDisplayLead`: once at startup
+/// from `display_lead_config_path`, and live from the web page. Because it can
+/// now change at any moment on the HTTP thread while the display loop reads it
+/// every frame, this is an atomic rather than a plain `var` -- unlike
+/// `cues.active_dir_path`, which really is set once before any other thread
+/// exists and stays that way.
+pub var display_lead_ms: std.atomic.Value(i64) = .init(0);
 
 pub const display_lead_config_path = "/home/emanspeaks/bluray_display_lead_ms.txt";
 
 /// Parse a candidate lead value. Pure and I/O-free so the parsing itself is
 /// directly testable; null for anything that is not a bare signed integer.
-fn parseDisplayLeadConfig(raw: []const u8) ?i64 {
+pub fn parseDisplayLeadConfig(raw: []const u8) ?i64 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     return std.fmt.parseInt(i64, trimmed, 10) catch null;
@@ -354,9 +357,11 @@ fn parseDisplayLeadConfig(raw: []const u8) ?i64 {
 /// Read `display_lead_config_path` and, if it holds a valid integer, use it in
 /// place of the built-in default for the rest of the process.
 ///
-/// Call once, early in `main`, before the Blu-ray display loop starts reading
-/// `DISPLAY_LEAD_MS` -- there is no synchronization on it, by design: this is
-/// meant to run once while still single-threaded, not to be re-read live.
+/// Call once, early in `main`, before the Blu-ray display loop starts. Unlike
+/// `cues.configureDirPath`, this one does not need that ordering for
+/// correctness -- `display_lead_ms` is safe to write from any thread at any
+/// time -- but there is no reason to let the display run even briefly on the
+/// stale default while this is read.
 pub fn configureDisplayLead(io: Io) void {
     const raw = Io.Dir.readFileAlloc(
         .cwd(),
@@ -366,13 +371,13 @@ pub fn configureDisplayLead(io: Io) void {
         .limited(64),
     ) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("No {s}, DISPLAY_LEAD_MS stays {d}\n", .{ display_lead_config_path, DISPLAY_LEAD_MS });
+            std.debug.print("No {s}, display_lead_ms stays {d}\n", .{ display_lead_config_path, display_lead_ms.load(.monotonic) });
             return;
         },
         else => {
             std.debug.print(
-                "Error reading {s}: {}, DISPLAY_LEAD_MS stays {d}\n",
-                .{ display_lead_config_path, err, DISPLAY_LEAD_MS },
+                "Error reading {s}: {}, display_lead_ms stays {d}\n",
+                .{ display_lead_config_path, err, display_lead_ms.load(.monotonic) },
             );
             return;
         },
@@ -381,13 +386,60 @@ pub fn configureDisplayLead(io: Io) void {
 
     const parsed = parseDisplayLeadConfig(raw) orelse {
         std.debug.print(
-            "{s} does not contain a plain integer, DISPLAY_LEAD_MS stays {d}\n",
-            .{ display_lead_config_path, DISPLAY_LEAD_MS },
+            "{s} does not contain a plain integer, display_lead_ms stays {d}\n",
+            .{ display_lead_config_path, display_lead_ms.load(.monotonic) },
         );
         return;
     };
-    DISPLAY_LEAD_MS = parsed;
-    std.debug.print("Using DISPLAY_LEAD_MS = {d} ms\n", .{DISPLAY_LEAD_MS});
+    display_lead_ms.store(parsed, .release);
+    std.debug.print("Using display_lead_ms = {d} ms\n", .{parsed});
+}
+
+/// Write `value` to `display_lead_config_path` so it survives a restart.
+///
+/// Best-effort: a write failure (read-only filesystem, full disk) is logged
+/// and swallowed rather than propagated, since `setDisplayLead` has already
+/// applied the value to the running process by the time this runs, and a
+/// persistence failure should not make the live change look like it failed.
+fn persistDisplayLead(io: Io, value: i64) void {
+    persistDisplayLeadTo(io, display_lead_config_path, value);
+}
+
+/// `persistDisplayLead`, with the path passed explicitly. Split out so the
+/// write itself is testable against a path guaranteed to be writable, rather
+/// than against `display_lead_config_path`'s hardcoded directory, which need
+/// not exist on every machine this is tested on (it does not, on the machine
+/// this was developed on).
+fn persistDisplayLeadTo(io: Io, path: []const u8, value: i64) void {
+    var text_buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&text_buf, "{d}\n", .{value}) catch unreachable;
+
+    const file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        std.debug.print("Failed to open {s} for writing: {}\n", .{ path, err });
+        return;
+    };
+    defer file.close(io);
+
+    var write_buf: [64]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+    writer.interface.writeAll(text) catch |err| {
+        std.debug.print("Failed to write {s}: {}\n", .{ path, err });
+        return;
+    };
+    writer.interface.flush() catch |err| {
+        std.debug.print("Failed to flush {s}: {}\n", .{ path, err });
+    };
+}
+
+/// Apply a new lead value to the running process and persist it, so a change
+/// made from the web page takes effect immediately and survives a restart.
+/// This is the single entry point both `main.zig`'s `/display-lead` handler
+/// and any future caller should use, rather than writing `display_lead_ms`
+/// directly and forgetting the file, or vice versa.
+pub fn setDisplayLead(io: Io, value: i64) void {
+    display_lead_ms.store(value, .release);
+    persistDisplayLead(io, value);
+    std.debug.print("display_lead_ms set to {d} ms (saved to {s})\n", .{ value, display_lead_config_path });
 }
 
 /// Everything the display needs to know about the player, in a form it can
@@ -429,15 +481,15 @@ pub const Snapshot = struct {
             now_ms - self.sampled_ms <= stale_position_ms;
     }
 
-    /// Play position in milliseconds at `now_ms`, `DISPLAY_LEAD_MS` included.
+    /// Play position in milliseconds at `now_ms`, `display_lead_ms` included.
     pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
-        return self.playTimeMillisLeadBy(now_ms, DISPLAY_LEAD_MS);
+        return self.playTimeMillisLeadBy(now_ms, display_lead_ms.load(.acquire));
     }
 
-    /// `playTimeMillis`, with the lead passed explicitly rather than taken from
-    /// `DISPLAY_LEAD_MS`. Exists so the formula itself -- the part worth
+    /// `playTimeMillis`, with the lead passed explicitly rather than read from
+    /// `display_lead_ms`. Exists so the formula itself -- the part worth
     /// regression-testing -- can be exercised with concrete numbers regardless
-    /// of whatever the constant is currently tuned to.
+    /// of whatever the live value is currently tuned to.
     fn playTimeMillisLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) i64 {
         if (self.run_status != .Playing or !self.has_anchor) {
             return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
@@ -455,7 +507,7 @@ pub const Snapshot = struct {
     /// When the displayed second next changes, or null when nothing is ticking
     /// and so there is no future moment worth waking up for.
     pub fn nextTickMs(self: Snapshot, now_ms: i64) ?i64 {
-        return self.nextTickMsLeadBy(now_ms, DISPLAY_LEAD_MS);
+        return self.nextTickMsLeadBy(now_ms, display_lead_ms.load(.acquire));
     }
 
     /// `nextTickMs` with an explicit lead. See `playTimeMillisLeadBy`.
@@ -1180,14 +1232,40 @@ test "parseDisplayLeadConfig accepts signed integers and rejects garbage" {
 test "configureDisplayLead leaves the value in place when the config file is absent" {
     var threaded: Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    const before = DISPLAY_LEAD_MS;
+    const before = display_lead_ms.load(.acquire);
     // No such file exists on any dev or CI machine, so this exercises exactly
     // the FileNotFound branch -- the common case before anyone has tuned it.
     configureDisplayLead(threaded.io());
-    try std.testing.expectEqual(before, DISPLAY_LEAD_MS);
+    try std.testing.expectEqual(before, display_lead_ms.load(.acquire));
 }
 
-test "DISPLAY_LEAD_MS shifts the displayed position and its tick schedule together" {
+test "persistDisplayLeadTo writes a value that parses back correctly" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "bluray_display_lead_test_probe.txt";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    persistDisplayLeadTo(io, path, 250);
+
+    const raw = try Io.Dir.readFileAlloc(.cwd(), io, path, std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqual(@as(?i64, 250), parseDisplayLeadConfig(raw));
+}
+
+test "setDisplayLead applies to the running process immediately" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    // Persistence (to display_lead_config_path) may fail here -- its directory
+    // need not exist on every machine this runs on -- but the in-memory value
+    // must still apply regardless: a persistence failure should not make a
+    // live change from the web page look like it silently did nothing.
+    setDisplayLead(threaded.io(), 250);
+    try std.testing.expectEqual(@as(i64, 250), display_lead_ms.load(.acquire));
+}
+
+test "display_lead_ms shifts the displayed position and its tick schedule together" {
     const snap: Snapshot = .{
         .run_status = .Playing,
         .has_anchor = true,
@@ -1207,8 +1285,8 @@ test "DISPLAY_LEAD_MS shifts the displayed position and its tick schedule togeth
     try std.testing.expectEqual(@as(i64, 51_000 - 237), snap.nextTickMsLeadBy(50_000, 237).?);
 }
 
-test "playTimeMillis and nextTickMs are wired to the configured DISPLAY_LEAD_MS" {
-    // Proves the public entry points actually reach the constant, not just that
+test "playTimeMillis and nextTickMs are wired to the live display_lead_ms" {
+    // Proves the public entry points actually reach the atomic, not just that
     // the LeadBy helpers compute the right formula in isolation.
     const snap: Snapshot = .{
         .run_status = .Playing,
@@ -1216,8 +1294,9 @@ test "playTimeMillis and nextTickMs are wired to the configured DISPLAY_LEAD_MS"
         .anchor_ms = 50_000,
         .anchor_sec = 100,
     };
-    try std.testing.expectEqual(snap.playTimeMillisLeadBy(60_000, DISPLAY_LEAD_MS), snap.playTimeMillis(60_000));
-    try std.testing.expectEqual(snap.nextTickMsLeadBy(50_000, DISPLAY_LEAD_MS), snap.nextTickMs(50_000));
+    const lead = display_lead_ms.load(.acquire);
+    try std.testing.expectEqual(snap.playTimeMillisLeadBy(60_000, lead), snap.playTimeMillis(60_000));
+    try std.testing.expectEqual(snap.nextTickMsLeadBy(50_000, lead), snap.nextTickMs(50_000));
 }
 
 test "nextTickMs marks exactly when playTimeSeconds increments, whatever the lead" {
