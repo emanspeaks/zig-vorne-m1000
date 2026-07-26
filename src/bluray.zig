@@ -183,6 +183,13 @@ pub fn runBlurayClocks(
         if (cue_cell.take()) |fresh| {
             if (cue_list) |list| list.deinit();
             cue_list = fresh;
+            // Only fires on an actual transition (cueLoop publishes on load or
+            // clear, not every pass), so this is safe at render-loop rate.
+            if (cue_list) |list| {
+                std.debug.print("bluray: display picked up {d} cues\n", .{list.cues.len});
+            } else {
+                std.debug.print("bluray: display cleared its cue list\n", .{});
+            }
         }
 
         // The selected file's name, kept only to show while disarmed. Re-read
@@ -322,8 +329,66 @@ pub const BlurayPlayerRunStatus = enum {
 /// negative value pulls the display back instead.
 ///
 /// No principled default exists -- it depends on hardware this code cannot
-/// see -- so it starts at zero until measured on the actual setup.
-pub const DISPLAY_LEAD_MS: i64 = 0;
+/// see -- so it starts at zero. Rule out a stall first, though: a resume that
+/// stalls the display (see `phase_lock.PhaseLock.resumed`) produces exactly
+/// the same symptom -- the panel reading a second or so behind -- as genuine
+/// downstream hardware latency, but no lead value fixes a stall, since it is
+/// not a constant offset. Re-check after confirming the clock keeps advancing
+/// through a resume before tuning this.
+///
+/// Runtime-configurable via `display_lead_config_path` (one line, a signed
+/// integer of milliseconds) so it can be dialed in by comparing the panel
+/// against the picture without a rebuild for every trial.
+pub var DISPLAY_LEAD_MS: i64 = 0;
+
+pub const display_lead_config_path = "/home/emanspeaks/bluray_display_lead_ms.txt";
+
+/// Parse a candidate lead value. Pure and I/O-free so the parsing itself is
+/// directly testable; null for anything that is not a bare signed integer.
+fn parseDisplayLeadConfig(raw: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(i64, trimmed, 10) catch null;
+}
+
+/// Read `display_lead_config_path` and, if it holds a valid integer, use it in
+/// place of the built-in default for the rest of the process.
+///
+/// Call once, early in `main`, before the Blu-ray display loop starts reading
+/// `DISPLAY_LEAD_MS` -- there is no synchronization on it, by design: this is
+/// meant to run once while still single-threaded, not to be re-read live.
+pub fn configureDisplayLead(io: Io) void {
+    const raw = Io.Dir.readFileAlloc(
+        .cwd(),
+        io,
+        display_lead_config_path,
+        std.heap.page_allocator,
+        .limited(64),
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("No {s}, DISPLAY_LEAD_MS stays {d}\n", .{ display_lead_config_path, DISPLAY_LEAD_MS });
+            return;
+        },
+        else => {
+            std.debug.print(
+                "Error reading {s}: {}, DISPLAY_LEAD_MS stays {d}\n",
+                .{ display_lead_config_path, err, DISPLAY_LEAD_MS },
+            );
+            return;
+        },
+    };
+    defer std.heap.page_allocator.free(raw);
+
+    const parsed = parseDisplayLeadConfig(raw) orelse {
+        std.debug.print(
+            "{s} does not contain a plain integer, DISPLAY_LEAD_MS stays {d}\n",
+            .{ display_lead_config_path, DISPLAY_LEAD_MS },
+        );
+        return;
+    };
+    DISPLAY_LEAD_MS = parsed;
+    std.debug.print("Using DISPLAY_LEAD_MS = {d} ms\n", .{DISPLAY_LEAD_MS});
+}
 
 /// Everything the display needs to know about the player, in a form it can
 /// evaluate for any instant without touching the network.
@@ -492,9 +557,11 @@ fn cueLoop(
             name_len = 0;
             if (cue_state.currentName(&name_buf)) |name| {
                 name_len = name.len;
+                std.debug.print("cueLoop: selection -> '{s}' (directory: {s})\n", .{ name, cues.dirPath() });
             } else {
                 // Selection cleared: blank the line rather than leaving the
                 // previous file's cues running.
+                std.debug.print("cueLoop: selection cleared\n", .{});
                 cell.publish(null);
             }
         }
@@ -511,6 +578,10 @@ fn cueLoop(
                 const stale = if (loaded_print) |previous| !previous.eql(current) else true;
                 if (stale) {
                     if (cues.load(io, allocator, name)) |fresh| {
+                        std.debug.print(
+                            "cueLoop: loaded '{s}': {d} cues, title '{s}'\n",
+                            .{ name, fresh.cues.len, fresh.title },
+                        );
                         cell.publish(fresh);
                     } else |err| {
                         // Keep whatever is already on screen: a briefly broken
@@ -522,6 +593,15 @@ fn cueLoop(
                     // re-read every second until it is saved again.
                     loaded_print = current;
                 }
+            } else {
+                // Silent before this fix: a directory-path mismatch, or a file
+                // that simply is not there, produced no output at all -- the
+                // exact "nothing happens, nothing loads, nothing logs" report
+                // this is here to stop from recurring undiagnosed.
+                std.debug.print(
+                    "cueLoop: cannot stat '{s}' in {s} (missing, permissions, or directory mismatch)\n",
+                    .{ name, cues.dirPath() },
+                );
             }
         }
 
@@ -710,12 +790,40 @@ pub const BlurayPlayer = struct {
         if (!self.lock.due(now)) return;
 
         const kind = self.lock.next_kind;
+        // `phase_lock.zig` is deliberately free of I/O (its own module doc:
+        // "so the state machine can be tested deterministically" -- a print
+        // inside it would fire on every one of the hundreds of steps in a
+        // single test). Comparing the anchor before and after instead gives
+        // the same visibility without that cost, from the layer that already
+        // does I/O.
+        const anchor_ms_before = self.lock.anchor_ms;
+        const anchor_sec_before = self.lock.anchor_sec;
+        const had_anchor_before = self.lock.have_anchor;
+
         self.getStatus(kind) catch |err| {
             std.debug.print("Failed to get Blu-ray status: {}\n", .{err});
             self.lock.retryAfterError(now);
             return;
         };
         self.lock.schedule(time.nowMillis(self.io), kind, self.state.run_status == .Playing);
+
+        // Report every actual change to the anchor -- the PLL's estimate of
+        // when the player's tick last crossed a second boundary -- not every
+        // poll. Most polls confirm the existing anchor and change nothing
+        // (a straddle or mid-second check that agreed with the prediction);
+        // this fires only when `sampleRunning`, `rebase`, or `resumed` actually
+        // moved it, which is the event worth seeing when chasing a sync issue.
+        if (self.lock.have_anchor and (!had_anchor_before or
+            self.lock.anchor_ms != anchor_ms_before or
+            self.lock.anchor_sec != anchor_sec_before))
+        {
+            std.debug.print(
+                "phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, kind={s}, locked={})\n",
+                .{ self.lock.anchor_sec, self.lock.anchor_ms, self.lock.anchor_err_ms, @tagName(kind), self.lock.isLocked() },
+            );
+        } else if (had_anchor_before and !self.lock.have_anchor) {
+            std.debug.print("phase_lock: anchor cleared (kind={s})\n", .{@tagName(kind)});
+        }
     }
 
     /// Current state in the form the display consumes.
@@ -756,9 +864,12 @@ pub const BlurayPlayer = struct {
         }
 
         // Playback just (re)started. The counter resumes at an unrelated phase
-        // and possibly an unrelated position, so the old anchor is void rather
-        // than merely untrusted.
-        if (!was_playing) self.lock.reset();
+        // and often an unrelated position, but the display must not stall
+        // waiting for a fresh bracket to form -- anchor immediately on this
+        // first sample (`PhaseLock.resumed`) and let the hunt that follows
+        // tighten it, rather than discarding the anchor outright and leaving
+        // `predict` with nothing to show until a full cold hunt completes.
+        if (!was_playing) self.lock.resumed(sample_ms, play_time);
 
         self.lock.sampleRunning(sample_ms, kind, play_time);
     }
@@ -1053,6 +1164,27 @@ test "an unlocked or paused snapshot falls back to the last reported second" {
         .has_anchor = false,
     };
     try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
+}
+
+test "parseDisplayLeadConfig accepts signed integers and rejects garbage" {
+    try std.testing.expectEqual(@as(?i64, 900), parseDisplayLeadConfig("900"));
+    try std.testing.expectEqual(@as(?i64, 900), parseDisplayLeadConfig("  900\n"));
+    try std.testing.expectEqual(@as(?i64, -150), parseDisplayLeadConfig("-150\r\n"));
+    try std.testing.expectEqual(@as(?i64, 0), parseDisplayLeadConfig("0"));
+    try std.testing.expectEqual(@as(?i64, null), parseDisplayLeadConfig(""));
+    try std.testing.expectEqual(@as(?i64, null), parseDisplayLeadConfig("   \n"));
+    try std.testing.expectEqual(@as(?i64, null), parseDisplayLeadConfig("not a number"));
+    try std.testing.expectEqual(@as(?i64, null), parseDisplayLeadConfig("900ms")); // trailing junk
+}
+
+test "configureDisplayLead leaves the value in place when the config file is absent" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const before = DISPLAY_LEAD_MS;
+    // No such file exists on any dev or CI machine, so this exercises exactly
+    // the FileNotFound branch -- the common case before anyone has tuned it.
+    configureDisplayLead(threaded.io());
+    try std.testing.expectEqual(before, DISPLAY_LEAD_MS);
 }
 
 test "DISPLAY_LEAD_MS shifts the displayed position and its tick schedule together" {

@@ -241,6 +241,25 @@ pub const PhaseLock = struct {
         self.have_anchor = true;
     }
 
+    /// Anchor immediately on the first sample taken after playback resumes
+    /// from a stop or a genuine pause.
+    ///
+    /// The counter restarts at an unrelated phase and often an unrelated
+    /// position, so the old anchor's *value* is actively wrong, not merely
+    /// untrusted -- `reset` is the correct response to the stop/pause itself.
+    /// But calling `reset` again here, on the resume, would leave `predict`
+    /// with nothing to extrapolate from for the length of an entire cold hunt,
+    /// stalling the display at a flat, unmoving value at exactly the moment
+    /// someone is most likely watching it: right after pressing play. Anchoring
+    /// on this first sample keeps the clock moving immediately, at the same
+    /// +-500 ms precision `rebase` uses for a seek, while the hunt that follows
+    /// tightens it. Same operation as `rebase`; named separately because the
+    /// two callers reason about it differently and conflating them at the call
+    /// site obscured that stalling here was ever a choice rather than a given.
+    pub fn resumed(self: *PhaseLock, sample_ms: i64, value_sec: u32) void {
+        self.rebase(sample_ms, value_sec);
+    }
+
     /// Predicted counter value at `at_ms`, or `fallback` when there is no
     /// anchor to extrapolate from.
     pub fn predict(self: *const PhaseLock, at_ms: i64, fallback: u32) u32 {
@@ -890,6 +909,39 @@ test "the clock keeps running while the lock is being re-acquired" {
     // And it really did keep ticking rather than sitting still.
     try std.testing.expect(advanced >= 2);
     try expectInSync(&sim, &lock);
+}
+
+test "resumed anchors immediately rather than stalling like a bare reset" {
+    // Regression guard for the reported symptom: after a stop/pause the anchor
+    // is correctly gone (`reset`), but resuming used to call `reset` a second
+    // time, leaving `predict` with nothing to show -- a flat, unmoving value --
+    // for the length of an entire cold hunt right as playback restarted.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 10_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    lock.reset();
+    try std.testing.expect(!lock.hasAnchor());
+
+    // Resume at an arbitrary new position and phase.
+    const resume_sample_ms: i64 = sim.now_ms + 5_000;
+    const resume_value: u32 = 500;
+    lock.resumed(resume_sample_ms, resume_value);
+
+    // Unlike a bare cold start, there is immediately something to show, and it
+    // reflects the new position right away rather than the stale old one.
+    try std.testing.expect(lock.hasAnchor());
+    try std.testing.expectEqual(resume_value, lock.predict(resume_sample_ms, 0));
+
+    // And the clock actually advances from there while the hunt tightens it,
+    // rather than sitting flat.
+    var advanced = false;
+    var t = resume_sample_ms;
+    while (t < resume_sample_ms + 3_000) : (t += 100) {
+        if (lock.predict(t, 0) > resume_value) advanced = true;
+    }
+    try std.testing.expect(advanced);
 }
 
 test "a stop discards the anchor rather than free-wheeling past it" {

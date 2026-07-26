@@ -71,9 +71,19 @@ pub fn configureDirPath(io: Io) void {
         std.heap.page_allocator,
         .limited(max_dir_path_len + 16),
     ) catch |err| switch (err) {
-        error.FileNotFound => return, // Expected: use the built-in default.
+        error.FileNotFound => {
+            // Expected when no override is set up. Logged unconditionally --
+            // not just on override -- so a startup log always states, without
+            // ambiguity, which directory is actually in effect: the single most
+            // useful fact when cue files that should be there are not showing.
+            std.debug.print("No {s}, using default cue directory: {s}\n", .{ dir_path_config_path, default_dir_path });
+            return;
+        },
         else => {
-            std.debug.print("Error reading {s}: {}, using default cue directory\n", .{ dir_path_config_path, err });
+            std.debug.print(
+                "Error reading {s}: {}, using default cue directory: {s}\n",
+                .{ dir_path_config_path, err, default_dir_path },
+            );
             return;
         },
     };

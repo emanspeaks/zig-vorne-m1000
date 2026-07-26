@@ -59,10 +59,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Shared mode state
 
-    // Resolve which directory holds cue files before any thread that reads it
-    // starts. There is no synchronization on this afterward, by design -- it
-    // is meant to be set once, here, while still single-threaded.
+    // Resolve which directory holds cue files, and any hand-tuned display lead
+    // compensation, before any thread that reads them starts. There is no
+    // synchronization on either afterward, by design -- both are meant to be
+    // set once, here, while still single-threaded.
     cues.configureDirPath(io);
+    bluray.configureDisplayLead(io);
 
     // Which cue file line 2 shows in Blu-ray mode, and whether it is armed.
     // Written by the HTTP thread, read by the Blu-ray display loop.
