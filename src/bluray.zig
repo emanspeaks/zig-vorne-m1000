@@ -304,6 +304,27 @@ pub const BlurayPlayerRunStatus = enum {
     Paused,
 };
 
+/// Fixed, hand-tunable forward offset folded into every extrapolated position
+/// before it reaches the display or drives cue timing.
+///
+/// `phase_lock.PhaseLock.predict` is deliberately unbiased with respect to what
+/// the player reports over the network -- it drives the lock's own
+/// self-consistency checks against those raw reports, so biasing it there would
+/// make the lock see permanent, spurious drift and fight itself. But there are
+/// latencies downstream of the player's own report that no amount of
+/// network-side correction can see: time spent in the player's own
+/// decode/output pipeline, a TV or AVR's own processing delay, anything between
+/// "the player's internal counter reached N" and a human seeing second N
+/// appear on the screen. If the panel is observed to consistently read behind
+/// what is actually playing even after `phase_lock`'s own accuracy is accounted
+/// for, this is the knob: increase it in small steps (50-100 ms at a time)
+/// while comparing the panel against the picture, until they line up. A
+/// negative value pulls the display back instead.
+///
+/// No principled default exists -- it depends on hardware this code cannot
+/// see -- so it starts at zero until measured on the actual setup.
+pub const DISPLAY_LEAD_MS: i64 = 0;
+
 /// Everything the display needs to know about the player, in a form it can
 /// evaluate for any instant without touching the network.
 ///
@@ -343,12 +364,20 @@ pub const Snapshot = struct {
             now_ms - self.sampled_ms <= stale_position_ms;
     }
 
-    /// Play position in milliseconds at `now_ms`.
+    /// Play position in milliseconds at `now_ms`, `DISPLAY_LEAD_MS` included.
     pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
+        return self.playTimeMillisLeadBy(now_ms, DISPLAY_LEAD_MS);
+    }
+
+    /// `playTimeMillis`, with the lead passed explicitly rather than taken from
+    /// `DISPLAY_LEAD_MS`. Exists so the formula itself -- the part worth
+    /// regression-testing -- can be exercised with concrete numbers regardless
+    /// of whatever the constant is currently tuned to.
+    fn playTimeMillisLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) i64 {
         if (self.run_status != .Playing or !self.has_anchor) {
             return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
         }
-        return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms);
+        return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms) + lead_ms;
     }
 
     /// The whole second the player is showing at `now_ms`.
@@ -361,8 +390,21 @@ pub const Snapshot = struct {
     /// When the displayed second next changes, or null when nothing is ticking
     /// and so there is no future moment worth waking up for.
     pub fn nextTickMs(self: Snapshot, now_ms: i64) ?i64 {
+        return self.nextTickMsLeadBy(now_ms, DISPLAY_LEAD_MS);
+    }
+
+    /// `nextTickMs` with an explicit lead. See `playTimeMillisLeadBy`.
+    ///
+    /// Shifting the anchor `lead_ms` earlier before computing the edge is what
+    /// keeps this in lockstep with `playTimeMillisLeadBy`: the wake schedule and
+    /// the value it is waking up to show must never describe two different
+    /// instants, in either direction, or a step could be woken for and then
+    /// find nothing has actually changed yet (or the reverse: change without a
+    /// wake to redraw it).
+    fn nextTickMsLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) ?i64 {
         if (self.run_status != .Playing or !self.has_anchor) return null;
-        return self.anchor_ms + (@divFloor(now_ms - self.anchor_ms, 1000) + 1) * 1000;
+        const effective_anchor_ms = self.anchor_ms - lead_ms;
+        return effective_anchor_ms + (@divFloor(now_ms - effective_anchor_ms, 1000) + 1) * 1000;
     }
 };
 
@@ -1011,6 +1053,56 @@ test "an unlocked or paused snapshot falls back to the last reported second" {
         .has_anchor = false,
     };
     try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
+}
+
+test "DISPLAY_LEAD_MS shifts the displayed position and its tick schedule together" {
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .has_anchor = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+
+    // With no lead, position and tick line up with the raw anchor.
+    try std.testing.expectEqual(@as(i64, 110_000), snap.playTimeMillisLeadBy(60_000, 0));
+    try std.testing.expectEqual(@as(i64, 51_000), snap.nextTickMsLeadBy(50_000, 0).?);
+
+    // A lead of 237 ms must move both outputs by exactly 237 ms and no more:
+    // the clock and its own wake schedule can never disagree about what "now"
+    // means once a lead is applied, or a redraw would fire before -- or after
+    // -- the value it exists to show has actually changed.
+    try std.testing.expectEqual(@as(i64, 110_237), snap.playTimeMillisLeadBy(60_000, 237));
+    try std.testing.expectEqual(@as(i64, 51_000 - 237), snap.nextTickMsLeadBy(50_000, 237).?);
+}
+
+test "playTimeMillis and nextTickMs are wired to the configured DISPLAY_LEAD_MS" {
+    // Proves the public entry points actually reach the constant, not just that
+    // the LeadBy helpers compute the right formula in isolation.
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .has_anchor = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+    try std.testing.expectEqual(snap.playTimeMillisLeadBy(60_000, DISPLAY_LEAD_MS), snap.playTimeMillis(60_000));
+    try std.testing.expectEqual(snap.nextTickMsLeadBy(50_000, DISPLAY_LEAD_MS), snap.nextTickMs(50_000));
+}
+
+test "nextTickMs marks exactly when playTimeSeconds increments, whatever the lead" {
+    // The invariant that actually matters, independent of DISPLAY_LEAD_MS's
+    // current value: the wake schedule and the second it wakes up to show must
+    // never come apart.
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .has_anchor = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+    const now: i64 = 60_000;
+    const before = snap.playTimeSeconds(now);
+    const tick = snap.nextTickMs(now).?;
+    try std.testing.expectEqual(before, snap.playTimeSeconds(tick - 1));
+    try std.testing.expectEqual(before + 1, snap.playTimeSeconds(tick));
 }
 
 test "authValue is uppercase hex SHA-256 of key ++ nonce" {

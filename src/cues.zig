@@ -14,9 +14,83 @@ const std = @import("std");
 const Io = std.Io;
 const webvtt = @import("webvtt.zig");
 
-/// Directory scanned for cue files. Every `*.vtt` in it appears in the web
-/// page's drop-down.
-pub const dir_path = "/home/emanspeaks/bluray_cues";
+/// Directory scanned for cue files, unless overridden by
+/// `dir_path_config_path`. Every `*.vtt` in it appears in the web page's
+/// drop-down.
+pub const default_dir_path = "/home/emanspeaks/bluray_cues";
+
+/// Optional text file naming a different cue directory, one line, trimmed --
+/// the same shape as `bluray_ip.txt`/`bluray_key.txt` in `config.zig`.
+///
+/// Exists because a hardcoded path here is a silent footgun: point it at a
+/// directory that does not match wherever the real cue files actually live
+/// (they need not be checked into this repository at all, and commonly will
+/// not be) and the symptom is not an error anywhere -- it is an empty dropdown
+/// on the web page and line 2 permanently showing the "nothing selected"
+/// fallback text, which looks exactly like a code regression even though
+/// nothing is broken. Overriding the directory here, rather than requiring a
+/// symlink at the hardcoded path, makes the mismatch fixable without touching
+/// the filesystem layout the rest of the system expects.
+pub const dir_path_config_path = "/home/emanspeaks/bluray_cues_dir.txt";
+
+/// Upper bound on a configured directory path. Generous, and independent of
+/// `default_dir_path`'s own length, since it sizes the fixed buffers
+/// `buildPath` writes into -- a configured path longer than this is rejected
+/// rather than silently truncated or overflowing.
+pub const max_dir_path_len: usize = 200;
+
+var active_dir_path_buf: [max_dir_path_len]u8 = undefined;
+var active_dir_path: []const u8 = default_dir_path;
+
+/// The directory currently in use: `default_dir_path` until `configureDirPath`
+/// overrides it.
+pub fn dirPath() []const u8 {
+    return active_dir_path;
+}
+
+/// Trim and validate a candidate path read from `dir_path_config_path`.
+/// Returns null for anything empty or too long to fit the fixed buffer -- pure
+/// and I/O-free so the validation itself is directly testable.
+fn parseDirPathConfig(raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > max_dir_path_len) return null;
+    return trimmed;
+}
+
+/// Read `dir_path_config_path` and, if it names a usable directory, use it in
+/// place of `default_dir_path` for the rest of the process.
+///
+/// Call once, early in `main`, before any thread reads `dirPath()` -- there is
+/// no synchronization on `active_dir_path`, by design: this is meant to run
+/// once while still single-threaded, not to be re-read live.
+pub fn configureDirPath(io: Io) void {
+    const raw = Io.Dir.readFileAlloc(
+        .cwd(),
+        io,
+        dir_path_config_path,
+        std.heap.page_allocator,
+        .limited(max_dir_path_len + 16),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return, // Expected: use the built-in default.
+        else => {
+            std.debug.print("Error reading {s}: {}, using default cue directory\n", .{ dir_path_config_path, err });
+            return;
+        },
+    };
+    defer std.heap.page_allocator.free(raw);
+
+    const trimmed = parseDirPathConfig(raw) orelse {
+        std.debug.print(
+            "{s} is empty or too long (max {d}), using default cue directory\n",
+            .{ dir_path_config_path, max_dir_path_len },
+        );
+        return;
+    };
+
+    @memcpy(active_dir_path_buf[0..trimmed.len], trimmed);
+    active_dir_path = active_dir_path_buf[0..trimmed.len];
+    std.debug.print("Using cue directory: {s}\n", .{active_dir_path});
+}
 
 pub const extension = ".vtt";
 
@@ -64,7 +138,8 @@ pub const State = struct {
     }
 
     /// Replace the selection. Returns false for a name that is not a plain
-    /// `*.vtt` file name, so a crafted request cannot reach outside `dir_path`.
+    /// `*.vtt` file name, so a crafted request cannot reach outside the cue
+    /// directory.
     pub fn select(self: *State, name: []const u8) bool {
         if (!isValidName(name)) return false;
         self.acquire();
@@ -95,7 +170,8 @@ pub const State = struct {
 };
 
 /// A name is accepted only if it is a bare `*.vtt` file name: no path
-/// separators, no parent-directory hops, nothing that could escape `dir_path`.
+/// separators, no parent-directory hops, nothing that could escape the cue
+/// directory.
 pub fn isValidName(name: []const u8) bool {
     if (name.len <= extension.len or name.len > max_name_len) return false;
     if (!std.mem.endsWith(u8, name, extension)) return false;
@@ -112,13 +188,16 @@ pub fn baseName(name: []const u8) []const u8 {
         name;
 }
 
-/// Sorted names of the cue files in `dir_path`.
+/// Sorted names of the cue files in `dirPath()`.
 ///
 /// A missing directory yields an empty list rather than an error: not having
-/// set any cue files up yet is a normal state, not a fault.
+/// set any cue files up yet is a normal state, not a fault. Note that this
+/// makes a directory-path mismatch indistinguishable, from the web page alone,
+/// from having no cue files at all -- if the dropdown is unexpectedly empty,
+/// check `dirPath()`/`dir_path_config_path` before assuming the files are gone.
 /// Caller owns the result; release it with `freeNames`.
 pub fn listNames(io: Io, allocator: std.mem.Allocator) ![][]const u8 {
-    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = Io.Dir.cwd().openDir(io, dirPath(), .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc([]const u8, 0),
         else => return err,
     };
@@ -150,8 +229,12 @@ pub fn freeNames(allocator: std.mem.Allocator, names: [][]const u8) void {
     allocator.free(names);
 }
 
-fn buildPath(buf: *[dir_path.len + 1 + max_name_len]u8, name: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir_path, name }) catch unreachable;
+/// Sized for the worst case a configured directory path can reach
+/// (`max_dir_path_len`), not for whatever `default_dir_path` happens to be.
+const PathBuf = [max_dir_path_len + 1 + max_name_len]u8;
+
+fn buildPath(buf: *PathBuf, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dirPath(), name }) catch unreachable;
 }
 
 /// Enough of a cue file's metadata to tell whether it has been edited.
@@ -173,16 +256,16 @@ pub const Fingerprint = struct {
 pub fn fingerprint(io: Io, name: []const u8) ?Fingerprint {
     if (!isValidName(name)) return null;
 
-    var path_buf: [dir_path.len + 1 + max_name_len]u8 = undefined;
+    var path_buf: PathBuf = undefined;
     const stat = Io.Dir.cwd().statFile(io, buildPath(&path_buf, name), .{}) catch return null;
     return .{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size };
 }
 
-/// Read and parse one cue file from `dir_path`.
+/// Read and parse one cue file from `dirPath()`.
 pub fn load(io: Io, allocator: std.mem.Allocator, name: []const u8) !webvtt.CueList {
     if (!isValidName(name)) return error.InvalidCueFileName;
 
-    var path_buf: [dir_path.len + 1 + max_name_len]u8 = undefined;
+    var path_buf: PathBuf = undefined;
     const source = try Io.Dir.readFileAlloc(.cwd(), io, buildPath(&path_buf, name), allocator, max_cue_bytes);
     defer allocator.free(source);
 
@@ -255,6 +338,39 @@ test "fingerprint declines names it would refuse to load" {
     // Valid name, but no such file: a missing file must not be an error, so the
     // display keeps whatever it already has.
     try testing.expectEqual(@as(?Fingerprint, null), fingerprint(io, "definitely-not-here-9f3a.vtt"));
+}
+
+test "parseDirPathConfig trims whitespace and rejects unusable input" {
+    try testing.expectEqualStrings("/mnt/nas/cues", parseDirPathConfig("/mnt/nas/cues\n").?);
+    try testing.expectEqualStrings("/mnt/nas/cues", parseDirPathConfig("  /mnt/nas/cues  \r\n").?);
+    try testing.expectEqual(@as(?[]const u8, null), parseDirPathConfig(""));
+    try testing.expectEqual(@as(?[]const u8, null), parseDirPathConfig("   \n"));
+
+    var too_long: [max_dir_path_len + 1]u8 = undefined;
+    @memset(&too_long, 'a');
+    try testing.expectEqual(@as(?[]const u8, null), parseDirPathConfig(&too_long));
+
+    // Exactly at the limit is fine; only strictly over is rejected.
+    var exactly_max: [max_dir_path_len]u8 = undefined;
+    @memset(&exactly_max, 'a');
+    try testing.expect(parseDirPathConfig(&exactly_max) != null);
+}
+
+test "dirPath defaults to default_dir_path until configured" {
+    // Depends on no earlier test in this run having called configureDirPath
+    // with something that actually overrides it -- true today, since the only
+    // other test that calls it exercises exclusively the absent-file path.
+    try testing.expectEqualStrings(default_dir_path, dirPath());
+}
+
+test "configureDirPath leaves the default in place when the config file is absent" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    // No such file exists on any dev or CI machine, so this exercises exactly
+    // the FileNotFound branch -- the common case for anyone who has not set up
+    // an override.
+    configureDirPath(threaded.io());
+    try testing.expectEqualStrings(default_dir_path, dirPath());
 }
 
 test "arming defaults to off" {

@@ -27,7 +27,26 @@
 //! time is a whole second wrong. Only a sample taken far from any edge, where
 //! there is no rounding ambiguity to hide behind, can catch it. Conversely a
 //! sub-second shift moves the phase but not the reported value at mid-second,
-//! so the straddle catches what the value check cannot.
+//! so the straddle catches what the value check cannot. Either check acts
+//! immediately: a phase failure re-hunts, and a value failure `rebase`s the
+//! anchor on the spot rather than merely dropping it, since the very sample
+//! that caught the mismatch is itself a fresh, trustworthy reading -- dropping
+//! without using it would leave the display running from the old, wrong
+//! anchor for an entire extra hunt cycle after the true position is already
+//! known.
+//!
+//! Once locked, the anchor is periodically re-hunted to keep it from staying
+//! loose forever (`relockIntervalMs`), but how *often* is scaled by how good
+//! it already is: a bracket already as tight as `edge_guard_ms` cannot be
+//! improved on, so refreshing it on the same short cadence as a loose one
+//! would just load the player's small embedded server for no benefit --
+//! ordinary drift is caught continuously by the straddle and mid-second checks
+//! regardless of refresh cadence, so a tight anchor can safely go much longer
+//! between refreshes. A refresh hunt also polls gentler than a cold one
+//! (`refresh_hunt_poll_ms` vs. `fast_poll_ms`): a cold hunt has nothing else
+//! driving the display and needs to move fast, but a refresh already has a
+//! good anchor doing that job throughout, so there is no urgency, only
+//! opportunism.
 //!
 //! This module is deliberately free of I/O so the state machine can be tested
 //! deterministically.
@@ -75,14 +94,40 @@ pub const max_bracket_ms: i64 = 250;
 /// 500 ms it spans the whole second and starts bracketing two, at which point
 /// its check fails constantly and thrashes the lock instead of protecting it.
 pub const max_guard_ms: i64 = 300;
-/// Re-acquire the anchor from scratch this often. The straddle only ever
-/// confirms the existing estimate and never improves it, so without this a lock
-/// taken from a loose bracket would stay loose for the rest of the disc, and
-/// slow drift between the two clocks would never be corrected.
+/// Re-acquire the anchor from scratch this often while it is still loose (its
+/// error exceeds `edge_guard_ms`). The straddle only ever confirms the existing
+/// estimate and never improves it, so without a refresh a lock taken from a
+/// loose bracket -- typically because of a slow round trip -- would stay loose
+/// for the rest of the disc.
 ///
 /// A refresh does not drop the lock -- see `refreshing` -- so this can be
 /// frequent without the display ever falling back to a raw sample.
-pub const relock_interval_ms: i64 = 5_000;
+pub const relock_interval_loose_ms: i64 = 5_000;
+/// Re-acquire the anchor this much less often once it is already tight.
+/// Refreshing exists to *improve* the bracket; once it can't improve on a
+/// bracket that already meets `edge_guard_ms`, hunting again on the same
+/// 5-second cadence buys nothing but load on the player's small embedded
+/// server -- ordinary drift is already caught continuously by the straddle and
+/// mid-second checks regardless of how often a refresh runs.
+pub const relock_interval_tight_ms: i64 = 30_000;
+/// Poll cadence for a *refresh* hunt, as opposed to a cold one.
+///
+/// A cold hunt (no anchor yet, or one just invalidated by a real desync) has
+/// nothing to fall back on, so it hunts at `fast_poll_ms` to re-acquire as fast
+/// as possible. A refresh hunt is different: the existing anchor is still
+/// driving the display correctly the whole time (`refreshing` guarantees this),
+/// so there is no urgency, only opportunism -- gentler is fine.
+///
+/// Not arbitrarily gentle, though: a bracket is only accepted as tight when its
+/// half-width, `(sample_gap + rtt) / 2`, is at most `edge_guard_ms`. Slower than
+/// this and a refresh can never actually tighten anything -- every cycle falls
+/// through to the loose `hunt_patience` fallback, which then immediately
+/// re-triggers the *loose*-tier relock interval, turning "gentler" into "runs
+/// constantly and never improves," the opposite of the intent. This value
+/// leaves headroom for a real round trip on top of the gap and still clears
+/// that bar; a value found empirically to still starve tightening will show up
+/// as a failure in `expectInSync` during the refresh tests, not silently.
+pub const refresh_hunt_poll_ms: i64 = 90;
 
 pub const PhaseLock = struct {
     phase: Phase,
@@ -227,6 +272,22 @@ pub const PhaseLock = struct {
         return @min(max_guard_ms, @max(edge_guard_ms, 2 * self.anchor_err_ms));
     }
 
+    /// How long to trust the current anchor before hunting a fresh one.
+    ///
+    /// Scaled by how good the anchor already is -- the "poll less often the
+    /// more precisely the phase is already known" idea, applied directly.
+    /// Tight, and a refresh could not improve on it anyway; loose, and it is
+    /// still worth trying again soon. Ordinary drift does not depend on this at
+    /// all: the straddle and mid-second checks run continuously regardless and
+    /// will drop the lock the moment either disagrees with reality. This only
+    /// controls how often the bracket gets a chance to *tighten*.
+    fn relockIntervalMs(self: *const PhaseLock) i64 {
+        return if (self.anchor_err_ms <= edge_guard_ms)
+            relock_interval_tight_ms
+        else
+            relock_interval_loose_ms;
+    }
+
     /// Whether the straddle is worth running at all.
     ///
     /// The pair has to land either side of *one* edge. That needs the guard to
@@ -310,7 +371,17 @@ pub const PhaseLock = struct {
                 // whole second. The straddle cannot: such a shift moves both of
                 // its samples together, leaving the phase looking perfect while
                 // the displayed value is a full second out.
-                if (value_sec != self.predict(sample_ms, value_sec)) self.drop();
+                //
+                // A mismatch is rebased immediately rather than merely dropped.
+                // This sample is fresh, trustworthy ground truth -- exactly what
+                // `rebase` wants -- so using it now fixes the display on this
+                // same pass. A bare `drop` would leave `predict` free-wheeling
+                // from the stale, wrong anchor for the length of the ensuing
+                // hunt (which can run to a second or more), which is a real,
+                // measurable source of the display reading behind the truth:
+                // every desync this check catches would otherwise cost an
+                // extra hunt's worth of visible lag on top of the desync itself.
+                if (value_sec != self.predict(sample_ms, value_sec)) self.rebase(sample_ms, value_sec);
             },
             .hunt, .pre_edge => {
                 // Sampled close to an edge, where +/-1 is genuinely ambiguous.
@@ -333,18 +404,30 @@ pub const PhaseLock = struct {
             // Back off once the hunt has clearly stopped converging, so a
             // source that never yields a tight bracket is not polled at the
             // hunt rate indefinitely.
-            const gap = if (self.hunt_samples >= hunt_patience) idle_poll_ms else fast_poll_ms;
+            //
+            // A refresh hunts gentler than a cold one. A cold hunt (no anchor,
+            // or one a real desync just invalidated) has nothing else driving
+            // the display, so speed matters more than load. A refresh already
+            // has a good anchor doing that job the whole time -- it is purely
+            // opportunistic -- so there is no reason to burst it at the same
+            // rate and lean on the player's small embedded server for nothing.
+            const gap = if (self.hunt_samples >= hunt_patience)
+                idle_poll_ms
+            else if (self.refreshing)
+                refresh_hunt_poll_ms
+            else
+                fast_poll_ms;
             self.next_poll_ms = now_ms + gap;
             self.next_kind = .hunt;
             return;
         }
-        if (now_ms - self.locked_at_ms >= relock_interval_ms) {
+        if (now_ms - self.locked_at_ms >= self.relockIntervalMs()) {
             // Start hunting a fresh bracket, but keep the current anchor
             // driving the display until a better one arrives, so a re-sync is
             // invisible rather than a stutter.
             self.refreshing = true;
             self.hunt_samples = 0;
-            self.next_poll_ms = now_ms + fast_poll_ms;
+            self.next_poll_ms = now_ms + refresh_hunt_poll_ms;
             self.next_kind = .hunt;
             return;
         }
@@ -617,9 +700,9 @@ test "locked cadence stays modest rather than degenerating into fast polling" {
     sim.stepN(&lock, polls);
     const elapsed_ms = sim.now_ms - start_ms;
 
-    // Three checks per second, plus a hunt burst every `relock_interval_ms`.
-    // The exact average does not matter; what matters is that it stays far
-    // below the hunt rate, which would hammer the player's small web server.
+    // Three checks per second, plus an occasional gentle refresh burst. The
+    // exact average does not matter; what matters is that it stays far below
+    // the hunt rate, which would hammer the player's small web server.
     const per_second = @divFloor(polls * 1000, elapsed_ms);
     try std.testing.expect(per_second >= 3);
     try std.testing.expect(per_second <= 8);
@@ -638,8 +721,9 @@ test "a periodic refresh never drops the lock" {
     var refreshes_seen: usize = 0;
     var was_refreshing = false;
 
-    // Several refresh intervals' worth of running.
-    const until_ms = sim.now_ms + 4 * relock_interval_ms;
+    // Several refresh intervals' worth of running. A default-rtt lock is tight
+    // (well under edge_guard_ms), so the tight-tier interval applies.
+    const until_ms = sim.now_ms + 4 * relock_interval_tight_ms;
     while (sim.now_ms < until_ms) {
         sim.step(&lock);
         if (lock.refreshing and !was_refreshing) refreshes_seen += 1;
@@ -660,7 +744,7 @@ test "a refresh re-anchors rather than merely restating the old estimate" {
     try expectInSync(&sim, &lock);
     const first_anchor_at = lock.locked_at_ms;
 
-    while (sim.now_ms < first_anchor_at + relock_interval_ms + 3_000) sim.step(&lock);
+    while (sim.now_ms < first_anchor_at + relock_interval_tight_ms + 3_000) sim.step(&lock);
 
     try std.testing.expect(lock.locked_at_ms > first_anchor_at);
     try std.testing.expect(!lock.refreshing);
@@ -692,9 +776,80 @@ test "the anchor is re-acquired periodically rather than trusted forever" {
     const first_lock_ms = lock.locked_at_ms;
 
     // Run past the re-lock interval; the anchor must have been rebuilt.
-    while (sim.now_ms < first_lock_ms + relock_interval_ms + 5_000) sim.step(&lock);
+    while (sim.now_ms < first_lock_ms + relock_interval_tight_ms + 5_000) sim.step(&lock);
     try std.testing.expect(lock.locked_at_ms > first_lock_ms);
     try expectInSync(&sim, &lock);
+}
+
+test "a tight anchor relaxes its own refresh cadence" {
+    // The precision-scaled relock interval, directly: once the bracket is
+    // already as good as `edge_guard_ms`, refreshing on the loose (5 s) cadence
+    // would buy nothing and just load the player for no reason.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 5_000 }; // default rtt_ms=20 locks tight
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    try std.testing.expect(lock.anchor_err_ms <= edge_guard_ms);
+    try std.testing.expectEqual(relock_interval_tight_ms, lock.relockIntervalMs());
+
+    // It must not have refreshed yet at the old, tighter 5 s mark.
+    const start_ms = sim.now_ms;
+    while (sim.now_ms < start_ms + relock_interval_loose_ms) sim.step(&lock);
+    try std.testing.expect(!lock.refreshing);
+}
+
+test "a loose anchor keeps trying on the shorter interval" {
+    // With a round trip too slow to ever bracket tightly, refreshing is still
+    // worth attempting on the original, more frequent cadence -- there is real
+    // room to improve, unlike the tight case above.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 5_000, .rtt_ms = 200 };
+    sim.stepN(&lock, hunt_patience + 20);
+    try std.testing.expect(lock.isLocked());
+
+    try std.testing.expect(lock.anchor_err_ms > edge_guard_ms);
+    try std.testing.expectEqual(relock_interval_loose_ms, lock.relockIntervalMs());
+}
+
+test "a refresh hunts gently, not at the cold-start rate" {
+    // A refresh already has a good anchor driving the display; there is no
+    // urgency, only opportunism, so it must not burst requests at the same
+    // rate as a cold hunt starting from nothing.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 5_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // Run until a refresh is underway.
+    while (!lock.refreshing) sim.step(&lock);
+
+    // The poll just scheduled for this refresh must use the gentle cadence.
+    try std.testing.expectEqual(refresh_hunt_poll_ms, lock.next_poll_ms - sim.now_ms);
+}
+
+test "mid_second immediately corrects the display, not just the phase" {
+    // Regression guard for a real, measured source of "the display reads
+    // behind the player": previously a mid-second mismatch only dropped the
+    // lock, leaving `predict` running from the old, wrong anchor for an entire
+    // extra hunt cycle after the desync was already known about.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 90_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // A rewind of a whole number of seconds: phase-preserving, so only the
+    // mid-second check can catch it.
+    sim.content_ms -= 5_000;
+
+    // Advance until the mismatch is caught (the next mid_second poll).
+    while (lock.isLocked()) sim.step(&lock);
+
+    // The very next prediction -- no further polling -- must already be close
+    // to the truth, not stuck 5 seconds ahead of it.
+    const shown = lock.predict(sim.now_ms, 0);
+    const err = @abs(@as(i64, shown) - @as(i64, sim.reported()));
+    try std.testing.expect(err <= 1);
 }
 
 test "predict falls back only when there is no anchor at all" {

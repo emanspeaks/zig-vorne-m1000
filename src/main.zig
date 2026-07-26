@@ -59,6 +59,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Shared mode state
 
+    // Resolve which directory holds cue files before any thread that reads it
+    // starts. There is no synchronization on this afterward, by design -- it
+    // is meant to be set once, here, while still single-threaded.
+    cues.configureDirPath(io);
+
     // Which cue file line 2 shows in Blu-ray mode, and whether it is armed.
     // Written by the HTTP thread, read by the Blu-ray display loop.
     var cue_state: cues.State = .{};
@@ -312,13 +317,13 @@ fn writeCuesSection(
     try w.writeAll("<h2>Blu-Ray Line 2 Cues</h2>\n");
 
     const names = cues.listNames(io, allocator) catch |err| {
-        try w.print("<p>Cannot read {s}: {}</p>\n", .{ cues.dir_path, err });
+        try w.print("<p>Cannot read {s}: {}</p>\n", .{ cues.dirPath(), err });
         return;
     };
     defer cues.freeNames(allocator, names);
 
     if (names.len == 0) {
-        try w.print("<p>No <code>*.vtt</code> files in <code>{s}</code>.</p>\n", .{cues.dir_path});
+        try w.print("<p>No <code>*.vtt</code> files in <code>{s}</code>.</p>\n", .{cues.dirPath()});
         return;
     }
 
