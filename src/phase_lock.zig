@@ -19,12 +19,12 @@
 //! where `drift` is reported-minus-predicted in whole seconds and `into` is
 //! how far into the modelled second the sample landed. Every sample yields
 //! such an interval; consistent samples *intersect* to something narrower.
-//! Because the poll cadence is deliberately staggered so that spacing is
-//! never a multiple of a second, the sample instants sweep across the
-//! counter's second like a vernier scale, and a handful of samples pin the
-//! tick edge to a few tens of milliseconds -- **regardless of the round
-//! trip**. Two samples 60 ms apart straddling an edge is merely the lucky
-//! special case of the same arithmetic.
+//! As long as the poll cadence is not a multiple of a second (see "No
+//! scheduling here" below for where that comes from now), the sample instants
+//! sweep across the counter's second like a vernier scale, and a handful of
+//! samples pin the tick edge to a few tens of milliseconds -- **regardless of
+//! the round trip**. Two samples 60 ms apart straddling an edge is merely the
+//! lucky special case of the same arithmetic.
 //!
 //! That round-trip independence is the entire reason this file looks the way
 //! it does. The real player was measured answering `cCMD_PST` in ~1000 ms
@@ -52,6 +52,20 @@
 //! running during re-acquisition. Only a genuine stop discards it -- nothing
 //! is counting, so there is nothing to extrapolate from.
 //!
+//! ## No scheduling here
+//!
+//! This module used to also decide *when* to poll -- fast while searching,
+//! throttled once locked, staggered to guarantee phase diversity. That is
+//! gone: `bluray.zig` now runs a small pool of poller threads on a fixed,
+//! staggered cadence of its own (see `bluray.poll_workers` /
+//! `bluray.frame_interval_ms`), dispatching continuously rather than reacting
+//! to an estimate of when a poll is "due". The phase diversity the old
+//! staggered schedule existed to guarantee falls out of that pool for free --
+//! `poll_workers * frame_interval_ms` is not a multiple of 1000 ms, so
+//! successive samples from any one worker sweep the counter's second on their
+//! own. This module is left with exactly the job its own doc above describes:
+//! fold a timestamped sample into the running interval, and predict.
+//!
 //! This module is deliberately free of I/O so the state machine can be tested
 //! deterministically.
 
@@ -60,36 +74,6 @@ const std = @import("std");
 /// Whether the model error interval has been narrowed enough to trust.
 pub const Phase = enum { searching, locked };
 
-/// What a given poll is for. Purely informational now (the estimator treats
-/// every running sample identically); kept because the poll log tags each
-/// line with it, and "hunt vs mid_second" reads as "acquiring vs maintaining".
-pub const PollKind = enum {
-    /// Fast, staggered polls while the error interval is still wide.
-    hunt,
-    /// Maintenance polls while locked (~1/s), their placement rotated across
-    /// the second so the estimator keeps receiving fresh phase evidence.
-    mid_second,
-};
-
-/// Base poll cadence while the error interval is still wide.
-pub const fast_poll_ms: i64 = 60;
-/// The hunt gap cycles through `fast_poll_ms + stagger_step * (0..cycle)` so
-/// that consecutive sample instants can never land at the same point of the
-/// counter's second, no matter the round trip. Without this, a round trip
-/// near a whole second (gap + rtt = 1000) would freeze every sample at the
-/// same `into` and the interval would never narrow.
-pub const poll_stagger_step_ms: i64 = 17;
-pub const poll_stagger_cycle: u32 = 5;
-/// Cadence while the source is not running. Kept short because the event
-/// being waited for is the transition back to running, and any delay noticing
-/// it is time spent displaying a stale value.
-pub const idle_poll_ms: i64 = 200;
-/// Back off after a failed request rather than hammering the source.
-pub const error_retry_ms: i64 = 2000;
-/// Hard ceiling on the gap between polls. A live source is checked at least
-/// this often no matter what; trick play (rewind especially) changes nothing
-/// about `running`, so only steady sampling notices it promptly.
-pub const max_poll_gap_ms: i64 = 1000;
 /// Target half-width of the error interval: reaching it means `locked`.
 pub const edge_guard_ms: i64 = 75;
 /// Half-width of slack added to every per-sample interval, absorbing
@@ -127,20 +111,6 @@ pub const PhaseLock = struct {
     /// of the model). Valid only while `have_anchor`.
     eps_lo_ms: i64,
     eps_hi_ms: i64,
-    /// EWMA of how long after its scheduled instant each sample actually
-    /// lands: dispatch delay plus half the round trip. Used to place locked
-    /// maintenance polls so the *sample* -- not the request -- hits
-    /// mid-second. At a ~1 s round trip this is ~500 ms and matters a lot; at
-    /// 20 ms it is noise.
-    sample_lag_ms: i64,
-    /// Cycles the hunt gap; see `poll_stagger_step_ms`.
-    stagger: u32,
-    /// Rotates the placement of locked maintenance samples across the second;
-    /// see the locked branch of `scheduleInner`.
-    maintain_slot: u32,
-    /// When the next poll is due, and what it is for.
-    next_poll_ms: i64,
-    next_kind: PollKind,
 
     pub const init: PhaseLock = .{
         .phase = .searching,
@@ -151,16 +121,7 @@ pub const PhaseLock = struct {
         .have_anchor = false,
         .eps_lo_ms = -eps_unset,
         .eps_hi_ms = eps_unset,
-        .sample_lag_ms = 0,
-        .stagger = 0,
-        .maintain_slot = 0,
-        .next_poll_ms = 0,
-        .next_kind = .hunt,
     };
-
-    pub fn due(self: *const PhaseLock, now_ms: i64) bool {
-        return now_ms >= self.next_poll_ms;
-    }
 
     pub fn isLocked(self: *const PhaseLock) bool {
         return self.phase == .locked;
@@ -186,18 +147,6 @@ pub const PhaseLock = struct {
     pub fn drop(self: *PhaseLock) void {
         self.phase = .searching;
         self.strobeReset();
-    }
-
-    /// Force an immediate re-acquisition, bypassing the locked cadence.
-    ///
-    /// For a caller who has decided *right now* that the anchor should not be
-    /// trusted -- the "force resync" button on the web page. Drops the phase
-    /// (the anchor keeps free-wheeling, so the display does not stall) and
-    /// makes the very next poll due immediately.
-    pub fn forceResync(self: *PhaseLock, now_ms: i64) void {
-        self.drop();
-        self.next_poll_ms = now_ms;
-        self.next_kind = .hunt;
     }
 
     /// Throw the anchor away entirely.
@@ -252,17 +201,6 @@ pub const PhaseLock = struct {
         return self.anchor_sec +| @as(u32, @intCast(@divFloor(elapsed_ms, 1000)));
     }
 
-    /// First predicted edge strictly after `at_ms`.
-    fn nextEdgeAfter(self: *const PhaseLock, at_ms: i64) i64 {
-        return self.anchor_ms + (@divFloor(at_ms - self.anchor_ms, 1000) + 1) * 1000;
-    }
-
-    /// The next instant midway between two predicted edges, strictly ahead.
-    fn midSecondAfter(self: *const PhaseLock, at_ms: i64) i64 {
-        const mid = self.nextEdgeAfter(at_ms) - 500;
-        return if (mid > at_ms) mid else mid + 1000;
-    }
-
     /// Record that the source is not running. Nothing is counting, and
     /// resuming restarts the tick at an unrelated phase, so the anchor is
     /// void rather than merely untrusted -- there is nothing to free-wheel.
@@ -274,23 +212,9 @@ pub const PhaseLock = struct {
     ///
     /// `sample_ms` is the best estimate of when the source read its own
     /// clock; for a request/response exchange that is the midpoint of the
-    /// two. `kind` is informational only -- every running sample carries the
-    /// same kind of evidence and is treated identically.
-    pub fn sampleRunning(self: *PhaseLock, sample_ms: i64, kind: PollKind, value_sec: u32) void {
-        _ = kind;
-
-        // How late after its scheduled instant this sample landed: dispatch
-        // delay plus half the round trip. Smoothed, and used only for placing
-        // locked maintenance polls; an outlier (a hung request) is excluded
-        // rather than folded in.
-        const raw_lag = sample_ms - self.next_poll_ms;
-        if (raw_lag >= 0 and raw_lag <= 10_000) {
-            self.sample_lag_ms = if (self.sample_lag_ms == 0)
-                raw_lag
-            else
-                @divFloor(3 * self.sample_lag_ms + raw_lag, 4);
-        }
-
+    /// two. Every running sample carries the same kind of evidence and is
+    /// treated identically regardless of which poller produced it.
+    pub fn sampleRunning(self: *PhaseLock, sample_ms: i64, value_sec: u32) void {
         // The very first running sample seeds the anchor outright. Waiting
         // for the estimate to tighten first would leave the display stalled
         // on a cold start; +-500 ms immediately beats perfect eventually.
@@ -350,76 +274,47 @@ pub const PhaseLock = struct {
             self.phase = .locked;
         }
     }
-
-    /// Choose when the next poll happens, given the poll just completed.
-    pub fn schedule(self: *PhaseLock, now_ms: i64, completed: PollKind, running: bool) void {
-        self.scheduleInner(now_ms, completed, running);
-        // Never leave a poll further out than `max_poll_gap_ms`, regardless
-        // of what the branch below computed. Every branch stays well inside
-        // this by construction, but this is what *guarantees* it rather than
-        // relying on that remaining true.
-        if (self.next_poll_ms - now_ms > max_poll_gap_ms) {
-            self.next_poll_ms = now_ms + max_poll_gap_ms;
-        }
-    }
-
-    fn scheduleInner(self: *PhaseLock, now_ms: i64, completed: PollKind, running: bool) void {
-        _ = completed;
-        if (!running) {
-            self.next_poll_ms = now_ms + idle_poll_ms;
-            self.next_kind = .hunt;
-            return;
-        }
-        if (self.phase != .locked) {
-            // Narrowing: fast cadence, staggered so consecutive samples land
-            // at different points of the counter's second whatever the round
-            // trip happens to be. See `poll_stagger_step_ms`.
-            const gap = fast_poll_ms +
-                poll_stagger_step_ms * @as(i64, @intCast(self.stagger % poll_stagger_cycle));
-            self.stagger +%= 1;
-            self.next_poll_ms = now_ms + gap;
-            self.next_kind = .hunt;
-            return;
-        }
-        // Locked: poll again as soon as reasonable, not as soon as physically
-        // possible. There is no urgency once locked -- only confirmation --
-        // but no reason either to sit idle beyond a small deliberate gap: the
-        // round trip already spent getting here (folded into `now_ms`, which
-        // is measured *after* the previous response arrived) is the only real
-        // throttle this design needs, since it is set by how fast the device
-        // itself can answer.
-        //
-        // The stagger (same mechanism as hunting) is what keeps the estimator
-        // alive while locked, not the interval's width: a sample parked at a
-        // fixed offset every time -- mid-second especially -- has the same
-        // interval every poll and can neither narrow the accumulated estimate
-        // nor contradict it, so a sub-second phase shift would stay invisible
-        // for as long as the lock held. Moving the offset means every part of
-        // the second gets probed within a few polls, and a shifted phase
-        // produces a contradicting sample almost immediately. Near-edge
-        // samples need no special treatment -- a +-1 reading there is not
-        // ambiguity but exactly the evidence the interval encodes.
-        const gap = fast_poll_ms +
-            poll_stagger_step_ms * @as(i64, @intCast(self.stagger % poll_stagger_cycle));
-        self.stagger +%= 1;
-        self.next_poll_ms = now_ms + gap;
-        self.next_kind = .mid_second;
-    }
-
-    /// A failed request: back off, and keep the evidence -- the interval is
-    /// anchored to the model's coordinates, not to sample spacing, so a gap
-    /// in sampling does not invalidate it.
-    pub fn retryAfterError(self: *PhaseLock, now_ms: i64) void {
-        self.next_poll_ms = now_ms + error_retry_ms;
-        self.next_kind = .hunt;
-    }
 };
 
 // ---------------------------------------------------------------------------
 // Tests: a simulated player driving the state machine deterministically.
 // ---------------------------------------------------------------------------
 
-/// A source whose counter advances only while running.
+/// Mirrors `bluray.poll_workers` / `bluray.frame_interval_ms`: these tests
+/// exercise the phase diversity that pool actually produces, not an idealized
+/// stand-in for it.
+const sim_workers: usize = 5;
+const sim_frame_interval_ms: i64 = 250;
+/// Mirrors `bluray.poll_stagger_step_ms` / `poll_stagger_cycle`.
+///
+/// 250 ms divides 1000 ms evenly, so a worker cycling at an exact multiple of
+/// it -- `sim_workers * sim_frame_interval_ms` -- would have every one of its
+/// own samples land at one of only 4 fixed points in the counter's second,
+/// forever. The best intersection those 4 points can ever produce is wider
+/// than `edge_guard_ms` (worked out by hand: a 250 ms-spaced, evenly-covering
+/// set leaves a 250 ms gap plus the margin on each side), so without this the
+/// lock would never acquire at all in a jitter-free simulation -- the exact
+/// failure mode "the estimator survives a round trip that divides the second
+/// exactly" exists to catch. A small varying jitter added to each cycle
+/// breaks the alignment, the same way the old design's per-poll stagger did.
+const sim_stagger_step_ms: i64 = 17;
+const sim_stagger_cycle: u32 = 5;
+
+const WorkerState = enum { idle, in_flight };
+
+/// A source whose counter advances only while running, sampled by
+/// `sim_workers` independent pollers each looping on its own
+/// `sim_workers * sim_frame_interval_ms` cycle, staggered from each other by
+/// `sim_frame_interval_ms` -- i.e. the same ring `bluray.zig` actually runs,
+/// not a single sequential poller.
+///
+/// Requests genuinely overlap: a worker's dispatch and its completion are
+/// separate events, and other workers can dispatch (or complete) in between.
+/// This matters whenever `rtt_ms` exceeds the stagger spacing -- the real
+/// measured hardware case -- because processing one worker's exchange fully
+/// before considering the next would silently serialize the pool, collapsing
+/// every worker onto the same phase and defeating the whole point of running
+/// more than one.
 const Sim = struct {
     now_ms: i64 = 0,
     /// Content time in ms; the reported value is this truncated to seconds.
@@ -433,6 +328,23 @@ const Sim = struct {
     /// of how `content_ms` moves, not of `running`.
     content_rate_permille: i64 = 1000,
 
+    /// Each worker's next event instant: a dispatch time while `.idle`, a
+    /// completion time while `.in_flight`. Lazily staggered on first use
+    /// rather than in a default field value, since the stagger is relative to
+    /// wherever `now_ms` starts.
+    next_event_ms: [sim_workers]i64 = undefined,
+    worker_state: [sim_workers]WorkerState = .{.idle} ** sim_workers,
+    /// Snapshot taken at dispatch, so a completion can compute its sample's
+    /// value at the midpoint without rewinding `content_ms`, which -- like
+    /// the real clock it stands in for -- only ever moves forward.
+    dispatch_ms: [sim_workers]i64 = undefined,
+    content_at_dispatch: [sim_workers]i64 = undefined,
+    running_at_dispatch: [sim_workers]bool = undefined,
+    rate_at_dispatch: [sim_workers]i64 = undefined,
+    started: bool = false,
+    /// Shared across every worker: see `sim_stagger_step_ms`.
+    stagger: u32 = 0,
+
     fn reported(self: Sim) u32 {
         return @intCast(@divFloor(self.content_ms, 1000));
     }
@@ -444,24 +356,65 @@ const Sim = struct {
         }
     }
 
-    /// Run one poll: wait until it is due, exchange, and reschedule.
+    /// Advance the pool by exactly one folded sample. Internally this may
+    /// process several events -- other workers dispatching while one is
+    /// still in flight -- but always returns as soon as one completion has
+    /// been folded in, so callers see the same "one step, one sample"
+    /// contract as before.
     fn step(self: *Sim, lock: *PhaseLock) void {
-        const wait = lock.next_poll_ms - self.now_ms;
-        if (wait > 0) self.advance(wait);
-
-        const kind = lock.next_kind;
-        self.advance(@divFloor(self.rtt_ms, 2));
-        const sample_ms = self.now_ms;
-        const value = self.reported();
-        const running = self.running;
-        self.advance(self.rtt_ms - @divFloor(self.rtt_ms, 2));
-
-        if (running) {
-            lock.sampleRunning(sample_ms, kind, value);
-        } else {
-            lock.sampleStopped();
+        if (!self.started) {
+            self.started = true;
+            for (&self.next_event_ms, 0..) |*t, i| {
+                t.* = self.now_ms + @as(i64, @intCast(i)) * sim_frame_interval_ms;
+            }
         }
-        lock.schedule(self.now_ms, kind, running);
+
+        while (true) {
+            var idx: usize = 0;
+            for (self.next_event_ms[1..], 1..) |t, i| {
+                if (t < self.next_event_ms[idx]) idx = i;
+            }
+
+            const wait = self.next_event_ms[idx] - self.now_ms;
+            if (wait > 0) self.advance(wait);
+
+            switch (self.worker_state[idx]) {
+                .idle => {
+                    self.dispatch_ms[idx] = self.now_ms;
+                    self.content_at_dispatch[idx] = self.content_ms;
+                    self.running_at_dispatch[idx] = self.running;
+                    self.rate_at_dispatch[idx] = self.content_rate_permille;
+                    self.worker_state[idx] = .in_flight;
+                    self.next_event_ms[idx] = self.now_ms + self.rtt_ms;
+                },
+                .in_flight => {
+                    const half = @divFloor(self.rtt_ms, 2);
+                    const sample_ms = self.dispatch_ms[idx] + half;
+                    const running = self.running_at_dispatch[idx];
+                    const content_at_sample = self.content_at_dispatch[idx] +
+                        (if (running) @divTrunc(half * self.rate_at_dispatch[idx], 1000) else 0);
+                    const value: u32 = @intCast(@divFloor(content_at_sample, 1000));
+
+                    self.worker_state[idx] = .idle;
+                    // Back on cycle if the round trip left slack, immediately
+                    // if it ran long -- mirrors `bluray.pollWorker`'s own
+                    // catch-up behavior. The jitter keeps the cycle from ever
+                    // being an exact, repeating multiple of
+                    // `sim_frame_interval_ms`; see `sim_stagger_step_ms`.
+                    const jitter = sim_stagger_step_ms * @as(i64, @intCast(self.stagger % sim_stagger_cycle));
+                    self.stagger +%= 1;
+                    const cycle_ms = @as(i64, @intCast(sim_workers)) * sim_frame_interval_ms + jitter;
+                    self.next_event_ms[idx] = @max(self.dispatch_ms[idx] + cycle_ms, self.now_ms);
+
+                    if (running) {
+                        lock.sampleRunning(sample_ms, value);
+                    } else {
+                        lock.sampleStopped();
+                    }
+                    return;
+                },
+            }
+        }
     }
 
     fn stepN(self: *Sim, lock: *PhaseLock, n: usize) void {
@@ -501,8 +454,8 @@ test "acquires lock quickly from cold start" {
     var lock = PhaseLock.init;
     var sim: Sim = .{ .content_ms = 12_345 };
 
-    // A couple of seconds of staggered sampling narrows the interval well
-    // past the guard at a fast round trip.
+    // A few dozen staggered samples from the poll-worker pool narrows the
+    // interval well past the guard.
     sim.stepN(&lock, 50);
     try expectInSync(&sim, &lock);
     try std.testing.expect(lock.anchor_err_ms <= edge_guard_ms);
@@ -531,27 +484,6 @@ test "stays locked and in sync over a long run" {
         if (lock.isLocked()) try expectInSync(&sim, &lock);
     }
     try expectInSync(&sim, &lock);
-}
-
-test "locked maintenance polls back-to-back, throttled only by the round trip" {
-    var lock = PhaseLock.init;
-    var sim: Sim = .{ .content_ms = 2_000 };
-    sim.stepN(&lock, 50);
-    try expectInSync(&sim, &lock);
-
-    const start_ms = sim.now_ms;
-    const polls = 30;
-    sim.stepN(&lock, polls);
-    const elapsed_ms = sim.now_ms - start_ms;
-
-    // Each dispatch follows the previous response by only the round trip
-    // (baked into `now_ms`) plus the small stagger -- no deliberate idle is
-    // added on top. At this sim's low rtt (20 ms) that puts every poll well
-    // under the 1 s cap; a slow, ~1 s round trip settles near the cap on its
-    // own (see "a one-second round trip locks via interval intersection").
-    const max_gap = fast_poll_ms + poll_stagger_step_ms * (poll_stagger_cycle - 1) + sim.rtt_ms;
-    try std.testing.expect(elapsed_ms <= polls * max_gap);
-    try std.testing.expect(elapsed_ms >= polls * (fast_poll_ms + sim.rtt_ms));
 }
 
 test "re-locks after a pause that is never observed as paused status" {
@@ -718,16 +650,12 @@ test "reacquire through a transient stop during the jump lands on the exact valu
     sim.content_ms -= 600_000 - 411;
     sim.running = true;
 
-    const wait = lock.next_poll_ms - sim.now_ms;
-    if (wait > 0) sim.advance(wait);
-    const kind = lock.next_kind;
     sim.advance(10);
     const sample_ms = sim.now_ms;
     const value = sim.reported();
     sim.advance(10);
     lock.resumed(sample_ms, value);
-    lock.sampleRunning(sample_ms, kind, value);
-    lock.schedule(sim.now_ms, kind, true);
+    lock.sampleRunning(sample_ms, value);
 
     // Roughly right immediately (resumed's job)...
     const shown = lock.predict(sim.now_ms, 0);
@@ -774,9 +702,14 @@ test "the clock keeps running while the lock is being re-acquired" {
     sim.stepN(&lock, 50);
     try expectInSync(&sim, &lock);
 
+    const anchor_before = lock.anchor_ms;
     lock.drop();
     try std.testing.expect(!lock.isLocked());
     try std.testing.expect(lock.hasAnchor());
+    // The anchor itself is untouched by drop -- only confidence in the phase
+    // is -- so the display does not stall or jump the instant this fires
+    // (e.g. the "Force PLL Resync" button on the web page).
+    try std.testing.expectEqual(anchor_before, lock.anchor_ms);
 
     var previous = lock.predict(sim.now_ms, 0);
     var advanced: usize = 0;
@@ -818,29 +751,6 @@ test "resumed anchors immediately rather than stalling like a bare reset" {
     try std.testing.expect(advanced);
 }
 
-test "forceResync re-acquires immediately without stalling or waiting" {
-    var lock = PhaseLock.init;
-    var sim: Sim = .{ .content_ms = 20_000 };
-    sim.stepN(&lock, 50);
-    try expectInSync(&sim, &lock);
-    const anchor_before = lock.anchor_ms;
-
-    lock.forceResync(sim.now_ms);
-
-    // The clock keeps running (old anchor still in place)...
-    try std.testing.expect(!lock.isLocked());
-    try std.testing.expect(lock.hasAnchor());
-    try std.testing.expectEqual(anchor_before, lock.anchor_ms);
-
-    // ...the next poll is due immediately...
-    try std.testing.expectEqual(sim.now_ms, lock.next_poll_ms);
-    try std.testing.expectEqual(PollKind.hunt, lock.next_kind);
-
-    // ...and it actually does re-acquire from there.
-    sim.stepN(&lock, 50);
-    try expectInSync(&sim, &lock);
-}
-
 test "a stop discards the anchor rather than free-wheeling past it" {
     var lock = PhaseLock.init;
     var sim: Sim = .{ .content_ms = 12_000 };
@@ -850,19 +760,6 @@ test "a stop discards the anchor rather than free-wheeling past it" {
     lock.sampleStopped();
     try std.testing.expect(!lock.hasAnchor());
     try std.testing.expectEqual(@as(u32, 99), lock.predict(sim.now_ms, 99));
-}
-
-test "schedule never leaves a gap wider than max_poll_gap_ms" {
-    var lock = PhaseLock.init;
-    var sim: Sim = .{ .content_ms = 60_000, .rtt_ms = 200 };
-
-    for (0..300) |i| {
-        if (i == 100) sim.running = false;
-        if (i == 130) sim.running = true;
-        if (i == 200) sim.content_ms += 500_000; // seek
-        sim.step(&lock);
-        try std.testing.expect(lock.next_poll_ms - sim.now_ms <= max_poll_gap_ms);
-    }
 }
 
 test "a slow round trip still locks, with the same accuracy" {
@@ -876,18 +773,6 @@ test "a slow round trip still locks, with the same accuracy" {
     try std.testing.expect(lock.isLocked());
     try std.testing.expect(lock.anchor_err_ms <= edge_guard_ms);
     try expectInSync(&sim, &lock);
-
-    // And having locked, maintenance polling continues at this round trip's
-    // own pace (rtt plus a small stagger) rather than idling for no reason --
-    // see "locked maintenance polls back-to-back, throttled only by the
-    // round trip".
-    const start_ms = sim.now_ms;
-    const polls = 20;
-    sim.stepN(&lock, polls);
-    const elapsed_ms = sim.now_ms - start_ms;
-    const max_gap = fast_poll_ms + poll_stagger_step_ms * (poll_stagger_cycle - 1) + sim.rtt_ms;
-    try std.testing.expect(elapsed_ms <= polls * max_gap);
-    try std.testing.expect(elapsed_ms >= polls * (fast_poll_ms + sim.rtt_ms));
 }
 
 test "a one-second round trip locks via interval intersection" {
@@ -896,16 +781,13 @@ test "a one-second round trip locks via interval intersection" {
     // ever land close together in time, so nothing bracket-shaped can work;
     // the hardware log showed the old design hunting forever on a rebase-luck
     // anchor, tolerating a permanent error of up to a second. The interval
-    // estimator locks anyway, because the staggered cadence sweeps the sample
-    // instants across the counter's second.
+    // estimator locks anyway, because the staggered poll-worker pool sweeps
+    // the sample instants across the counter's second regardless.
     var lock = PhaseLock.init;
     var sim: Sim = .{ .content_ms = 2_216_350, .rtt_ms = 1000 };
 
     for (0..120) |_| sim.step(&lock);
     try std.testing.expect(lock.isLocked());
-    // The lag estimate is what places maintenance samples mid-second; at this
-    // round trip it is ~500 ms and essential.
-    try std.testing.expect(lock.sample_lag_ms > 400);
 
     // Locked and exactly right, and it stays that way.
     var locked_steps: usize = 0;
@@ -920,11 +802,16 @@ test "a one-second round trip locks via interval intersection" {
 }
 
 test "the estimator survives a round trip that divides the second exactly" {
-    // gap + rtt = 60 + 940 = 1000: without the stagger, every sample would
-    // land at the same point of the counter's second and the interval could
-    // never narrow. The stagger exists precisely for this case.
+    // rtt=2000 exceeds the pool's target cycle (sim_workers * frame_interval,
+    // 1250 ms), so every worker overruns to a period of exactly its own rtt --
+    // a whole number of seconds. Each worker's own successive samples would
+    // then freeze at the same point of the counter's second forever; what
+    // saves it is that the pool has more than one worker, each started
+    // `sim_frame_interval_ms` apart, so their frozen offsets still differ from
+    // each other. A single sequential poller has no such fallback, which is
+    // exactly why one is no longer used.
     var lock = PhaseLock.init;
-    var sim: Sim = .{ .content_ms = 7_777, .rtt_ms = 940 };
+    var sim: Sim = .{ .content_ms = 7_777, .rtt_ms = 2000 };
 
     for (0..120) |_| sim.step(&lock);
     try std.testing.expect(lock.isLocked());
