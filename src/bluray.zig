@@ -790,7 +790,6 @@ pub const Command = enum {
 const LockObservable = struct {
     have_anchor: bool,
     locked: bool,
-    refreshing: bool,
     anchor_ms: i64,
     anchor_sec: u32,
     anchor_err_ms: i64,
@@ -799,7 +798,6 @@ const LockObservable = struct {
         return .{
             .have_anchor = lock.have_anchor,
             .locked = lock.isLocked(),
-            .refreshing = lock.refreshing,
             .anchor_ms = lock.anchor_ms,
             .anchor_sec = lock.anchor_sec,
             .anchor_err_ms = lock.anchor_err_ms,
@@ -821,7 +819,7 @@ const LockObservable = struct {
     /// Log whatever changed between `before` (an earlier capture) and `self`
     /// (the current state), attributing it to the poll of kind `kind` that ran
     /// in between. Silent when nothing changed, which is most polls -- a
-    /// straddle or mid-second check that simply agreed with the prediction.
+    /// sample that simply agreed with the accumulated estimate.
     fn logChangesFrom(self: LockObservable, before: LockObservable, kind: PollKind) void {
         if (!before.have_anchor and self.have_anchor) {
             std.debug.print("phase_lock: anchor acquired -> sec={d} at ms={d} (+-{d}ms, kind={s})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind) });
@@ -834,21 +832,17 @@ const LockObservable = struct {
         if (!before.locked and self.locked) {
             std.debug.print("phase_lock: locked (+-{d}ms, kind={s})\n", .{ self.anchor_err_ms, @tagName(kind) });
         } else if (before.locked and !self.locked) {
-            std.debug.print("phase_lock: lost lock, hunting (kind={s})\n", .{@tagName(kind)});
+            std.debug.print("phase_lock: lost lock, re-acquiring (kind={s})\n", .{@tagName(kind)});
         }
 
-        if (!before.refreshing and self.refreshing) {
-            std.debug.print("phase_lock: periodic refresh started (kind={s})\n", .{@tagName(kind)});
-        }
-
-        // Bracket tightening: same anchor instant, but a narrower error bound.
-        // Not itself a resync, so kept quieter than the events above -- useful
-        // when specifically watching convergence, noisy otherwise.
+        // Interval tightening: same anchor, narrower error bound. Not itself
+        // a resync, so kept quieter than the events above -- useful when
+        // specifically watching convergence, noisy otherwise.
         if (self.have_anchor and before.have_anchor and
             self.anchor_ms == before.anchor_ms and self.anchor_sec == before.anchor_sec and
             self.anchor_err_ms != before.anchor_err_ms)
         {
-            std.debug.print("phase_lock: bracket tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
+            std.debug.print("phase_lock: estimate tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
         }
     }
 };
@@ -983,11 +977,10 @@ pub const BlurayPlayer = struct {
             const predicted = before.predictAt(sample_ms);
             const drift = @as(i64, reported) - @as(i64, predicted);
             const into_ms = @mod(sample_ms - before.anchor_ms, 1000);
-            std.debug.print("pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}{s}\n", .{
-                @tagName(kind),          reported,          predicted,
-                drift,                   into_ms,           after.anchor_err_ms,
-                self.last_rtt_ms,        if (after.locked) "locked" else "hunting",
-                if (after.refreshing) "+refresh" else "",
+            std.debug.print("pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}\n", .{
+                @tagName(kind),   reported,            predicted,
+                drift,            into_ms,             after.anchor_err_ms,
+                self.last_rtt_ms, if (after.locked) "locked" else "hunting",
             });
         } else {
             std.debug.print("pll: {s} reported={d} (no anchor yet) rtt={d}ms\n", .{

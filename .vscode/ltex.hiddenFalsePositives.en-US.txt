@@ -1,0 +1,1 @@
+{"rule":"EN_A_VS_AN","sentence":"^\\QAn \\E(?:Dummy|Ina|Jimmy-|Dummy-|Maniquí-|Maniquíes-|Atrapa-|Dummy\\+|Dummy's\\+)[0-9]+\\Q line well after startup is a real desync being caught and corrected; \\E(?:Dummy|Ina|Jimmy-|Dummy-|Maniquí-|Maniquíes-|Atrapa-|Dummy\\+|Dummy's\\+)[0-9]+\\Q is a genuine stop/pause and unexpected anywhere else.\\E$"}
