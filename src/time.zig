@@ -1,4 +1,24 @@
 const std = @import("std");
+const Io = std.Io;
+
+// 0.16 removed `std.time.timestamp` and friends; wall-clock readings now come
+// from the `Io` implementation via the `.real` clock. These wrappers keep the
+// old call shape, just with an `io` argument.
+
+/// Seconds since the Unix epoch.
+pub fn nowSeconds(io: Io) i64 {
+    return @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
+/// Milliseconds since the Unix epoch.
+pub fn nowMillis(io: Io) i64 {
+    return @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+/// Nanoseconds since the Unix epoch.
+pub fn nowNanos(io: Io) i128 {
+    return Io.Timestamp.now(io, .real).nanoseconds;
+}
 
 pub const zoneinfo = struct {
     offset_sec: i32,
@@ -38,13 +58,13 @@ pub const HmsMs = struct {
 };
 
 /// Get the local timezone offset in seconds from UTC
-pub fn getTimezoneInfo() zoneinfo {
+pub fn getTimezoneInfo(io: Io) zoneinfo {
     // Read timezone info from /etc/localtime symlink
-    if (std.fs.cwd().openFile("/etc/localtime", .{})) |file| {
-        defer file.close();
+    if (Io.Dir.cwd().openFile(io, "/etc/localtime", .{})) |file| {
+        defer file.close(io);
 
         // Try to parse the TZif file for accurate DST information
-        if (parseTZifFile(file)) |zi| {
+        if (parseTZifFile(io, file)) |zi| {
             return zi;
         } else {
             // Fallback to hardcoded mapping if TZif parsing fails
@@ -58,13 +78,14 @@ pub fn getTimezoneInfo() zoneinfo {
 }
 
 /// Parse TZif file to get current timezone offset
-fn parseTZifFile(file: std.fs.File) ?zoneinfo {
+fn parseTZifFile(io: Io, file: Io.File) ?zoneinfo {
     var buf: [1024]u8 = undefined;
-    const utc_timestamp = std.time.timestamp();
+    const utc_timestamp = nowSeconds(io);
 
     // Now read and parse the TZif file to get actual DST status
-    if (file.seekTo(0)) |_| {
-        if (file.read(&buf)) |bytes_read| {
+    var file_reader = file.reader(io, &.{});
+    if (file_reader.seekTo(0)) |_| {
+        if (file_reader.interface.readSliceShort(&buf)) |bytes_read| {
             // std.debug.print("Read {} bytes from timezone file\n", .{bytes_read});
 
             // Parse TZif file format
@@ -121,11 +142,11 @@ fn parseTZifFile(file: std.fs.File) ?zoneinfo {
                     const types_offset = 44 + transitions_size + transition_count; // +transition_count for type indices
                     const buf_offset = @max(0, types_offset + (type_count * 6) - 1024);
 
-                    file.seekTo(buf_offset) catch |err| {
+                    file_reader.seekTo(buf_offset) catch |err| {
                         std.debug.print("Failed to seek to data: {}\n", .{err});
                         return null;
                     };
-                    _ = file.read(&buf) catch |err| {
+                    _ = file_reader.interface.readSliceShort(&buf) catch |err| {
                         std.debug.print("Failed to read data: {}\n", .{err});
                         return null;
                     };
@@ -322,7 +343,10 @@ pub fn timestampToYmdhms(timestamp: i64) Ymdhms {
 }
 
 test "ymdhmsToTimestamp" {
-    const utc_timestamp = std.time.timestamp();
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const utc_timestamp = nowSeconds(threaded.io());
     std.debug.print("Current UTC timestamp: {}\n", .{utc_timestamp});
     const ymdhms = timestampToYmdhms(utc_timestamp);
     var buf: [20]u8 = undefined;

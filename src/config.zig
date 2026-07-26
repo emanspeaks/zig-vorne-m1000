@@ -1,6 +1,10 @@
 const std = @import("std");
+const Io = std.Io;
 const time = @import("time.zig");
 const str_utils = @import("str_utils.zig");
+
+/// Upper bound for the config/IP files read below.
+const max_config_bytes: Io.Limit = .limited(1 << 20);
 
 const maxbufsz = str_utils.maxbufsz;
 
@@ -18,67 +22,37 @@ const bluray_cfg_path = "/home/emanspeaks/bluray_config.jsonc";
 const bluray_ip_path = "/home/emanspeaks/bluray_ip.txt";
 const countdown_cfg_path = "/home/emanspeaks/line2_config.jsonc";
 
-pub fn loadBlurayIp(allocator: std.mem.Allocator) ?[]const u8 {
+pub fn loadBlurayIp(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
     // Try to read the IP address from the text file
-    const file = std.fs.openFileAbsolute(bluray_ip_path, .{}) catch |err| switch (err) {
+    // Caller owns the returned buffer.
+    return Io.Dir.readFileAlloc(.cwd(), io, bluray_ip_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("bluray_ip.txt not found, skipping\n", .{});
             return null;
         },
         else => {
-            std.debug.print("Error opening IP file: {}, skipping\n", .{err});
+            std.debug.print("Error reading IP file: {}, skipping\n", .{err});
             return null;
         },
     };
-    defer file.close();
-
-    const file_size = file.getEndPos() catch |err| {
-        std.debug.print("Error getting file size: {}, skipping\n", .{err});
-        return null;
-    };
-    const contents = allocator.alloc(u8, @intCast(file_size)) catch |err| {
-        std.debug.print("Error allocating memory: {}, skipping\n", .{err});
-        return null;
-    };
-    // defer allocator.free(contents);
-    _ = file.readAll(contents) catch |err| {
-        std.debug.print("Error reading file: {}, skipping\n", .{err});
-        return null;
-    };
-
-    return contents;
 }
 
-pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
+pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
     // Try to read the JSON file
-    const file = std.fs.openFileAbsolute(bluray_cfg_path, .{}) catch |err| switch (err) {
+    const contents = Io.Dir.readFileAlloc(.cwd(), io, bluray_cfg_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("bluray_config.jsonc not found, skipping\n", .{});
             return null;
         },
         else => {
-            std.debug.print("Error opening JSON file: {}, skipping\n", .{err});
+            std.debug.print("Error reading JSON file: {}, skipping\n", .{err});
             return null;
         },
     };
-    defer file.close();
-
-    const file_size = file.getEndPos() catch |err| {
-        std.debug.print("Error getting file size: {}, skipping\n", .{err});
-        return null;
-    };
-    const contents = allocator.alloc(u8, @intCast(file_size)) catch |err| {
-        std.debug.print("Error allocating memory: {}, skipping\n", .{err});
-        return null;
-    };
     defer allocator.free(contents);
-    _ = file.readAll(contents) catch |err| {
-        std.debug.print("Error reading file: {}, skipping\n", .{err});
-        return null;
-    };
 
     // Preprocess JSONC content to remove comments first, then trailing commas
-    var comment_free = std.ArrayList(u8){};
+    var comment_free = std.ArrayList(u8).empty;
     defer comment_free.deinit(allocator);
 
     // First pass: remove comments
@@ -119,7 +93,7 @@ pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
     }
 
     // Second pass: remove trailing commas
-    var cleaned_contents = std.ArrayList(u8){};
+    var cleaned_contents = std.ArrayList(u8).empty;
     defer cleaned_contents.deinit(allocator);
 
     i = 0;
@@ -199,36 +173,22 @@ pub fn loadBlurayConfig(allocator: std.mem.Allocator) ?BlurayConfig {
     return null;
 }
 
-pub fn loadCountdownConfig(allocator: std.mem.Allocator) ?CountdownConfig {
+pub fn loadCountdownConfig(io: Io, allocator: std.mem.Allocator) ?CountdownConfig {
     // Try to read the JSON file
-    const file = std.fs.openFileAbsolute(countdown_cfg_path, .{}) catch |err| switch (err) {
+    const contents = Io.Dir.readFileAlloc(.cwd(), io, countdown_cfg_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("line2_config.jsonc not found, skipping\n", .{});
             return null;
         },
         else => {
-            std.debug.print("Error opening JSON file: {}, skipping\n", .{err});
+            std.debug.print("Error reading JSON file: {}, skipping\n", .{err});
             return null;
         },
     };
-    defer file.close();
-
-    const file_size = file.getEndPos() catch |err| {
-        std.debug.print("Error getting file size: {}, skipping\n", .{err});
-        return null;
-    };
-    const contents = allocator.alloc(u8, @intCast(file_size)) catch |err| {
-        std.debug.print("Error allocating memory: {}, skipping\n", .{err});
-        return null;
-    };
     defer allocator.free(contents);
-    _ = file.readAll(contents) catch |err| {
-        std.debug.print("Error reading file: {}, skipping\n", .{err});
-        return null;
-    };
 
     // Preprocess JSONC content to remove comments first, then trailing commas
-    var comment_free = std.ArrayList(u8){};
+    var comment_free = std.ArrayList(u8).empty;
     defer comment_free.deinit(allocator);
 
     // First pass: remove comments
@@ -269,7 +229,7 @@ pub fn loadCountdownConfig(allocator: std.mem.Allocator) ?CountdownConfig {
     }
 
     // Second pass: remove trailing commas
-    var cleaned_contents = std.ArrayList(u8){};
+    var cleaned_contents = std.ArrayList(u8).empty;
     defer cleaned_contents.deinit(allocator);
 
     i = 0;

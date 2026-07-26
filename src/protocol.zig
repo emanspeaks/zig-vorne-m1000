@@ -87,7 +87,7 @@ pub fn genCmdStr(
     const addr_str = std.fmt.bufPrint(&buf, "{d}", .{address}) catch unreachable;
 
     // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8){};
+    var cmd_parts = std.ArrayList(u8).empty;
     defer cmd_parts.deinit(allocator);
 
     try cmd_parts.appendSlice(allocator, addr_cmd);

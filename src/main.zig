@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const http = std.http;
 const protocol = @import("protocol.zig");
 const serial = @import("serial.zig");
@@ -10,38 +11,43 @@ const vlc = @import("vlc.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const Mode = @import("mode.zig").Mode;
 
-pub fn main() !void {
+/// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
+/// `Io` implementation that all blocking I/O (files, sockets, sleeping) now
+/// goes through, along with the command-line arguments.
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
+    const io = init.io;
+
+    // Make the environment available for the DEBUG_VLC check
+    vlc.setEnviron(init.minimal.environ);
 
     // Setup signal handlers and check for existing instances
     try process_mgmt.setup();
-    try process_mgmt.checkExistingInstance(allocator);
-    defer process_mgmt.cleanup();
+    try process_mgmt.checkExistingInstance(io, allocator);
+    defer process_mgmt.cleanup(io);
 
     // Parse command-line arguments for optional modes
     var bluray_flag = false;
     var vlc_flag = false;
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    if (args.len > 1) {
-        for (args[1..]) |arg| {
-            if (std.mem.eql(u8, arg, "--bluray")) {
-                bluray_flag = true;
-            } else if (std.mem.eql(u8, arg, "--vlc")) {
-                vlc_flag = true;
-            }
+    var args = init.minimal.args.iterate();
+    _ = args.skip(); // argv[0]
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--bluray")) {
+            bluray_flag = true;
+        } else if (std.mem.eql(u8, arg, "--vlc")) {
+            vlc_flag = true;
         }
     }
 
     const ttydev = "/dev/ttyUSB0";
     std.debug.print("Opening {s}...\n", .{ttydev});
-    const port = serial.SerialPort.open(ttydev, allocator) catch |err| return err;
+    const port = serial.SerialPort.open(io, ttydev, allocator) catch |err| return err;
     defer port.close(allocator);
     std.debug.print("Serial port opened and configured successfully.\n", .{});
 
     protocol.sendUnitFlushCmd(allocator, port, 1) catch |err| return err;
     protocol.sendUnitDisplayCmd(allocator, port, 1, protocol.ESC ++ "E") catch |err| return err;
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    try io.sleep(.fromSeconds(1), .awake);
 
     var mode = std.atomic.Value(Mode).init(.Clocks);
     if (bluray_flag) {
@@ -53,7 +59,7 @@ pub fn main() !void {
     // Shared mode state
 
     // Start HTTP server in a separate thread
-    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ allocator, port, &mode });
+    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode });
     server_thread.detach();
 
     // Main display loop
@@ -66,35 +72,46 @@ pub fn main() !void {
 
         const current_mode = mode.load(.acquire);
         if (current_mode == .Clocks) {
-            try clocks.runClocks(allocator, port, &mode);
+            try clocks.runClocks(io, allocator, port, &mode);
         } else if (current_mode == .Bluray) {
-            try bluray.runBlurayClocks(allocator, port, &mode);
+            try bluray.runBlurayClocks(io, allocator, port, &mode);
         } else if (current_mode == .Vlc) {
-            try vlc.runVlcClocks(allocator, port, &mode);
+            try vlc.runVlcClocks(io, allocator, port, &mode);
         }
     }
 }
 
-fn startHttpServer(allocator: std.mem.Allocator, port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
-    const address = std.net.Address.parseIp("0.0.0.0", 8080) catch unreachable;
-    var listener = try address.listen(.{ .reuse_address = true });
-    defer listener.deinit();
+fn startHttpServer(io: Io, allocator: std.mem.Allocator, port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+    const address: Io.net.IpAddress = Io.net.IpAddress.parse("0.0.0.0", 8080) catch unreachable;
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
 
     std.debug.print("HTTP server listening on port 8080\n", .{});
 
     while (true) {
-        const conn = try listener.accept();
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ allocator, conn, port, mode });
+        const stream = try listener.accept(io);
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode });
         thread.detach();
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection, serial_port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
-    defer conn.stream.close();
+fn handleConnection(io: Io, allocator: std.mem.Allocator, stream: Io.net.Stream, serial_port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+    defer stream.close(io);
 
-    var buffer: [1024]u8 = undefined;
-    const n = try conn.stream.read(&buffer);
-    const request = buffer[0..n];
+    var read_buffer: [1024]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buffer);
+    var write_buffer: [1024]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buffer);
+    const out = &stream_writer.interface;
+    defer out.flush() catch {};
+
+    // Wait for the first chunk of the request and take whatever arrived. Do not
+    // use `readSliceShort` here: it blocks until the buffer is full, which never
+    // happens for a request smaller than `read_buffer`.
+    const request = stream_reader.interface.peekGreedy(1) catch |err| switch (err) {
+        error.EndOfStream => return,
+        else => return err,
+    };
 
     // Simple HTTP request parsing
     var lines = std.mem.splitSequence(u8, request, "\r\n");
@@ -139,8 +156,8 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         defer allocator.free(html_body);
         const headers = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\n\r\n", .{html_body.len}) catch return;
         defer allocator.free(headers);
-        _ = try conn.stream.write(headers);
-        _ = try conn.stream.write(html_body);
+        try out.writeAll(headers);
+        try out.writeAll(html_body);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/control")) {
         // Find the body
         var body_start: usize = 0;
@@ -183,7 +200,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
 
         // Redirect back to main page
         const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
-        _ = try conn.stream.write(response);
+        try out.writeAll(response);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/mode")) {
         // Find the body
         var body_start: usize = 0;
@@ -216,9 +233,9 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
 
         // Redirect back to main page
         const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
-        _ = try conn.stream.write(response);
+        try out.writeAll(response);
     } else {
         const response = "HTTP/1.1 404 Not Found\r\n\r\n";
-        _ = try conn.stream.write(response);
+        try out.writeAll(response);
     }
 }

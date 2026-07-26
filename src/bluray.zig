@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const time = @import("time.zig");
@@ -14,11 +15,11 @@ pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 
-pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
+pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
     // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8){};
+    var cmd_parts = std.ArrayList(u8).empty;
     defer cmd_parts.deinit(allocator);
 
     var playtime_buf: [maxbufsz]u8 = undefined;
@@ -26,14 +27,15 @@ pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.a
     var playtime: u32 = 0;
 
     // Initialize frame timer for real-time operation
-    var timer = frame_timer.FrameTimer.init(1.0); // 1 FPS target
+    // var timer = frame_timer.FrameTimer.init(1.0); // 1 FPS target
+    var timer = frame_timer.FrameTimer.init(io, 0.2); // 1 FPS target
 
     // Initialize Blu-ray player
-    var player = BlurayPlayer.init(allocator);
+    var player = BlurayPlayer.init(io, allocator);
     defer player.deinit();
 
     // Load configuration from JSON
-    const bluray_config = config.loadBlurayConfig(allocator);
+    const bluray_config = config.loadBlurayConfig(io, allocator);
 
     while (true) {
         // Start frame timing
@@ -87,7 +89,7 @@ pub fn runBlurayClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.a
         }
 
         // Handle frame timing and sleep
-        timer.frameEnd();
+        try timer.frameEnd();
     }
 }
 
@@ -136,10 +138,10 @@ pub const BlurayPlayer = struct {
     const USER_AGENT = "MEI-LAN-REMOTE-CALL";
 
     /// Initialize a new BlurayPlayer instance
-    pub fn init(allocator: std.mem.Allocator) Self {
-        var ip_address = config.loadBlurayIp(allocator);
+    pub fn init(io: Io, allocator: std.mem.Allocator) Self {
+        var ip_address = config.loadBlurayIp(io, allocator);
         if (ip_address) |ip| {
-            ip_address = std.mem.trimRight(u8, ip, "\r\n");
+            ip_address = std.mem.trimEnd(u8, ip, "\r\n");
         }
 
         return Self{
@@ -147,7 +149,7 @@ pub const BlurayPlayer = struct {
             .ip_address = ip_address,
             .state = BlurayPlayerState.init(),
             .last_update_time = 0,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = std.http.Client{ .allocator = allocator, .io = io },
         };
     }
 
@@ -225,7 +227,7 @@ pub const BlurayPlayer = struct {
     /// Send HTTP request to the Blu-ray player
     fn sendHttpRequest(self: *Self, url: []const u8, body: []const u8) ![]u8 {
         // Use Writer.Allocating for collecting HTTP response data
-        var allocating_writer = std.io.Writer.Allocating.init(self.allocator);
+        var allocating_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer allocating_writer.deinit();
 
         const response = try self.http_client.fetch(.{
@@ -251,7 +253,7 @@ pub const BlurayPlayer = struct {
     /// Parse the response from the Blu-ray player
     fn parseResponse(self: *Self, response: []const u8) ![][]const u8 {
         // Split response by \r\n
-        var lines = std.ArrayList([]const u8){};
+        var lines = std.ArrayList([]const u8).empty;
         defer lines.deinit(self.allocator);
 
         var line_iterator = std.mem.splitSequence(u8, response, "\r\n");
@@ -276,7 +278,7 @@ pub const BlurayPlayer = struct {
 
         // Parse second line (actual data)
         const data_line = lines.items[1];
-        var data_parts = std.ArrayList([]const u8){};
+        var data_parts = std.ArrayList([]const u8).empty;
         var data_iterator = std.mem.splitScalar(u8, data_line, ',');
         while (data_iterator.next()) |part| {
             try data_parts.append(self.allocator, part);

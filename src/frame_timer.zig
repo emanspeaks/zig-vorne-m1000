@@ -1,6 +1,8 @@
 const std = @import("std");
+const Io = std.Io;
 
 pub const FrameTimer = struct {
+    io: Io,
     target_fps: f64,
     target_frame_duration_ns: u64,
     max_overrun_ns: u64,
@@ -13,13 +15,14 @@ pub const FrameTimer = struct {
     const Self = @This();
 
     /// Initialize a new frame timer with the specified target FPS
-    pub fn init(target_fps: f64) Self {
+    pub fn init(io: Io, target_fps: f64) Self {
         const target_frame_duration_ns: u64 = @intFromFloat(std.time.ns_per_s / target_fps);
         return Self{
+            .io = io,
             .target_fps = target_fps,
             .target_frame_duration_ns = target_frame_duration_ns,
             .max_overrun_ns = target_frame_duration_ns / 4, // 25% overrun threshold
-            .frame_start_time = std.time.nanoTimestamp(),
+            .frame_start_time = Io.Timestamp.now(io, .real).nanoseconds,
             .frame_count = 0,
             .overrun_count = 0,
             .max_overrun_ns_recorded = 0,
@@ -29,12 +32,12 @@ pub const FrameTimer = struct {
 
     /// Call at the beginning of each frame
     pub fn frameStart(self: *Self) void {
-        self.frame_start_time = std.time.nanoTimestamp();
+        self.frame_start_time = Io.Timestamp.now(self.io, .real).nanoseconds;
     }
 
     /// Call at the end of each frame - handles timing and sleep
-    pub fn frameEnd(self: *Self) void {
-        const frame_end_time = std.time.nanoTimestamp();
+    pub fn frameEnd(self: *Self) Io.Cancelable!void {
+        const frame_end_time = Io.Timestamp.now(self.io, .real).nanoseconds;
         const frame_duration = frame_end_time - self.frame_start_time;
         const target_duration_i128: i128 = @intCast(self.target_frame_duration_ns);
 
@@ -42,8 +45,8 @@ pub const FrameTimer = struct {
 
         if (frame_duration < target_duration_i128) {
             // Frame finished early - sleep for remaining time
-            const sleep_duration: u64 = @intCast(target_duration_i128 - frame_duration);
-            std.Thread.sleep(sleep_duration);
+            const sleep_duration: i96 = @intCast(target_duration_i128 - frame_duration);
+            try self.io.sleep(.fromNanoseconds(sleep_duration), .awake);
         } else {
             // Frame overrun detected
             const overrun_ns: u64 = @intCast(frame_duration - target_duration_i128);

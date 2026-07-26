@@ -6,11 +6,31 @@
 	],
 	"settings": {
 		"cSpell.enabled": false,
+		"files.exclude": {
+			"**/node_modules/**": true,
+      "**/.zig-cache/**": true,
+			"**/zig-pkg/**": true,
+			"**/zig-cache*/**": true,
+		},
 		"files.watcherExclude": {
+			"**/node_modules/**": true,
+      "**/.zig-cache/**": true,
+			"**/zig-pkg/**": true,
+			"**/zig-cache*/**": true,
 			"**/.git/objects/**": true,
 			"**/.git/subtree-cache/**": true,
 			"**/.hg/store/**": true,
 			"**/build/_deps/**": true
-		}
+		},
+		"claudeCode.allowDangerouslySkipPermissions": true,
+    "claudeCode.initialPermissionMode": "bypassPermissions",
+		"files.associations": {
+      "VERSION": "plaintext",
+      ".local-gitignore": "gitignore",
+      ".github/workflows/exempt.txt": "gitignore"
+    },
+		"terminal.integrated.automationProfile.windows": {
+      "path": "C:\\windows\\system32\\cmd.exe",
+    },
 	}
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const time = @import("time.zig");
@@ -14,14 +15,19 @@ pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 
+// 0.16 removed the process-global environment accessors; the environment block
+// is handed to `main` instead. `setEnviron` records it so the debug check below
+// keeps working without an allocator.
+var vlc_environ: std.process.Environ = .empty;
+
+pub fn setEnviron(environ: std.process.Environ) void {
+    vlc_environ = environ;
+}
+
 // Check if VLC debug mode is enabled via environment variable
 fn isVlcDebugEnabled() bool {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "DEBUG_VLC")) |value| {
-        defer std.heap.page_allocator.free(value);
-        return std.mem.eql(u8, value, "1");
-    } else |_| {
-        return false;
-    }
+    const value = vlc_environ.getPosix("DEBUG_VLC") orelse return false;
+    return std.mem.eql(u8, value, "1");
 }
 
 // Debug print function that only prints if DEBUG_VLC=1
@@ -31,11 +37,11 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
+pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     std.debug.print("Starting VLC run mode...\n", .{});
 
     // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8){};
+    var cmd_parts = std.ArrayList(u8).empty;
     defer cmd_parts.deinit(allocator);
 
     var playtime_buf: [maxbufsz]u8 = undefined;
@@ -44,10 +50,10 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
     var filename: []const u8 = "(No media)";
 
     // Initialize frame timer for real-time operation
-    var timer = frame_timer.FrameTimer.init(4.0); // 5 FPS target to match server
+    var timer = frame_timer.FrameTimer.init(io, 4.0); // 5 FPS target to match server
 
     // Initialize VLC player
-    var player = VlcPlayer.init(allocator);
+    var player = VlcPlayer.init(io, allocator);
     defer player.deinit();
 
     while (true) {
@@ -80,7 +86,7 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
 
         // Interpolate play time if playing
         if (player.state.run_status == .Playing and player.last_message_time > 0) {
-            const now = std.time.milliTimestamp();
+            const now = time.nowMillis(io);
             const last_msg_i64: i64 = @intCast(player.last_message_time);
             const elapsed = now - last_msg_i64;
             const elapsed_u: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
@@ -120,7 +126,7 @@ pub fn runVlcClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atom
         protocol.sendUnitDisplayCmd(allocator, port, 1, cmd2_slice) catch |err| return err;
 
         // Handle frame timing and sleep
-        timer.frameEnd();
+        try timer.frameEnd();
     }
 }
 
@@ -151,9 +157,10 @@ pub const VlcPlayerState = struct {
 };
 
 pub const VlcPlayer = struct {
+    io: Io,
     allocator: std.mem.Allocator,
     state: VlcPlayerState,
-    socket: ?std.posix.socket_t,
+    socket: ?Io.net.Socket,
     last_update_time: i64,
     last_processed_ts: u64,
     last_vlc_time: u64,
@@ -162,10 +169,13 @@ pub const VlcPlayer = struct {
     const Self = @This();
     const MULTICAST_ADDR = "239.255.0.100";
     const MULTICAST_PORT = 8888;
+    /// How long to wait for a datagram before concluding none are pending.
+    const RECV_TIMEOUT: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
 
     /// Initialize a new VlcPlayer instance
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(io: Io, allocator: std.mem.Allocator) Self {
         return Self{
+            .io = io,
             .allocator = allocator,
             .state = VlcPlayerState.init(allocator),
             .socket = null,
@@ -180,7 +190,7 @@ pub const VlcPlayer = struct {
     pub fn deinit(self: *Self) void {
         self.state.deinit(self.allocator);
         if (self.socket) |sock| {
-            std.posix.close(sock);
+            sock.close(self.io);
         }
     }
 
@@ -197,13 +207,12 @@ pub const VlcPlayer = struct {
 
         while (true) {
             var buffer: [1024]u8 = undefined;
-            var addr: std.net.Address = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
 
-            const result = std.posix.recvfrom(self.socket.?, &buffer, 0, &addr.any, &addr_len);
+            const result = self.socket.?.receiveTimeout(self.io, &buffer, Self.RECV_TIMEOUT);
 
-            if (result) |bytes_read| {
-                const message = self.allocator.dupe(u8, buffer[0..bytes_read]) catch {
+            if (result) |incoming| {
+                const bytes_read = incoming.data.len;
+                const message = self.allocator.dupe(u8, incoming.data) catch {
                     std.debug.print("VLC: Failed to allocate memory for message\n", .{});
                     continue;
                 };
@@ -234,7 +243,7 @@ pub const VlcPlayer = struct {
                 latest_server_ts_ms = server_ts_ms;
                 latest_bytes = bytes_read;
             } else |err| switch (err) {
-                error.WouldBlock => {
+                error.Timeout => {
                     // No more messages
                     break;
                 },
@@ -250,7 +259,7 @@ pub const VlcPlayer = struct {
         if (latest_message) |message| {
             defer self.allocator.free(message);
 
-            const now_ms = std.time.milliTimestamp();
+            const now_ms = time.nowMillis(self.io);
 
             // Parse and process the latest message
             var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
@@ -291,42 +300,52 @@ pub const VlcPlayer = struct {
     fn connectMulticast(self: *Self) !void {
         std.debug.print("Creating UDP socket for VLC status multicast...\n", .{});
 
-        // Create UDP socket
-        self.socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, 0);
-        errdefer if (self.socket) |sock| std.posix.close(sock);
+        // `IpAddress.bind` would create and bind the socket in one step, but it
+        // offers no way to set SO_REUSEADDR/SO_REUSEPORT, which must be applied
+        // *before* bind so several receivers can share the multicast port. So
+        // create the socket by hand and wrap the fd in an `Io.net.Socket`.
+        const linux = std.os.linux;
+        const sock_fd: std.posix.socket_t = blk: {
+            const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.SocketCreateFailed;
+            break :blk @intCast(rc);
+        };
+        errdefer _ = linux.close(sock_fd);
 
         std.debug.print("VLC: Socket created successfully\n", .{});
 
-        // Set receive timeout
-        const timeout = std.posix.timeval{
-            .sec = 0,
-            .usec = 100_000, // 100ms
-        };
-        try std.posix.setsockopt(self.socket.?, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
-
         // Allow multiple sockets to bind to the same port
-        try std.posix.setsockopt(self.socket.?, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try std.posix.setsockopt(self.socket.?, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+        try std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
 
         // Bind to the multicast port
-        const bind_address = try std.net.Address.parseIp("0.0.0.0", Self.MULTICAST_PORT);
-        try std.posix.bind(self.socket.?, &bind_address.any, bind_address.getOsSockLen());
+        const bind_address: Io.net.IpAddress = try .parse("0.0.0.0", Self.MULTICAST_PORT);
+        var sa: linux.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, Self.MULTICAST_PORT),
+            .addr = 0, // INADDR_ANY
+        };
+        if (linux.errno(linux.bind(sock_fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+            return error.BindFailed;
+        }
+
+        // The receive timeout that used to be set via SO_RCVTIMEO is now passed
+        // per-call to `receiveTimeout`.
+        const sock: Io.net.Socket = .{ .handle = sock_fd, .address = bind_address };
+        self.socket = sock;
 
         std.debug.print("VLC: Bound to 0.0.0.0:{}\n", .{Self.MULTICAST_PORT});
 
         // Join the multicast group using raw socket options
-        const multicast_addr = try std.net.Address.parseIp(Self.MULTICAST_ADDR, Self.MULTICAST_PORT);
+        const multicast_addr: Io.net.IpAddress = try .parse(Self.MULTICAST_ADDR, Self.MULTICAST_PORT);
 
         // Create the ip_mreq structure manually
         var mreq: [8]u8 = undefined; // ip_mreq is 8 bytes
-        // imr_multiaddr (first 4 bytes) - multicast group address
-        const group_addr = std.mem.nativeToLittle(u32, multicast_addr.in.sa.addr);
-        @memcpy(mreq[0..4], std.mem.asBytes(&group_addr));
+        // imr_multiaddr (first 4 bytes) - multicast group address, network byte order
+        @memcpy(mreq[0..4], &multicast_addr.ip4.bytes);
         // imr_interface (next 4 bytes) - interface address (INADDR_ANY)
-        const iface_addr = std.mem.nativeToLittle(u32, 0); // INADDR_ANY
-        @memcpy(mreq[4..8], std.mem.asBytes(&iface_addr));
+        @memset(mreq[4..8], 0);
 
-        try std.posix.setsockopt(self.socket.?, std.posix.IPPROTO.IP, std.os.linux.IP.ADD_MEMBERSHIP, &mreq);
+        try std.posix.setsockopt(sock.handle, std.posix.IPPROTO.IP, std.os.linux.IP.ADD_MEMBERSHIP, &mreq);
 
         std.debug.print("VLC: Joined multicast group {s}\n", .{Self.MULTICAST_ADDR});
     }

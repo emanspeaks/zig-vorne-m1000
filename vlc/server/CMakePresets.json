@@ -6,7 +6,7 @@
             "displayName": "Windows x64 MinGW",
             "description": "Windows x64 using MinGW",
             "binaryDir": "${sourceDir}/build",
-            "generator": "MinGW Makefiles",
+            "generator": "Ninja",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_DLLTOOL": "C:/msys64/ucrt64/bin/dlltool",

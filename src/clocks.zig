@@ -1,17 +1,18 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const time = @import("time.zig");
 const config = @import("config.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const Mode = @import("mode.zig").Mode;
 
-pub fn runClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
+pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8){};
+    var cmd_parts = std.ArrayList(u8).empty;
     defer cmd_parts.deinit(allocator);
 
     var last_full_update_utc: i64 = 0;
-    var zi = time.getTimezoneInfo();
+    var zi = time.getTimezoneInfo(io);
     var line1_buf: [20]u8 = undefined;
     var line2_buf: [20]u8 = undefined;
     var msg1_buf: [128]u8 = undefined;
@@ -39,7 +40,7 @@ pub fn runClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.
         cmd_parts.clearAndFree(allocator);
 
         // Get current local timestamp
-        const utc_timestamp = std.time.timestamp();
+        const utc_timestamp = time.nowSeconds(io);
         const timestamp = utc_timestamp + zi.offset_sec;
         const seconds = @mod(timestamp, 60);
 
@@ -48,11 +49,11 @@ pub fn runClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.
             const display_str = time.formatRandyTimestamp(timestamp, &line1_buf, &zi) catch unreachable;
             const time_cmd_str = std.fmt.bufPrint(&msg1_buf, "{s}{s}", .{ protocol.ESC ++ "C", display_str }) catch unreachable;
             try cmd_parts.appendSlice(allocator, time_cmd_str);
-            zi = time.getTimezoneInfo();
+            zi = time.getTimezoneInfo(io);
             last_full_update_utc = utc_timestamp;
 
             // Load countdown configuration from JSON
-            line2_config = config.loadCountdownConfig(allocator);
+            line2_config = config.loadCountdownConfig(io, allocator);
         } else {
             // Just update the ones place of seconds (column 19, assuming format "25Au06W200/20:37:13D")
             const ones_digit = @as(u8, @intCast(@mod(seconds, 10))) + '0';
@@ -95,6 +96,6 @@ pub fn runClocks(allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.
         protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_slice) catch |err| return err;
 
         // Sleep until next second
-        std.Thread.sleep(0.5 * std.time.ns_per_s);
+        try io.sleep(.fromMilliseconds(500), .awake);
     }
 }

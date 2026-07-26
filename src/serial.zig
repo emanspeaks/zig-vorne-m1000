@@ -1,11 +1,12 @@
 const std = @import("std");
+const Io = std.Io;
 const linux = std.os.linux;
 
 pub const SerialPort = struct {
     fd: linux.fd_t,
 
-    pub fn open(path: []const u8, allocator: std.mem.Allocator) !*SerialPort {
-        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+    pub fn open(io: Io, path: []const u8, allocator: std.mem.Allocator) !*SerialPort {
+        const file = Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => {
                 std.debug.print("Device {s} not found.\n", .{path});
                 return err;
