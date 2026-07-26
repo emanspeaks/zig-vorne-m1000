@@ -18,3 +18,5 @@ desync
 EWMA
 
 bool
+rtt
+unparseable

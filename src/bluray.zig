@@ -451,8 +451,13 @@ pub fn setDisplayLead(io: Io, value: i64) void {
 /// a time).
 pub const Snapshot = struct {
     run_status: BlurayPlayerRunStatus = .Stopped,
-    /// Last value the player actually reported.
-    play_time_seconds: u32 = 0,
+    /// Last value the player actually reported, round-trip compensated (see
+    /// `BlurayPlayer.getStatus`) but not yet including `display_lead_ms`.
+    /// Milliseconds, not whole seconds, specifically so that compensation
+    /// keeps its sub-second remainder all the way to `playTimeMillisLeadBy`
+    /// instead of it being floored away before `display_lead_ms` is even
+    /// applied.
+    play_time_ms: i64 = 0,
     /// When the player last answered. Requests fail while it is busy -- trick
     /// play especially -- so a snapshot can be seconds old without anything
     /// looking wrong about it.
@@ -484,7 +489,7 @@ pub const Snapshot = struct {
     /// of whatever the live value is currently tuned to.
     fn playTimeMillisLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) i64 {
         _ = now_ms;
-        return @as(i64, self.play_time_seconds) * std.time.ms_per_s + lead_ms;
+        return self.play_time_ms + lead_ms;
     }
 
     /// The whole second the player is showing.
@@ -709,13 +714,14 @@ fn pollLoop(
 }
 
 pub const BlurayPlayerState = struct {
-    play_time_seconds: u32,
+    /// Round-trip compensated, in milliseconds -- see `Snapshot.play_time_ms`.
+    play_time_ms: i64,
     run_status: BlurayPlayerRunStatus,
     is_standby: bool,
 
     pub fn init() BlurayPlayerState {
         return BlurayPlayerState{
-            .play_time_seconds = 0,
+            .play_time_ms = 0,
             .run_status = .Stopped,
             .is_standby = true,
         };
@@ -820,8 +826,9 @@ pub const BlurayPlayer = struct {
         run_status: BlurayPlayerRunStatus,
         /// Compensated for the round trip already elapsed by the time this is
         /// in hand -- see `getStatus`. This is what feeds `state` and, from
-        /// there, the display.
-        play_time_seconds: u32,
+        /// there, the display. Milliseconds, not whole seconds -- see
+        /// `Snapshot.play_time_ms` for why the remainder matters.
+        play_time_ms: i64,
         /// Exactly what the CGI returned, before compensation. Kept only for
         /// the log line, so the correction itself stays checkable against
         /// real hardware rather than being silently baked in.
@@ -840,12 +847,12 @@ pub const BlurayPlayer = struct {
         };
 
         self.state.run_status = sample.run_status;
-        self.state.play_time_seconds = sample.play_time_seconds;
+        self.state.play_time_ms = sample.play_time_ms;
         self.state.is_standby = sample.is_standby;
         self.last_update_time = sample.sample_ms;
 
-        std.debug.print("poll: reported={d} position={d} status={s} rtt={d}ms\n", .{
-            sample.reported_play_time_seconds, sample.play_time_seconds, @tagName(sample.run_status), sample.rtt_ms,
+        std.debug.print("poll: reported={d} position={d}ms status={s} rtt={d}ms\n", .{
+            sample.reported_play_time_seconds, sample.play_time_ms, @tagName(sample.run_status), sample.rtt_ms,
         });
     }
 
@@ -853,7 +860,7 @@ pub const BlurayPlayer = struct {
     pub fn snapshot(self: *const Self) Snapshot {
         return .{
             .run_status = self.state.run_status,
-            .play_time_seconds = self.state.play_time_seconds,
+            .play_time_ms = self.state.play_time_ms,
             .sampled_ms = self.last_update_time,
         };
     }
@@ -903,7 +910,7 @@ pub const BlurayPlayer = struct {
         const play_time = std.fmt.parseInt(u32, parsed[1], 10) catch 0;
 
         if (play_time == std.math.maxInt(u32) - 1) { // -2 becomes maxInt-1 when parsed as u32
-            return .{ .sample_ms = sample_ms, .rtt_ms = rtt_ms, .run_status = .Stopped, .play_time_seconds = 0, .reported_play_time_seconds = 0, .is_standby = true };
+            return .{ .sample_ms = sample_ms, .rtt_ms = rtt_ms, .run_status = .Stopped, .play_time_ms = 0, .reported_play_time_seconds = 0, .is_standby = true };
         }
 
         // By the time this response is in hand, roughly `rtt_ms` of real time
@@ -913,17 +920,20 @@ pub const BlurayPlayer = struct {
         // to respond". A rough correction (this is a whole round trip, not
         // the midpoint) but a strictly one-sided bias, unlike jitter, so
         // leaving it uncorrected means the display is *always* behind, never
-        // just occasionally imprecise.
-        const play_time_seconds = if (play_state == .Playing)
-            play_time +| @as(u32, @intCast(@divFloor(rtt_ms, 1000)))
-        else
-            play_time;
+        // just occasionally imprecise. In milliseconds, not floored to whole
+        // seconds: an earlier version added `rtt_ms / 1000` (integer
+        // division) onto a whole-second value, which silently discarded
+        // rtt_ms's sub-second remainder every single poll -- up to 999 ms of
+        // real compensation, thrown away before `display_lead_ms` ever saw
+        // it.
+        const play_time_ms: i64 = @as(i64, play_time) * std.time.ms_per_s +
+            (if (play_state == .Playing) rtt_ms else 0);
 
         return .{
             .sample_ms = sample_ms,
             .rtt_ms = rtt_ms,
             .run_status = play_state,
-            .play_time_seconds = play_time_seconds,
+            .play_time_ms = play_time_ms,
             .reported_play_time_seconds = play_time,
             .is_standby = play_state == .Stopped,
         };
@@ -1095,10 +1105,10 @@ pub const BlurayPlayer = struct {
 
 test "playTimeSeconds and playTimeMillis show exactly the last reported value" {
     // No interpolation: whatever wall-clock instant this is evaluated at, the
-    // answer is the same until a fresh poll actually changes `play_time_seconds`.
+    // answer is the same until a fresh poll actually changes `play_time_ms`.
     const snap: Snapshot = .{
         .run_status = .Playing,
-        .play_time_seconds = 100,
+        .play_time_ms = 100_000,
         .sampled_ms = 50_000,
     };
 
@@ -1108,10 +1118,30 @@ test "playTimeSeconds and playTimeMillis show exactly the last reported value" {
     try std.testing.expectEqual(@as(i64, 100_000), snap.playTimeMillis(50_400));
 }
 
+test "a sub-second remainder in play_time_ms survives to playTimeSeconds" {
+    // Regression test: round-trip compensation used to be added as whole
+    // seconds (`rtt_ms / 1000`, integer division) onto an already-whole-second
+    // value, which silently discarded rtt_ms's remainder -- up to 999 ms of
+    // real compensation, every single poll. `play_time_ms` is milliseconds
+    // specifically so a remainder like this one survives to
+    // `playTimeMillisLeadBy` instead of being floored away first.
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .play_time_ms = 100_700, // e.g. reported=100, rtt_ms=700
+        .sampled_ms = 50_000,
+    };
+    try std.testing.expectEqual(@as(i64, 100_700), snap.playTimeMillis(50_000));
+    try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(50_000));
+    // A 400 ms lead pushes the 700 ms remainder over the next second
+    // boundary -- exactly the kind of crossing a floored remainder could
+    // never reach on its own.
+    try std.testing.expectEqual(@as(i64, 101_100), snap.playTimeMillisLeadBy(50_000, 400));
+}
+
 test "a paused or stopped snapshot still shows the last reported second" {
     const paused: Snapshot = .{
         .run_status = .Paused,
-        .play_time_seconds = 1234,
+        .play_time_ms = 1_234_000,
         .sampled_ms = 50_000,
     };
     try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(50_000));
@@ -1121,7 +1151,7 @@ test "a paused or stopped snapshot still shows the last reported second" {
 test "positionIsLive reflects freshness of the last poll, not lock state" {
     const fresh: Snapshot = .{
         .run_status = .Playing,
-        .play_time_seconds = 77,
+        .play_time_ms = 77_000,
         .sampled_ms = 50_000,
     };
     try std.testing.expect(fresh.positionIsLive(50_000));
@@ -1183,7 +1213,7 @@ test "setDisplayLead applies to the running process immediately" {
 test "display_lead_ms shifts the displayed position, applied at the end and nowhere else" {
     const snap: Snapshot = .{
         .run_status = .Playing,
-        .play_time_seconds = 100,
+        .play_time_ms = 100_000,
         .sampled_ms = 50_000,
     };
 
@@ -1202,7 +1232,7 @@ test "playTimeMillis is wired to the live display_lead_ms" {
     // that the LeadBy helper computes the right formula in isolation.
     const snap: Snapshot = .{
         .run_status = .Playing,
-        .play_time_seconds = 100,
+        .play_time_ms = 100_000,
         .sampled_ms = 50_000,
     };
     const lead = display_lead_ms.load(.acquire);
