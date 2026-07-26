@@ -606,8 +606,19 @@ pub const Snapshot = struct {
     /// perfectly usable the whole time. A poll landing every second or so
     /// without smooth extrapolation between them is a worse position signal
     /// than a locked one, but a much better one than nothing.
+    ///
+    /// `.Paused` counts as live too, deliberately, not just `.Playing`.
+    /// `playTimeMillisLeadBy` already returns the frozen last-polled value
+    /// whenever `run_status != .Playing` -- so a paused position never
+    /// extrapolates forward, it just stays put -- and a frozen-but-known
+    /// position is exactly as valid a cue-lookup key as a moving one.
+    /// Blanking line 2 on pause (the previous behavior) threw away a
+    /// perfectly good, unambiguous position and, worse, interrupted a
+    /// message mid-read the moment someone paused to read it; a scrolling
+    /// cue should keep sweeping through a pause too, since the sweep is
+    /// driven by wall-clock time, not play position.
     pub fn positionIsLive(self: Snapshot, now_ms: i64) bool {
-        return self.run_status == .Playing and
+        return (self.run_status == .Playing or self.run_status == .Paused) and
             now_ms - self.sampled_ms <= stale_position_ms;
     }
 
