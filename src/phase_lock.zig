@@ -184,7 +184,12 @@ pub const PhaseLock = struct {
     /// stalling the display until a new bracket turns up.
     fn rebase(self: *PhaseLock, sample_ms: i64, value_sec: u32) void {
         self.drop();
-        self.anchor_ms = sample_ms;
+        // The counter reached `value_sec` at some point in the second *before*
+        // the sample, uniformly distributed, so the expected edge is half a
+        // second back. Anchoring on the sample instant instead would bias every
+        // rebase late by that half second, and since the display jumps by the
+        // size of the correction, a biased rebase can skip a short cue outright.
+        self.anchor_ms = sample_ms - 500;
         self.anchor_sec = value_sec;
         // The value is right; where inside the second it changes is not known.
         self.anchor_err_ms = 500;

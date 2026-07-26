@@ -57,6 +57,31 @@ pub const CueList = struct {
         child.destroy(self.arena);
     }
 
+    /// The next instant after `t_ms` at which the displayed cue changes: the
+    /// start of the next cue, or the end of one currently showing.
+    ///
+    /// Lets the display loop be woken exactly when a cue is due instead of
+    /// noticing it on some later poll of the clock. That matters most for the
+    /// short warning cues, which are often only a second long: sampling on any
+    /// fixed interval risks stepping straight over one, and a warning that
+    /// never appears is worse than one that appears slightly late.
+    pub fn nextBoundaryMs(self: CueList, t_ms: i64) ?i64 {
+        var soonest: ?i64 = null;
+        for (self.cues) |cue| {
+            // Sorted by start, so once a cue starts later than the best
+            // candidate so far, neither it nor anything after it can improve.
+            if (soonest) |best| {
+                if (cue.start_ms >= best) break;
+            }
+            if (cue.start_ms > t_ms) {
+                soonest = cue.start_ms;
+            } else if (cue.end_ms > t_ms) {
+                soonest = if (soonest) |best| @min(best, cue.end_ms) else cue.end_ms;
+            }
+        }
+        return soonest;
+    }
+
     /// The cue covering `t_ms`, or null when there is none.
     ///
     /// Overlapping cues are legal in WebVTT but meaningless on a single line,
@@ -390,6 +415,66 @@ test "at covers the half-open interval and the gaps between cues" {
     try testing.expectEqual(@as(?Cue, null), list.at(20_000));
     try testing.expectEqualStrings("SECOND", list.at(35_000).?.text);
     try testing.expectEqual(@as(?Cue, null), list.at(40_000));
+}
+
+test "nextBoundaryMs lands on every cue edge, including short warnings" {
+    // The real shape: three one-second warnings running straight into the cue.
+    // Driving the loop off these boundaries has to visit each of them, or a
+    // warning gets stepped over entirely and never appears.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:09:14.000 --> 00:09:15.000\n***1m7a War Room\n" ++
+        "00:09:15.000 --> 00:09:16.000\n**1m7a War Room\n" ++
+        "00:09:16.000 --> 00:09:17.000\n*1m7a War Room\n" ++
+        "00:09:17.000 --> 00:09:56.000\n1m7a War Room\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    // From well before, the first thing due is the first cue starting.
+    try testing.expectEqual(@as(?i64, 554_000), list.nextBoundaryMs(0).?);
+
+    // Walking boundary to boundary must hit all four starts in order.
+    var t: i64 = 0;
+    var seen: [4][]const u8 = undefined;
+    for (0..4) |i| {
+        t = list.nextBoundaryMs(t).?;
+        seen[i] = list.at(t).?.text;
+    }
+    try testing.expectEqualStrings("***1m7a War Room", seen[0]);
+    try testing.expectEqualStrings("**1m7a War Room", seen[1]);
+    try testing.expectEqualStrings("*1m7a War Room", seen[2]);
+    try testing.expectEqualStrings("1m7a War Room", seen[3]);
+}
+
+test "nextBoundaryMs reports the end of a cue when nothing follows it" {
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:10.000 --> 00:00:20.000\nONLY\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    try testing.expectEqual(@as(?i64, 10_000), list.nextBoundaryMs(0).?);
+    // Mid-cue, the next change is the line going blank at its end.
+    try testing.expectEqual(@as(?i64, 20_000), list.nextBoundaryMs(15_000).?);
+    // Past everything there is nothing left to wake for.
+    try testing.expectEqual(@as(?i64, null), list.nextBoundaryMs(20_000));
+}
+
+test "nextBoundaryMs picks a gap's end before a later cue's start" {
+    // A cue that ends before the next one begins: the blanking in between is
+    // itself a change the display has to be woken for.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:10.000 --> 00:00:12.000\nFIRST\n\n" ++
+        "00:00:30.000 --> 00:00:40.000\nSECOND\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    try testing.expectEqual(@as(?i64, 12_000), list.nextBoundaryMs(11_000).?);
+    try testing.expectEqual(@as(?i64, 30_000), list.nextBoundaryMs(12_000).?);
 }
 
 test "NOTE blocks and their contents never reach the display" {

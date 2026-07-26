@@ -198,6 +198,47 @@ fn parseTZifFile(io: Io, file: Io.File) ?zoneinfo {
     return null;
 }
 
+/// A timezone offset shared between a background refresher and a loop that
+/// cannot afford to go and work it out itself.
+///
+/// `getTimezoneInfo` opens and parses `/etc/localtime`. That is file I/O, and a
+/// render loop with frame deadlines has no business doing it -- but the offset
+/// still has to be re-read periodically or a DST change needs a restart. So a
+/// background thread refreshes this and the render loop only ever does one
+/// atomic load.
+///
+/// Both fields live in a single atomic word so a reader can never see the
+/// offset from one reading paired with the DST flag from another.
+pub const SharedZone = struct {
+    packed_value: std.atomic.Value(u64),
+
+    /// How often the refreshing thread should call `store`.
+    pub const refresh_interval_ms: i64 = 10_000;
+
+    pub fn init(zi: zoneinfo) SharedZone {
+        return .{ .packed_value = .init(pack(zi)) };
+    }
+
+    pub fn load(self: *const SharedZone) zoneinfo {
+        return unpack(self.packed_value.load(.acquire));
+    }
+
+    pub fn store(self: *SharedZone, zi: zoneinfo) void {
+        self.packed_value.store(pack(zi), .release);
+    }
+
+    fn pack(zi: zoneinfo) u64 {
+        return @as(u64, @as(u32, @bitCast(zi.offset_sec))) | (@as(u64, zi.is_dst) << 32);
+    }
+
+    fn unpack(value: u64) zoneinfo {
+        return .{
+            .offset_sec = @bitCast(@as(u32, @truncate(value))),
+            .is_dst = @truncate(value >> 32),
+        };
+    }
+};
+
 /// Local wall clock, with the zone offset cached.
 ///
 /// `getTimezoneInfo` re-parses `/etc/localtime` on every call, which is far too
@@ -391,6 +432,30 @@ pub fn timestampToYmdhms(timestamp: i64) Ymdhms {
         .minute = @intCast(minutes),
         .second = @intCast(secs),
     };
+}
+
+test "SharedZone round-trips both fields in one atomic word" {
+    // Packing exists so a reader cannot pair the offset from one reading with
+    // the DST flag from another; the round trip has to be exact for that to be
+    // worth anything, negative offsets included.
+    for ([_]zoneinfo{
+        .{ .offset_sec = 0, .is_dst = 0 },
+        .{ .offset_sec = -6 * 3600, .is_dst = 0 }, // CST
+        .{ .offset_sec = -5 * 3600, .is_dst = 1 }, // CDT
+        .{ .offset_sec = 14 * 3600, .is_dst = 0 }, // the far end of the range
+        .{ .offset_sec = -12 * 3600, .is_dst = 1 },
+    }) |zi| {
+        var shared: SharedZone = .init(zi);
+        const got = shared.load();
+        try std.testing.expectEqual(zi.offset_sec, got.offset_sec);
+        try std.testing.expectEqual(zi.is_dst, got.is_dst);
+
+        // And again after a store, which is the path the refresher uses.
+        shared.store(.{ .offset_sec = 3600, .is_dst = 1 });
+        const after = shared.load();
+        try std.testing.expectEqual(@as(i32, 3600), after.offset_sec);
+        try std.testing.expectEqual(@as(u8, 1), after.is_dst);
+    }
 }
 
 test "ymdhmsToTimestamp" {

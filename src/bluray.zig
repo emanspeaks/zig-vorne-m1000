@@ -28,6 +28,20 @@ pub const CUE_STAT_INTERVAL_MS: i64 = 1000;
 /// notices a mode change; the poll cadence itself comes from the phase lock.
 const POLL_THREAD_SLICE_MS: i64 = 50;
 
+/// How often the cue thread checks the file and, less often, the timezone.
+/// Also bounds how quickly it notices a mode change.
+const CUE_THREAD_SLICE_MS: i64 = 200;
+
+/// A render pass later than this past its scheduled wake is reported.
+///
+/// The display loop is treated as a real-time task: every wake exists because
+/// something is due on screen at that instant, so being late is a defect rather
+/// than a slow frame. Nothing on the loop should be able to cause one -- all
+/// file and network I/O is on other threads -- which makes a report here a
+/// signal that something has crept back on, or that the serial write is
+/// colliding with the next deadline.
+const DEADLINE_SLACK_MS: i64 = 12;
+
 /// Ceiling on how long the display loop sleeps when it has nothing scheduled.
 ///
 /// The two clocks on line 1 are woken for exactly: the loop sleeps until the
@@ -35,6 +49,11 @@ const POLL_THREAD_SLICE_MS: i64 = 50;
 /// only bounds the latency of everything not modelled that way -- a scroll
 /// step, a cue boundary, a mode change.
 const DISPLAY_IDLE_SLICE_MS: i64 = 25;
+
+/// How old a snapshot may be before its play position stops being trusted for
+/// cue lookup. Long enough to ride out a couple of failed polls, short enough
+/// that a message cannot sit on screen after playback has moved on.
+const stale_position_ms: i64 = 2500;
 
 pub fn runBlurayClocks(
     io: Io,
@@ -64,36 +83,49 @@ pub fn runBlurayClocks(
     var line2buf: [maxbufsz]u8 = undefined;
     var playtime: u32 = 0;
 
-    // Time of day, shown at the left of line 1. Owns the cached zone offset.
-    var clock = time.LocalClock.init(io);
 
-    // Line 2 comes from the cue file chosen on the web page. It is reloaded
-    // when the selection changes -- which `generation` reports with a single
-    // atomic load, cheap enough to check every frame -- and when the file
-    // itself is edited, which costs one stat per second.
+    // Line 2 comes from the cue file chosen on the web page. The file is
+    // watched and parsed on the cue thread; what arrives here is a ready-made
+    // list, collected with one atomic load per frame.
     var cue_list: ?webvtt.CueList = null;
     defer if (cue_list) |list| list.deinit();
-    var loaded_generation: u64 = 0;
-    var name_buf: [cues.max_name_len]u8 = undefined;
-    var loaded_name_len: usize = 0;
-    var loaded_print: ?cues.Fingerprint = null;
-    var next_stat_ms: i64 = 0;
 
     // Sweeps line 2 back and forth when the message is wider than the display.
     var scroller: Marquee = .{};
 
-    // The player is polled on its own thread. It must not happen here: a poll
-    // costs a round trip, and the phase lock deliberately schedules its polls
-    // either side of the player's tick edge, which is exactly the instant this
-    // loop needs to be redrawing. Polling inline made every tick land a round
-    // trip late no matter how accurate the lock itself was.
+    // The selected file's name, shown on line 2 while cues are disarmed.
+    var name_buf: [cues.max_name_len]u8 = undefined;
+    var name_len: usize = 0;
+    var seen_generation: u64 = 0;
+
+    // Everything that can block for an unbounded time runs on its own thread,
+    // so that this loop only ever does arithmetic, a memcmp and one serial
+    // write. It is a real-time task: each wake exists because something is due
+    // on screen at that instant, and there is no catching up afterwards.
+    //
+    //   * the player is polled on `pollLoop`. A poll costs a round trip, and
+    //     the phase lock deliberately schedules its polls either side of the
+    //     player's tick edge -- exactly when this loop needs to be redrawing.
+    //   * the cue file is watched and parsed on `cueLoop`, along with the
+    //     timezone. Both are file I/O, and a cue file arrives whenever it
+    //     happens to be saved.
     var cell: SnapshotCell = .{};
-    var stop_poller = std.atomic.Value(bool).init(false);
-    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, &stop_poller });
+    var cue_cell: CueCell = .{};
+    defer cue_cell.deinit();
+    var zone: time.SharedZone = .init(time.getTimezoneInfo(io));
+
+    var stop_workers = std.atomic.Value(bool).init(false);
+    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, &stop_workers });
+    const cue_thread = try std.Thread.spawn(.{}, cueLoop, .{ io, allocator, cue_state, &cue_cell, &zone, &stop_workers });
     defer {
-        stop_poller.store(true, .release);
+        stop_workers.store(true, .release);
         poller.join();
+        cue_thread.join();
     }
+
+    // What the previous pass scheduled, so lateness can be reported.
+    var due_ms: i64 = 0;
+    var late_frames: u32 = 0;
 
     while (true) {
         // Check for shutdown signal
@@ -136,56 +168,30 @@ pub fn runBlurayClocks(
         // the field it sits in: `copyLeftJustify` pads a wider field by
         // shifting the rest of the line right, which would push the line past
         // 20 columns. `clearVorneLineBuf` already blanked the gap.
-        const clock_str = clock.formatNow(io, &clock_buf) catch unreachable;
+        // Time of day, from the offset the cue thread keeps refreshed. Working
+        // it out here would mean parsing `/etc/localtime` on a loop that has
+        // deadlines to meet.
+        const local_ms = now_ms + @as(i64, zone.load().offset_sec) * std.time.ms_per_s;
+        const clock_str = time.formatClock(@divFloor(local_ms, std.time.ms_per_s), &clock_buf) catch unreachable;
         try str_utils.copyLeftJustify(&linebuf, clock_str, @min(clock_str.len, 20 -| playtime_str.len), null);
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
 
-        // Pick up a cue file the moment the web page selects a different one,
-        // and pick up edits to the file that is already showing.
-        const generation = cue_state.generation.load(.acquire);
-        const selection_changed = generation != loaded_generation;
-        if (selection_changed) {
-            loaded_generation = generation;
+        // Collect a cue file the cue thread has finished parsing. One atomic
+        // load on almost every pass; the pointer swap and the arena free only
+        // happen when the selection changes or the file is edited.
+        if (cue_cell.take()) |fresh| {
             if (cue_list) |list| list.deinit();
-            cue_list = null;
-            loaded_print = null;
-            loaded_name_len = 0;
-            next_stat_ms = 0;
-            if (cue_state.currentName(&name_buf)) |name| loaded_name_len = name.len;
+            cue_list = fresh;
         }
 
-        if (loaded_name_len > 0) {
-            if (now_ms >= next_stat_ms) {
-                next_stat_ms = now_ms + CUE_STAT_INTERVAL_MS;
-                const name = name_buf[0..loaded_name_len];
-
-                // A file that cannot be stat'ed -- deleted, or a temporary
-                // being renamed into place by an editor -- is left alone. The
-                // next check picks it up, and the cues already in memory beat a
-                // blank line in the meantime.
-                if (cues.fingerprint(io, name)) |current| {
-                    // Load on the first pass, and thereafter only when the file
-                    // has actually changed on disk, so editing it while a disc
-                    // is running takes effect within a second.
-                    const stale = if (loaded_print) |previous| !previous.eql(current) else true;
-                    if (stale) {
-                        if (cues.load(io, allocator, name)) |fresh| {
-                            if (cue_list) |list| list.deinit();
-                            cue_list = fresh;
-                        } else |err| {
-                            // Keep whatever was already on screen: a briefly
-                            // broken file is normal while editing, and blanking
-                            // line 2 mid-movie over a typo is worse than
-                            // showing stale cues until the next save.
-                            std.debug.print("Failed to load cue file {s}: {}\n", .{ name, err });
-                        }
-                        // Recorded either way, so a file that fails to parse is
-                        // not re-read every second until it is saved again.
-                        loaded_print = current;
-                    }
-                }
-            }
+        // The selected file's name, kept only to show while disarmed. Re-read
+        // just when it changes, so the common pass takes no lock at all.
+        const generation = cue_state.generation.load(.acquire);
+        if (generation != seen_generation) {
+            seen_generation = generation;
+            name_len = 0;
+            if (cue_state.currentName(&name_buf)) |name| name_len = name.len;
         }
 
         // Line 2: the message due at the current play position, but only once
@@ -197,18 +203,23 @@ pub fn runBlurayClocks(
         // instant it appears, not a sweep later.
         var may_scroll = true;
         const line2: []const u8 = if (cue_state.isArmed()) blk: {
-            // A stopped player has no meaningful position. A paused one holds
-            // its last position, so the cue on screen stays put, which is what
-            // you want when someone pauses mid-message.
-            if (snap.run_status == .Stopped) break :blk "";
+            // Only show a cue while the position it is keyed to is actually
+            // being tracked. Stopped, paused, seeking, or simply not answering
+            // all leave the position frozen at whatever the last poll returned,
+            // and a frozen position pins whatever cue happened to cover it on
+            // screen indefinitely -- which is exactly what happens when you
+            // work the transport controls mid-message.
+            if (!snap.positionIsLive(now_ms)) break :blk "";
             const list = cue_list orelse break :blk "";
+            // Outside every cue's span the line is blank, checked afresh each
+            // pass rather than left holding the last message.
             const cue = list.at(snap.playTimeMillis(now_ms)) orelse break :blk "";
             may_scroll = cue.scroll;
             break :blk cue.text;
-        } else if (loaded_name_len > 0)
+        } else if (name_len > 0)
             // Disarmed: show which file is loaded, so it is obvious the right
             // one was picked before starting the disc.
-            cues.baseName(name_buf[0..loaded_name_len])
+            cues.baseName(name_buf[0..name_len])
         else
             "Blu-Ray mode";
 
@@ -238,13 +249,49 @@ pub fn runBlurayClocks(
         }
 
         // Sleep until the next moment something on the display is due to
-        // change: the next playback tick, or the next real-time second. Waking
-        // on a fixed grid instead would quantise every tick to the grid period,
-        // which is exactly the lateness this loop exists to avoid.
+        // change: the next playback tick, the next real-time second, or the
+        // next scroll step. Waking on a fixed grid instead would quantize each
+        // of them to the grid period -- which for the two clocks is the
+        // lateness this loop exists to avoid, and for the scroll is visible as
+        // stutter, since evenly spaced steps are the whole of what makes a
+        // character-cell marquee look smooth.
         var wake_ms = now_ms + DISPLAY_IDLE_SLICE_MS;
         if (snap.nextTickMs(now_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
+        // The displayed second flips on a local-time boundary. Offsets are
+        // whole minutes, so that is also a UTC second boundary.
         const next_second_ms = (@divFloor(now_ms, 1000) + 1) * 1000;
         wake_ms = @min(wake_ms, next_second_ms);
+        if (may_scroll) {
+            if (scroller.nextStepMs(line2, str_utils.maxchars, now_ms)) |step_ms| {
+                wake_ms = @min(wake_ms, step_ms);
+            }
+        }
+        // Wake exactly when the next cue starts or the current one ends. The
+        // warning cues are only a second long, so noticing them on some later
+        // sample risks stepping over one entirely -- and a warning that never
+        // appears is worse than one that appears a little late.
+        if (cue_list) |list| {
+            if (snap.positionIsLive(now_ms)) {
+                const position_ms = snap.playTimeMillis(now_ms);
+                if (list.nextBoundaryMs(position_ms)) |boundary_ms| {
+                    wake_ms = @min(wake_ms, now_ms + (boundary_ms - position_ms));
+                }
+            }
+        }
+
+        // Report a pass that started noticeably after the instant it was
+        // scheduled for. Every wake exists because something was due on screen
+        // then, and there is no catching up afterwards -- a late pass is a
+        // frame shown late, so it is a defect worth seeing in the log rather
+        // than something to absorb quietly.
+        if (due_ms != 0 and now_ms - due_ms > DEADLINE_SLACK_MS) {
+            late_frames += 1;
+            std.debug.print(
+                "Display pass {d} ms late (deadline {d}, {d} so far)\n",
+                .{ now_ms - due_ms, due_ms, late_frames },
+            );
+        }
+        due_ms = wake_ms;
 
         const sleep_ms = wake_ms - time.nowMillis(io);
         if (sleep_ms > 0) try io.sleep(.fromMilliseconds(sleep_ms), .awake);
@@ -279,6 +326,22 @@ pub const Snapshot = struct {
     has_anchor: bool = false,
     anchor_ms: i64 = 0,
     anchor_sec: u32 = 0,
+    /// When the player last answered. Requests fail while it is busy -- trick
+    /// play especially -- and the poller then backs off, so a snapshot can be
+    /// seconds old without anything looking wrong about it.
+    sampled_ms: i64 = 0,
+
+    /// Whether the play position is being actively tracked, and so can be
+    /// trusted for anything that keys off *where* playback is.
+    ///
+    /// Without an anchor the position is just whatever the last poll reported,
+    /// frozen until the next one lands: fine to show on the clock, but it would
+    /// pin a cue on screen long after playback left it behind.
+    pub fn positionIsLive(self: Snapshot, now_ms: i64) bool {
+        return self.run_status == .Playing and
+            self.has_anchor and
+            now_ms - self.sampled_ms <= stale_position_ms;
+    }
 
     /// Play position in milliseconds at `now_ms`.
     pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
@@ -302,6 +365,132 @@ pub const Snapshot = struct {
         return self.anchor_ms + (@divFloor(now_ms - self.anchor_ms, 1000) + 1) * 1000;
     }
 };
+
+/// Hands a freshly parsed cue file from the loader thread to the display loop.
+///
+/// The display loop must never touch the filesystem. Reading and parsing a cue
+/// file means an SD-card read and a parse of the whole thing -- milliseconds,
+/// unbounded, and landing at whatever moment the file happens to be saved. The
+/// lookup itself is a scan of a sorted array and costs about a microsecond, so
+/// it stays on the display loop; only the I/O moves.
+const CueCell = struct {
+    guard: std.atomic.Value(bool) = .init(false),
+    /// Whether `pending` holds something the display loop has not taken yet.
+    /// Checked with a plain atomic load so the common case never takes the lock.
+    ready: std.atomic.Value(bool) = .init(false),
+    pending: ?webvtt.CueList = null,
+
+    fn acquire(self: *CueCell) void {
+        while (self.guard.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *CueCell) void {
+        self.guard.store(false, .release);
+    }
+
+    /// Publish a newly loaded list, or null to mean "no cue file".
+    fn publish(self: *CueCell, list: ?webvtt.CueList) void {
+        self.acquire();
+        defer self.release();
+        // An earlier publication the display never collected is stale by
+        // definition, and nothing holds a reference to it, so it can go here.
+        if (self.pending) |stale| stale.deinit();
+        self.pending = list;
+        self.ready.store(true, .release);
+    }
+
+    /// Take whatever is waiting. The outer optional is "was there an update at
+    /// all"; the inner one is the list, which is null when the selection was
+    /// cleared and the line should go blank.
+    fn take(self: *CueCell) ??webvtt.CueList {
+        if (!self.ready.load(.acquire)) return null;
+        self.acquire();
+        defer self.release();
+        const taken = self.pending;
+        self.pending = null;
+        self.ready.store(false, .release);
+        return taken;
+    }
+
+    /// Release anything still held. Only safe once the loader has stopped.
+    fn deinit(self: *CueCell) void {
+        if (self.pending) |list| list.deinit();
+        self.pending = null;
+    }
+};
+
+/// Watch the selected cue file and parse it, off the display loop.
+///
+/// Also refreshes the timezone offset, for the same reason: working out the
+/// local offset means opening and parsing `/etc/localtime`, which is file I/O
+/// and has no business happening on a loop with frame deadlines to meet.
+fn cueLoop(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cue_state: *cues.State,
+    cell: *CueCell,
+    zone: *time.SharedZone,
+    stop: *std.atomic.Value(bool),
+) void {
+    var loaded_generation: u64 = 0;
+    var name_buf: [cues.max_name_len]u8 = undefined;
+    var name_len: usize = 0;
+    var loaded_print: ?cues.Fingerprint = null;
+    var next_zone_ms: i64 = 0;
+    var next_stat_ms: i64 = 0;
+
+    while (!stop.load(.acquire)) {
+        const generation = cue_state.generation.load(.acquire);
+        if (generation != loaded_generation) {
+            loaded_generation = generation;
+            loaded_print = null;
+            next_stat_ms = 0; // load the new selection immediately
+            name_len = 0;
+            if (cue_state.currentName(&name_buf)) |name| {
+                name_len = name.len;
+            } else {
+                // Selection cleared: blank the line rather than leaving the
+                // previous file's cues running.
+                cell.publish(null);
+            }
+        }
+
+        const now_ms = time.nowMillis(io);
+
+        if (name_len > 0 and now_ms >= next_stat_ms) {
+            next_stat_ms = now_ms + CUE_STAT_INTERVAL_MS;
+            const name = name_buf[0..name_len];
+            // A file that cannot be stat'ed -- deleted, or a temporary being
+            // renamed into place by an editor -- is left alone. The next pass
+            // picks it up, and the cues already loaded beat a blank line.
+            if (cues.fingerprint(io, name)) |current| {
+                const stale = if (loaded_print) |previous| !previous.eql(current) else true;
+                if (stale) {
+                    if (cues.load(io, allocator, name)) |fresh| {
+                        cell.publish(fresh);
+                    } else |err| {
+                        // Keep whatever is already on screen: a briefly broken
+                        // file is normal while editing, and blanking line 2
+                        // mid-movie over a typo is worse than stale cues.
+                        std.debug.print("Failed to load cue file {s}: {}\n", .{ name, err });
+                    }
+                    // Recorded either way, so a file that fails to parse is not
+                    // re-read every second until it is saved again.
+                    loaded_print = current;
+                }
+            }
+        }
+
+        if (now_ms >= next_zone_ms) {
+            next_zone_ms = now_ms + time.SharedZone.refresh_interval_ms;
+            zone.store(time.getTimezoneInfo(io));
+        }
+
+        io.sleep(.fromMilliseconds(CUE_THREAD_SLICE_MS), .awake) catch return;
+    }
+}
 
 /// Hands a `Snapshot` from the polling thread to the display loop.
 ///
@@ -500,6 +689,7 @@ pub const BlurayPlayer = struct {
             .run_status = self.state.run_status,
             .play_time_seconds = self.state.play_time_seconds,
             .has_anchor = self.lock.hasAnchor(),
+            .sampled_ms = self.last_update_time,
             .anchor_ms = self.lock.anchor_ms,
             .anchor_sec = self.lock.anchor_sec,
         };
@@ -512,6 +702,9 @@ pub const BlurayPlayer = struct {
         const was_playing = self.state.run_status == .Playing;
         self.state.run_status = run_status;
         self.state.play_time_seconds = play_time;
+        // When the player last actually answered, so consumers can tell a live
+        // position from one frozen by a run of failed requests.
+        self.last_update_time = sample_ms;
 
         if (run_status != .Playing) {
             // Nothing is ticking, and resuming will restart the tick at an
