@@ -32,5 +32,8 @@
 		"terminal.integrated.automationProfile.windows": {
       "path": "C:\\windows\\system32\\cmd.exe",
     },
+    "[subtitles]": {
+      "editor.rulers": [20],
+    }
 	}
 }

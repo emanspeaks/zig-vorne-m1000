@@ -12,7 +12,7 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
     defer cmd_parts.deinit(allocator);
 
     var last_full_update_utc: i64 = 0;
-    var zi = time.getTimezoneInfo(io);
+    var clock = time.LocalClock.init(io);
     var line1_buf: [20]u8 = undefined;
     var line2_buf: [20]u8 = undefined;
     var msg1_buf: [128]u8 = undefined;
@@ -40,16 +40,16 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
         cmd_parts.clearAndFree(allocator);
 
         // Get current local timestamp
-        const utc_timestamp = time.nowSeconds(io);
-        const timestamp = utc_timestamp + zi.offset_sec;
+        const now = clock.read(io);
+        const utc_timestamp = now.utc;
+        const timestamp = now.local;
         const seconds = @mod(timestamp, 60);
 
         // Check if we need a full update (every 10 seconds, first time, or timestamp changed)
         if (last_full_update_utc == 0 or (@mod(seconds, 10) == 0 and utc_timestamp != last_full_update_utc)) {
-            const display_str = time.formatRandyTimestamp(timestamp, &line1_buf, &zi) catch unreachable;
+            const display_str = time.formatRandyTimestamp(timestamp, &line1_buf, &clock.zi) catch unreachable;
             const time_cmd_str = std.fmt.bufPrint(&msg1_buf, "{s}{s}", .{ protocol.ESC ++ "C", display_str }) catch unreachable;
             try cmd_parts.appendSlice(allocator, time_cmd_str);
-            zi = time.getTimezoneInfo(io);
             last_full_update_utc = utc_timestamp;
 
             // Load countdown configuration from JSON

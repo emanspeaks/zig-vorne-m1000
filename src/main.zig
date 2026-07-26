@@ -9,6 +9,7 @@ const clocks = @import("clocks.zig");
 const bluray = @import("bluray.zig");
 const vlc = @import("vlc.zig");
 const process_mgmt = @import("process_mgmt.zig");
+const cues = @import("cues.zig");
 const Mode = @import("mode.zig").Mode;
 
 /// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
@@ -58,8 +59,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Shared mode state
 
+    // Which cue file line 2 shows in Blu-ray mode, and whether it is armed.
+    // Written by the HTTP thread, read by the Blu-ray display loop.
+    var cue_state: cues.State = .{};
+
     // Start HTTP server in a separate thread
-    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode });
+    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode, &cue_state });
     server_thread.detach();
 
     // Main display loop
@@ -74,14 +79,20 @@ pub fn main(init: std.process.Init) !void {
         if (current_mode == .Clocks) {
             try clocks.runClocks(io, allocator, port, &mode);
         } else if (current_mode == .Bluray) {
-            try bluray.runBlurayClocks(io, allocator, port, &mode);
+            try bluray.runBlurayClocks(io, allocator, port, &mode, &cue_state);
         } else if (current_mode == .Vlc) {
             try vlc.runVlcClocks(io, allocator, port, &mode);
         }
     }
 }
 
-fn startHttpServer(io: Io, allocator: std.mem.Allocator, port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+fn startHttpServer(
+    io: Io,
+    allocator: std.mem.Allocator,
+    port: *serial.SerialPort,
+    mode: *std.atomic.Value(Mode),
+    cue_state: *cues.State,
+) !void {
     const address: Io.net.IpAddress = Io.net.IpAddress.parse("0.0.0.0", 8080) catch unreachable;
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -90,12 +101,19 @@ fn startHttpServer(io: Io, allocator: std.mem.Allocator, port: *serial.SerialPor
 
     while (true) {
         const stream = try listener.accept(io);
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode, cue_state });
         thread.detach();
     }
 }
 
-fn handleConnection(io: Io, allocator: std.mem.Allocator, stream: Io.net.Stream, serial_port: *serial.SerialPort, mode: *std.atomic.Value(Mode)) !void {
+fn handleConnection(
+    io: Io,
+    allocator: std.mem.Allocator,
+    stream: Io.net.Stream,
+    serial_port: *serial.SerialPort,
+    mode: *std.atomic.Value(Mode),
+    cue_state: *cues.State,
+) !void {
     defer stream.close(io);
 
     var read_buffer: [1024]u8 = undefined;
@@ -127,7 +145,11 @@ fn handleConnection(io: Io, allocator: std.mem.Allocator, stream: Io.net.Stream,
             .Bluray => "Blu-Ray",
             .Vlc => "VLC",
         };
-        const html_body = std.fmt.allocPrint(allocator,
+        var body: Io.Writer.Allocating = .init(allocator);
+        defer body.deinit();
+        const w = &body.writer;
+
+        w.print(
             \\<!DOCTYPE html>
             \\<html>
             \\<head>
@@ -141,20 +163,21 @@ fn handleConnection(io: Io, allocator: std.mem.Allocator, stream: Io.net.Stream,
             \\<button type="submit" name="mode" value="bluray">Switch to Blu-Ray</button>
             \\<button type="submit" name="mode" value="vlc">Switch to VLC</button>
             \\</form>
-            // \\<form action="/control" method="post">
-            // \\<label for="text">Display Text:</label>
-            // \\<input type="text" id="text" name="text" maxlength="100">
-            // \\<button type="submit" name="action" value="display">Display</button>
-            // \\</form>
             \\<form action="/control" method="post">
-            // \\<button type="submit" name="action" value="flush">Flush</button>
             \\<button type="submit" name="action" value="init">Init</button>
             \\</form>
+            \\
+        , .{mode_str}) catch return;
+
+        writeCuesSection(io, allocator, w, cue_state) catch return;
+
+        w.writeAll(
             \\</body>
             \\</html>
-        , .{mode_str}) catch return;
-        defer allocator.free(html_body);
-        const headers = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\n\r\n", .{html_body.len}) catch return;
+        ) catch return;
+
+        const html_body = body.written();
+        const headers = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n", .{html_body.len}) catch return;
         defer allocator.free(headers);
         try out.writeAll(headers);
         try out.writeAll(html_body);
@@ -234,8 +257,171 @@ fn handleConnection(io: Io, allocator: std.mem.Allocator, stream: Io.net.Stream,
         // Redirect back to main page
         const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
         try out.writeAll(response);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/cues")) {
+        // Find the body
+        var body_start: usize = 0;
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "")) {
+                body_start = @intFromPtr(line.ptr) - @intFromPtr(request.ptr) + line.len + 2;
+                break;
+            }
+        }
+        const body = request[body_start..];
+
+        var iter = std.mem.splitSequence(u8, body, "&");
+        while (iter.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const key = pair[0..eq];
+            // File names routinely contain spaces and parentheses, so the value
+            // has to be properly form-decoded rather than just un-plussed.
+            const value = formDecode(allocator, pair[eq + 1 ..]) catch continue;
+            defer allocator.free(value);
+
+            if (std.mem.eql(u8, key, "file")) {
+                if (value.len == 0) {
+                    cue_state.clear();
+                } else if (!cue_state.select(value)) {
+                    std.debug.print("Rejected cue file selection: {s}\n", .{value});
+                }
+            } else if (std.mem.eql(u8, key, "arm")) {
+                cue_state.setArmed(std.mem.eql(u8, value, "on"));
+            }
+        }
+
+        // Redirect back to main page
+        const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
+        try out.writeAll(response);
     } else {
         const response = "HTTP/1.1 404 Not Found\r\n\r\n";
         try out.writeAll(response);
     }
+}
+
+/// Render the Blu-ray cue controls: which file line 2 draws from, and whether
+/// its cues are being shown.
+fn writeCuesSection(
+    io: Io,
+    allocator: std.mem.Allocator,
+    w: *Io.Writer,
+    cue_state: *cues.State,
+) !void {
+    var name_buf: [cues.max_name_len]u8 = undefined;
+    const selected = cue_state.currentName(&name_buf);
+    const armed = cue_state.isArmed();
+
+    try w.writeAll("<h2>Blu-Ray Line 2 Cues</h2>\n");
+
+    const names = cues.listNames(io, allocator) catch |err| {
+        try w.print("<p>Cannot read {s}: {}</p>\n", .{ cues.dir_path, err });
+        return;
+    };
+    defer cues.freeNames(allocator, names);
+
+    if (names.len == 0) {
+        try w.print("<p>No <code>*.vtt</code> files in <code>{s}</code>.</p>\n", .{cues.dir_path});
+        return;
+    }
+
+    try w.writeAll(
+        \\<form action="/cues" method="post">
+        \\<select name="file">
+        \\<option value="">(none)</option>
+        \\
+    );
+    for (names) |name| {
+        const is_selected = if (selected) |s| std.mem.eql(u8, s, name) else false;
+        try w.writeAll("<option value=\"");
+        try writeHtmlEscaped(w, name);
+        try w.writeAll(if (is_selected) "\" selected>" else "\">");
+        try writeHtmlEscaped(w, cues.baseName(name));
+        try w.writeAll("</option>\n");
+    }
+    try w.writeAll(
+        \\</select>
+        \\<button type="submit">Select</button>
+        \\</form>
+        \\
+    );
+
+    // Arming is manual: the player reports elapsed time and nothing else, so
+    // nothing here can tell the feature apart from a menu loop or a trailer.
+    try w.print(
+        \\<form action="/cues" method="post">
+        \\<p>Cues are <b>{s}</b>.</p>
+        \\<button type="submit" name="arm" value="on">Start cues</button>
+        \\<button type="submit" name="arm" value="off">Stop cues</button>
+        \\</form>
+        \\
+    , .{if (armed) "running" else "stopped"});
+}
+
+/// Escape text for interpolation into HTML. File names come from the
+/// filesystem, so they are not guaranteed to be free of markup characters.
+fn writeHtmlEscaped(w: *Io.Writer, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try w.writeAll("&amp;"),
+            '<' => try w.writeAll("&lt;"),
+            '>' => try w.writeAll("&gt;"),
+            '"' => try w.writeAll("&quot;"),
+            '\'' => try w.writeAll("&#39;"),
+            else => try w.writeByte(c),
+        }
+    }
+}
+
+/// Decode one `application/x-www-form-urlencoded` value. Caller owns the result.
+fn formDecode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < raw.len) {
+        switch (raw[i]) {
+            '+' => {
+                try out.append(allocator, ' ');
+                i += 1;
+            },
+            '%' => {
+                if (i + 3 <= raw.len) {
+                    if (std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16)) |byte| {
+                        try out.append(allocator, byte);
+                        i += 3;
+                        continue;
+                    } else |_| {}
+                }
+                // Not a valid escape, so treat it as a literal percent sign.
+                try out.append(allocator, '%');
+                i += 1;
+            },
+            else => |c| {
+                try out.append(allocator, c);
+                i += 1;
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "formDecode handles the escapes a file name can produce" {
+    const cases = .{
+        .{ "plain.vtt", "plain.vtt" },
+        .{ "The+Thing+%281982%29.vtt", "The Thing (1982).vtt" },
+        .{ "100%25.vtt", "100%.vtt" },
+        // A truncated escape must not swallow the rest of the value.
+        .{ "bad%2.vtt", "bad%2.vtt" },
+        .{ "trailing%", "trailing%" },
+    };
+    inline for (cases) |case| {
+        const got = try formDecode(std.testing.allocator, case[0]);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+}
+
+test "writeHtmlEscaped neutralizes markup in file names" {
+    var body: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer body.deinit();
+    try writeHtmlEscaped(&body.writer, "a<b>&\"c\".vtt");
+    try std.testing.expectEqualStrings("a&lt;b&gt;&amp;&quot;c&quot;.vtt", body.written());
 }

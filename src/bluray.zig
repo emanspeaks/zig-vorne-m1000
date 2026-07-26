@@ -6,7 +6,11 @@ const time = @import("time.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
 const frame_timer = @import("frame_timer.zig");
+const phase_lock = @import("phase_lock.zig");
+const PollKind = phase_lock.PollKind;
 const Mode = @import("mode.zig").Mode;
+const cues = @import("cues.zig");
+const webvtt = @import("webvtt.zig");
 
 const Writer = std.Io.Writer;
 const maxbufsz = str_utils.maxbufsz;
@@ -15,7 +19,18 @@ pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 
-pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
+/// How often the selected cue file is checked for edits. One `stat` per second
+/// is nothing next to the HTTP polling already going on, and it makes the file
+/// editable while a disc is running.
+pub const CUE_STAT_INTERVAL_MS: i64 = 1000;
+
+pub fn runBlurayClocks(
+    io: Io,
+    allocator: std.mem.Allocator,
+    port: anytype,
+    mode: *std.atomic.Value(Mode),
+    cue_state: *cues.State,
+) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
     // Build the command string dynamically
@@ -28,8 +43,25 @@ pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode
     defer last_cmd.deinit(allocator);
 
     var playtime_buf: [maxbufsz]u8 = undefined;
+    var clock_buf: [maxbufsz]u8 = undefined;
     var linebuf: [maxbufsz]u8 = undefined;
+    var line2buf: [maxbufsz]u8 = undefined;
     var playtime: u32 = 0;
+
+    // Time of day, shown at the left of line 1. Owns the cached zone offset.
+    var clock = time.LocalClock.init(io);
+
+    // Line 2 comes from the cue file chosen on the web page. It is reloaded
+    // when the selection changes -- which `generation` reports with a single
+    // atomic load, cheap enough to check every frame -- and when the file
+    // itself is edited, which costs one stat per second.
+    var cue_list: ?webvtt.CueList = null;
+    defer if (cue_list) |list| list.deinit();
+    var loaded_generation: u64 = 0;
+    var name_buf: [cues.max_name_len]u8 = undefined;
+    var loaded_name_len: usize = 0;
+    var loaded_print: ?cues.Fingerprint = null;
+    var next_stat_ms: i64 = 0;
 
     // The loop runs fast so the displayed second flips close to the player's
     // own tick; it is a scheduler, not a redraw rate. Polling is rate limited
@@ -41,9 +73,6 @@ pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode
     // Initialize Blu-ray player
     var player = BlurayPlayer.init(io, allocator);
     defer player.deinit();
-
-    // Load configuration from JSON
-    const bluray_config = config.loadBlurayConfig(io, allocator);
 
     while (true) {
         // Start frame timing
@@ -62,6 +91,7 @@ pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode
         }
 
         playtime_buf = undefined;
+        clock_buf = undefined;
         cmd_parts.clearRetainingCapacity();
         try str_utils.clearVorneLineBuf(&linebuf);
 
@@ -79,18 +109,88 @@ pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode
             .Paused => PAUSECHAR,
         };
 
-        if (bluray_config != null) {
-            try str_utils.copyLeftJustify(&linebuf, &bluray_config.?.label, 20 - playtime_str.len, null);
-        }
+        // Line 1: time of day at the left, elapsed play time and transport
+        // state at the right.
+        //
+        // The width passed here is the string's own length, not the width of
+        // the field it sits in: `copyLeftJustify` pads a wider field by
+        // shifting the rest of the line right, which would push the line past
+        // 20 columns. `clearVorneLineBuf` already blanked the gap.
+        const clock_str = clock.formatNow(io, &clock_buf) catch unreachable;
+        try str_utils.copyLeftJustify(&linebuf, clock_str, @min(clock_str.len, 20 -| playtime_str.len), null);
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
 
-        if (bluray_config) |cfg| {
-            _ = cfg;
+        // Pick up a cue file the moment the web page selects a different one,
+        // and pick up edits to the file that is already showing.
+        const generation = cue_state.generation.load(.acquire);
+        const selection_changed = generation != loaded_generation;
+        if (selection_changed) {
+            loaded_generation = generation;
+            if (cue_list) |list| list.deinit();
+            cue_list = null;
+            loaded_print = null;
+            loaded_name_len = 0;
+            next_stat_ms = 0;
+            if (cue_state.currentName(&name_buf)) |name| loaded_name_len = name.len;
         }
 
-        try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, "Blu-Ray mode");
+        if (loaded_name_len > 0) {
+            const now_ms = time.nowMillis(io);
+            if (now_ms >= next_stat_ms) {
+                next_stat_ms = now_ms + CUE_STAT_INTERVAL_MS;
+                const name = name_buf[0..loaded_name_len];
+
+                // A file that cannot be stat'ed -- deleted, or a temporary
+                // being renamed into place by an editor -- is left alone. The
+                // next check picks it up, and the cues already in memory beat a
+                // blank line in the meantime.
+                if (cues.fingerprint(io, name)) |current| {
+                    // Load on the first pass, and thereafter only when the file
+                    // has actually changed on disk, so editing it while a disc
+                    // is running takes effect within a second.
+                    const stale = if (loaded_print) |previous| !previous.eql(current) else true;
+                    if (stale) {
+                        if (cues.load(io, allocator, name)) |fresh| {
+                            if (cue_list) |list| list.deinit();
+                            cue_list = fresh;
+                        } else |err| {
+                            // Keep whatever was already on screen: a briefly
+                            // broken file is normal while editing, and blanking
+                            // line 2 mid-movie over a typo is worse than
+                            // showing stale cues until the next save.
+                            std.debug.print("Failed to load cue file {s}: {}\n", .{ name, err });
+                        }
+                        // Recorded either way, so a file that fails to parse is
+                        // not re-read every second until it is saved again.
+                        loaded_print = current;
+                    }
+                }
+            }
+        }
+
+        // Line 2: the message due at the current play position, but only once
+        // armed from the web page. Nothing about the player's status can tell
+        // us the feature is running rather than a menu or a trailer, so the
+        // decision is the operator's.
+        try str_utils.clearVorneLineBuf(&line2buf);
+        const line2: []const u8 = if (cue_state.isArmed()) blk: {
+            // A stopped player has no meaningful position. A paused one holds
+            // its last position, so the cue on screen stays put, which is what
+            // you want when someone pauses mid-message.
+            if (player.state.run_status == .Stopped) break :blk "";
+            const list = cue_list orelse break :blk "";
+            break :blk list.textAt(player.playTimeMillis()) orelse "";
+        } else if (loaded_name_len > 0)
+            // Disarmed: show which file is loaded, so it is obvious the right
+            // one was picked before starting the disc.
+            cues.baseName(name_buf[0..loaded_name_len])
+        else
+            "Blu-Ray mode";
+
+        try str_utils.copyLeftJustify(&line2buf, line2, @min(line2.len, 20), null);
+        try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
 
         if (cmd_parts.items.len > 0 and !std.mem.eql(u8, cmd_parts.items, last_cmd.items)) {
             protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items) catch |err| return err;
@@ -126,15 +226,34 @@ pub const BlurayPlayerState = struct {
     }
 };
 
-/// Commands that can be sent to the Blu-ray player
+/// Commands that can be sent to the Blu-ray player.
+///
+/// UHD (UB-series) players use the `RC_*` remote-key codes below. The older
+/// BD-series codes (`cCMD_PLAY`, `cCMD_PWR`, ...) are *not* accepted by a
+/// DP-UB820-K. Codes taken from the command table in `ha-panasonic_ub`.
 pub const Command = enum {
     Play,
     Stop,
     Pause,
     Next,
     Previous,
-    Power,
+    PowerOn,
+    PowerOff,
     OpenClose,
+
+    /// The protocol code, i.e. the `<CODE>` in `cCMD_<CODE>.x=100&...`.
+    pub fn code(self: Command) []const u8 {
+        return switch (self) {
+            .Play => "RC_PLAYBACK",
+            .Stop => "RC_STOP",
+            .Pause => "RC_PAUSE",
+            .Next => "RC_SKIPFWD",
+            .Previous => "RC_SKIPREV",
+            .PowerOn => "RC_POWERON",
+            .PowerOff => "RC_POWEROFF",
+            .OpenClose => "RC_OP_CL",
+        };
+    }
 };
 
 /// Client for a Panasonic DP-UB820-K.
@@ -144,51 +263,44 @@ pub const Command = enum {
 /// the player rejects requests that do not carry the `MEI-LAN-REMOTE-CALL`
 /// user agent (MEI = Matsushita Electric Industrial). Responses are CRLF
 /// separated plain text, not JSON. See `parseResponse` for the layout.
-/// Whether we know the phase of the player's 1 Hz clock.
-const PhaseLock = enum { searching, locked };
-
 pub const BlurayPlayer = struct {
     io: Io,
     allocator: std.mem.Allocator,
     ip_address: ?[]const u8,
+    /// 32-character control-API key, or null to run unauthenticated. Status
+    /// polling works either way; control commands require it on stock firmware.
+    secret_key: ?[]const u8,
     state: BlurayPlayerState,
     last_update_time: i64,
     http_client: std.http.Client,
 
-    // --- Phase lock on the player's 1 Hz tick (see `recordSample`) ---
-    phase: PhaseLock,
-    /// Wall-clock ms at which the play time became `anchor_sec`.
-    anchor_ms: i64,
-    anchor_sec: u32,
-    /// Half-width of the bracket that produced `anchor_ms`, in ms. Smaller is
-    /// a better estimate; used to decide whether a new edge is worth adopting.
-    anchor_err_ms: i64,
-    /// When the current lock was established, so it can be refreshed to
-    /// counter any slow drift between the player's clock and ours.
-    locked_at_ms: i64,
-    /// Previous sample, used to bracket an edge.
-    prev_sample_ms: i64,
-    prev_sample_sec: u32,
-    have_prev_sample: bool,
-    /// Wall-clock ms at which the next poll is due.
-    next_poll_ms: i64,
+    /// Tracks the phase of the player's 1 Hz tick so the displayed time can be
+    /// interpolated from the local clock between polls, and decides the poll
+    /// cadence. See `phase_lock.zig`.
+    lock: phase_lock.PhaseLock,
 
     const Self = @This();
     /// Required by the DP-UB820-K; the CGI returns an error without it.
     const USER_AGENT = "MEI-LAN-REMOTE-CALL";
+    /// Arbitrary client identifier sent when requesting a nonce.
+    const AUTH_SID = "VORNE_M1000";
+    /// Number of leading key characters echoed in `cAUTH_FORM`. Observed as 2
+    /// on a UB-series player (`cAUTH_FORM=C4`); openHAB uses 3 for some keys,
+    /// so this may need to become key-dependent if a key ever fails to work.
+    const AUTH_FORM_LEN = 2;
 
     /// Poll cadence while hunting for a tick edge. Each edge is bracketed to
     /// roughly half this, which is far below what the display can show.
     const FAST_POLL_MS: i64 = 100;
-    /// Once locked, a single confirmation poll shortly after each predicted
-    /// edge is enough to notice a seek, pause or stop.
-    const LOCK_CONFIRM_OFFSET_MS: i64 = 150;
-    /// Cadence when the player is not playing (nothing is ticking).
-    const IDLE_POLL_MS: i64 = 1000;
+    /// Half-width of the straddle window placed around each predicted edge.
+    /// Also the largest phase error the lock will tolerate before re-hunting.
+    const EDGE_GUARD_MS: i64 = 75;
+    /// Cadence when the player is not playing. Kept short because the event we
+    /// are waiting for is the transition back into playback, and every
+    /// millisecond of delay noticing it is a millisecond of stale display.
+    const IDLE_POLL_MS: i64 = 300;
     /// Back off after a failed request rather than hammering the player.
     const ERROR_RETRY_MS: i64 = 2000;
-    /// Re-hunt the edge occasionally so the lock cannot drift indefinitely.
-    const RELOCK_INTERVAL_MS: i64 = 120_000;
 
     /// Initialize a new BlurayPlayer instance
     pub fn init(io: Io, allocator: std.mem.Allocator) Self {
@@ -201,18 +313,11 @@ pub const BlurayPlayer = struct {
             .io = io,
             .allocator = allocator,
             .ip_address = ip_address,
+            .secret_key = config.loadBlurayKey(io, allocator),
             .state = BlurayPlayerState.init(),
             .last_update_time = 0,
             .http_client = std.http.Client{ .allocator = allocator, .io = io },
-            .phase = .searching,
-            .anchor_ms = 0,
-            .anchor_sec = 0,
-            .anchor_err_ms = 0,
-            .locked_at_ms = 0,
-            .prev_sample_ms = 0,
-            .prev_sample_sec = 0,
-            .have_prev_sample = false,
-            .next_poll_ms = 0,
+            .lock = .init,
         };
     }
 
@@ -222,28 +327,25 @@ pub const BlurayPlayer = struct {
         if (self.ip_address) |ip| {
             self.allocator.free(ip);
         }
+        if (self.secret_key) |key| {
+            self.allocator.free(key);
+        }
     }
 
     /// Poll the player if a poll is currently due. Cheap to call every frame:
-    /// the cadence is decided internally, so the render loop can run fast
-    /// without generating one HTTP request per frame.
+    /// the cadence is decided by the phase lock, so the render loop can run
+    /// fast without generating one HTTP request per frame.
     pub fn poll(self: *Self) void {
         const now = time.nowMillis(self.io);
-        if (now < self.next_poll_ms) return;
+        if (!self.lock.due(now)) return;
 
-        // Never trust a lock forever; the player's clock and ours are free
-        // running and could slowly diverge.
-        if (self.phase == .locked and now - self.locked_at_ms > RELOCK_INTERVAL_MS) {
-            self.unlock();
-        }
-
-        self.getStatus() catch |err| {
+        const kind = self.lock.next_kind;
+        self.getStatus(kind) catch |err| {
             std.debug.print("Failed to get Blu-ray status: {}\n", .{err});
-            self.next_poll_ms = now + ERROR_RETRY_MS;
-            self.have_prev_sample = false;
+            self.lock.retryAfterError(now);
             return;
         };
-        self.scheduleNextPoll(time.nowMillis(self.io));
+        self.lock.schedule(time.nowMillis(self.io), kind, self.state.run_status == .Playing);
     }
 
     /// Current play time in seconds, extrapolated from the phase lock.
@@ -254,94 +356,46 @@ pub const BlurayPlayer = struct {
     /// our own clock and will flip at the same instant the player's does.
     pub fn playTime(self: *Self) u32 {
         if (self.state.run_status != .Playing) return self.state.play_time_seconds;
-        return self.predictAt(time.nowMillis(self.io));
+        return self.lock.predict(time.nowMillis(self.io), self.state.play_time_seconds);
     }
 
-    fn predictAt(self: *Self, at_ms: i64) u32 {
-        if (self.phase != .locked) return self.state.play_time_seconds;
-        const elapsed_ms = at_ms - self.anchor_ms;
-        if (elapsed_ms < 0) return self.anchor_sec;
-        return self.anchor_sec +| @as(u32, @intCast(@divFloor(elapsed_ms, 1000)));
-    }
-
-    fn unlock(self: *Self) void {
-        self.phase = .searching;
-        self.anchor_err_ms = 0;
+    /// Current play time in milliseconds.
+    ///
+    /// The player itself only ever reports whole seconds, but the phase lock
+    /// knows where the second boundaries fall, so sub-second position comes for
+    /// free once locked -- which is what cue timing wants, since a cue file has
+    /// millisecond resolution. Falls back to the whole second when there is no
+    /// lock to interpolate from.
+    pub fn playTimeMillis(self: *Self) i64 {
+        const seconds_ms = @as(i64, self.state.play_time_seconds) * std.time.ms_per_s;
+        if (self.state.run_status != .Playing or !self.lock.isLocked()) return seconds_ms;
+        return @as(i64, self.lock.anchor_sec) * std.time.ms_per_s +
+            (time.nowMillis(self.io) - self.lock.anchor_ms);
     }
 
     /// Fold one status sample into the phase lock.
     ///
-    /// `sample_ms` is our best estimate of when the player read its own clock.
-    /// When the reported second differs from the previous sample's, the
-    /// increment must have happened between the two sample instants, so the
-    /// midpoint of that bracket estimates the tick edge to within half the
-    /// sampling gap. Polling quickly narrows the bracket; once it is tight the
-    /// cadence drops to one confirmation poll per second.
-    fn recordSample(self: *Self, sample_ms: i64, run_status: BlurayPlayerRunStatus, play_time: u32) void {
+    /// `sample_ms` is the best estimate of when the player read its own clock.
+    fn recordSample(self: *Self, sample_ms: i64, kind: PollKind, run_status: BlurayPlayerRunStatus, play_time: u32) void {
         const was_playing = self.state.run_status == .Playing;
         self.state.run_status = run_status;
+        self.state.play_time_seconds = play_time;
 
         if (run_status != .Playing) {
-            // Nothing is ticking; hold the reported value as-is.
-            self.state.play_time_seconds = play_time;
-            self.unlock();
-            self.have_prev_sample = false;
+            // Nothing is ticking, and resuming will restart the tick at an
+            // unrelated phase, so the lock is void.
+            self.lock.sampleStopped();
             return;
         }
 
-        // Playback just (re)started, so any previous phase is meaningless.
-        if (!was_playing) {
-            self.unlock();
-            self.have_prev_sample = false;
-        }
+        // Playback just (re)started; the previous phase means nothing now.
+        if (!was_playing) self.lock.drop();
 
-        // A reported value that disagrees with the prediction means the
-        // timeline moved under us: a seek, or a lock that has gone stale.
-        if (self.phase == .locked) {
-            const drift = @as(i64, play_time) - @as(i64, self.predictAt(sample_ms));
-            if (drift < -1 or drift > 1) {
-                self.unlock();
-                self.have_prev_sample = false;
-            }
-        }
-
-        if (self.have_prev_sample and play_time != self.prev_sample_sec) {
-            const err_ms = @divFloor(sample_ms - self.prev_sample_ms, 2);
-            // Adopt only a strictly better estimate, so the coarse brackets
-            // produced by once-a-second confirmation polls cannot degrade a
-            // tight lock obtained during a fast hunt.
-            if (self.phase != .locked or err_ms <= self.anchor_err_ms) {
-                self.anchor_ms = self.prev_sample_ms + err_ms;
-                self.anchor_sec = play_time;
-                self.anchor_err_ms = err_ms;
-                self.phase = .locked;
-                self.locked_at_ms = sample_ms;
-            }
-        }
-
-        self.state.play_time_seconds = play_time;
-        self.prev_sample_ms = sample_ms;
-        self.prev_sample_sec = play_time;
-        self.have_prev_sample = true;
-    }
-
-    fn scheduleNextPoll(self: *Self, now: i64) void {
-        if (self.state.run_status != .Playing) {
-            self.next_poll_ms = now + IDLE_POLL_MS;
-            return;
-        }
-        if (self.phase != .locked) {
-            self.next_poll_ms = now + FAST_POLL_MS;
-            return;
-        }
-        // Locked: land just after the next predicted edge, which both confirms
-        // the lock and bounds how long a seek can go unnoticed, at ~1 poll/sec.
-        const k = @divFloor(now - self.anchor_ms, 1000) + 1;
-        self.next_poll_ms = self.anchor_ms + k * 1000 + LOCK_CONFIRM_OFFSET_MS;
+        self.lock.sampleRunning(sample_ms, kind, play_time);
     }
 
     /// Internal method to update player state from the actual device
-    fn getStatus(self: *Self) !void {
+    fn getStatus(self: *Self, kind: PollKind) !void {
         if (self.ip_address == null) {
             return error.NoIpAddress;
         }
@@ -389,9 +443,9 @@ pub const BlurayPlayer = struct {
 
             // Update play time if valid
             if (play_time != std.math.maxInt(u32) - 1) { // -2 becomes maxInt-1 when parsed as u32
-                self.recordSample(sample_ms, play_state, play_time);
+                self.recordSample(sample_ms, kind, play_state, play_time);
             } else {
-                self.recordSample(sample_ms, .Stopped, 0);
+                self.recordSample(sample_ms, kind, .Stopped, 0);
                 self.state.is_standby = true; // No disc or deep standby
             }
 
@@ -478,6 +532,53 @@ pub const BlurayPlayer = struct {
         return self.ip_address;
     }
 
+    /// Fetch a one-shot challenge string for command authentication.
+    ///
+    /// Caller owns the returned buffer.
+    fn fetchNonce(self: *Self) ![]u8 {
+        const url = try std.fmt.allocPrint(self.allocator, "http://{s}/cgi-bin/get_nonce.cgi", .{self.ip_address.?});
+        defer self.allocator.free(url);
+
+        const raw = try self.sendHttpRequest(url, "SID=" ++ AUTH_SID);
+        defer self.allocator.free(raw);
+
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return error.EmptyNonce;
+        return self.allocator.dupe(u8, trimmed);
+    }
+
+    /// `cAUTH_VALUE` for a challenge: uppercase hex SHA-256 of key ++ nonce.
+    fn authValue(key: []const u8, nonce: []const u8) [64]u8 {
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(key);
+        hasher.update(nonce);
+        hasher.final(&digest);
+        return std.fmt.bytesToHex(digest, .upper);
+    }
+
+    /// Build the POST body for `command`, including authentication fields when
+    /// a secret key is configured. Caller owns the returned buffer.
+    ///
+    /// Observed on the wire, for reference:
+    ///   cCMD_RC_POWERON.x=100&cCMD_RC_POWERON.y=100&cAUTH_FORM=C4&cAUTH_VALUE=3C90...
+    fn buildCommandBody(self: *Self, code: []const u8) ![]u8 {
+        const key = self.secret_key orelse
+            return std.fmt.allocPrint(self.allocator, "cCMD_{s}.x=100&cCMD_{s}.y=100", .{ code, code });
+
+        const nonce = try self.fetchNonce();
+        defer self.allocator.free(nonce);
+
+        const auth = authValue(key, nonce);
+        // `cAUTH_FORM` is the leading characters of the key, sent in the clear;
+        // it appears to identify the key format.
+        return std.fmt.allocPrint(
+            self.allocator,
+            "cCMD_{s}.x=100&cCMD_{s}.y=100&cAUTH_FORM={s}&cAUTH_VALUE={s}",
+            .{ code, code, key[0..AUTH_FORM_LEN], auth[0..] },
+        );
+    }
+
     /// Send a command to the Blu-ray player
     pub fn sendCommand(self: *Self, command: Command) !void {
         if (self.ip_address == null) {
@@ -487,15 +588,10 @@ pub const BlurayPlayer = struct {
         const url = try std.fmt.allocPrint(self.allocator, "http://{s}/WAN/dvdr/dvdr_ctrl.cgi", .{self.ip_address.?});
         defer self.allocator.free(url);
 
-        const body_data = switch (command) {
-            .Play => "cCMD_PLAY.x=100&cCMD_PLAY.y=100",
-            .Stop => "cCMD_STOP.x=100&cCMD_STOP.y=100",
-            .Pause => "cCMD_PAUSE.x=100&cCMD_PAUSE.y=100",
-            .Next => "cCMD_NEXT.x=100&cCMD_NEXT.y=100",
-            .Previous => "cCMD_PREV.x=100&cCMD_PREV.y=100",
-            .Power => "cCMD_PWR.x=100&cCMD_PWR.y=100",
-            .OpenClose => "cCMD_OP_CL.x=100&cCMD_OP_CL.y=100",
-        };
+        // Authenticated when a key is configured; the nonce round trip happens
+        // inside `buildCommandBody`.
+        const body_data = try self.buildCommandBody(command.code());
+        defer self.allocator.free(body_data);
 
         const response = self.sendHttpRequest(url, body_data) catch |err| switch (err) {
             error.HttpRequestFailed => {
@@ -521,3 +617,23 @@ pub const BlurayPlayer = struct {
         // };
     }
 };
+
+test "authValue is uppercase hex SHA-256 of key ++ nonce" {
+    // SHA-256("ab"), i.e. key "a" concatenated with nonce "b".
+    const expected = "FB8E20FC2E4C3F248C60C39BD652F3C1347298BB977B8B4D5903B85055620603";
+    const actual = BlurayPlayer.authValue("a", "b");
+    try std.testing.expectEqualStrings(expected, &actual);
+    try std.testing.expectEqual(@as(usize, 64), actual.len);
+}
+
+test "command codes are the UB-series RC_* form" {
+    // The older BD-series codes (cCMD_PLAY, cCMD_PWR) are rejected by UB players.
+    try std.testing.expectEqualStrings("RC_PLAYBACK", Command.Play.code());
+    try std.testing.expectEqualStrings("RC_POWERON", Command.PowerOn.code());
+    try std.testing.expectEqualStrings("RC_OP_CL", Command.OpenClose.code());
+}
+
+test {
+    // Force analysis of decls that nothing calls yet, such as the auth path.
+    std.testing.refAllDecls(BlurayPlayer);
+}

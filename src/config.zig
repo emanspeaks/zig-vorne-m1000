@@ -20,7 +20,44 @@ pub const BlurayConfig = struct {
 
 const bluray_cfg_path = "/home/emanspeaks/bluray_config.jsonc";
 const bluray_ip_path = "/home/emanspeaks/bluray_ip.txt";
+const bluray_key_path = "/home/emanspeaks/bluray_key.txt";
 const countdown_cfg_path = "/home/emanspeaks/line2_config.jsonc";
+
+/// Length of the Panasonic control-API secret key.
+pub const bluray_key_len = 32;
+
+/// Load the 32-character secret key used to authenticate control commands.
+///
+/// Optional: status polling (`cCMD_PST`) does not need it, so its absence is
+/// not an error — only control commands and `cCMD_REVIEW` are unavailable
+/// without it. Caller owns the returned buffer.
+pub fn loadBlurayKey(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
+    const raw = Io.Dir.readFileAlloc(.cwd(), io, bluray_key_path, allocator, max_config_bytes) catch |err| switch (err) {
+        error.FileNotFound => return null, // Expected when running unauthenticated
+        else => {
+            std.debug.print("Error reading Blu-ray key file: {}, skipping\n", .{err});
+            return null;
+        },
+    };
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len != bluray_key_len) {
+        std.debug.print(
+            "Blu-ray key must be {d} characters, got {d}; ignoring\n",
+            .{ bluray_key_len, trimmed.len },
+        );
+        allocator.free(raw);
+        return null;
+    }
+
+    // Re-own the trimmed span so the caller can free exactly what it holds.
+    const key = allocator.dupe(u8, trimmed) catch {
+        allocator.free(raw);
+        return null;
+    };
+    allocator.free(raw);
+    return key;
+}
 
 pub fn loadBlurayIp(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
     // Try to read the IP address from the text file

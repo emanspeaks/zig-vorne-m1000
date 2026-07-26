@@ -198,6 +198,57 @@ fn parseTZifFile(io: Io, file: Io.File) ?zoneinfo {
     return null;
 }
 
+/// Local wall clock, with the zone offset cached.
+///
+/// `getTimezoneInfo` re-parses `/etc/localtime` on every call, which is far too
+/// expensive to run per frame, but the offset still has to be re-read
+/// occasionally so a DST transition is picked up without a restart. Every mode
+/// that puts the time of day on the display needs that same caching, so it
+/// lives here rather than in any one mode.
+pub const LocalClock = struct {
+    zi: zoneinfo,
+    next_refresh_utc: i64,
+
+    /// How often the zone offset is re-read.
+    pub const refresh_interval_sec: i64 = 10;
+
+    /// A clock reading, kept together so callers needing both UTC and local do
+    /// not sample twice and risk straddling a second boundary.
+    pub const Reading = struct {
+        utc: i64,
+        /// Seconds since the epoch shifted into the local zone, i.e. what the
+        /// `timestampTo*`/`format*` helpers want for wall-clock output.
+        local: i64,
+    };
+
+    pub fn init(io: Io) LocalClock {
+        return .{
+            .zi = getTimezoneInfo(io),
+            .next_refresh_utc = nowSeconds(io) + refresh_interval_sec,
+        };
+    }
+
+    pub fn read(self: *LocalClock, io: Io) Reading {
+        const utc = nowSeconds(io);
+        if (utc >= self.next_refresh_utc) {
+            self.zi = getTimezoneInfo(io);
+            self.next_refresh_utc = utc + refresh_interval_sec;
+        }
+        return .{ .utc = utc, .local = utc + self.zi.offset_sec };
+    }
+
+    /// Current local time as "HH:MM:SS".
+    pub fn formatNow(self: *LocalClock, io: Io, buf: []u8) ![]const u8 {
+        return formatClock(self.read(io).local, buf);
+    }
+};
+
+/// Format a timestamp as "HH:MM:SS": time of day only, no date.
+pub fn formatClock(timestamp: i64, buf: []u8) ![]const u8 {
+    const ymdhms = timestampToYmdhms(timestamp);
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ ymdhms.hour, ymdhms.minute, ymdhms.second });
+}
+
 /// Format a timestamp as "YYYY-MM-DD HH:MM:SS"
 pub fn formatIsoTimestamp(timestamp: i64, buf: []u8) ![]const u8 {
     return formatYmdhms(timestampToYmdhms(timestamp), buf);
