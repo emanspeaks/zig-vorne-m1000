@@ -11,6 +11,7 @@ const PollKind = phase_lock.PollKind;
 const Mode = @import("mode.zig").Mode;
 const cues = @import("cues.zig");
 const webvtt = @import("webvtt.zig");
+const Marquee = @import("marquee.zig").Marquee;
 
 const Writer = std.Io.Writer;
 const maxbufsz = str_utils.maxbufsz;
@@ -63,6 +64,9 @@ pub fn runBlurayClocks(
     var loaded_print: ?cues.Fingerprint = null;
     var next_stat_ms: i64 = 0;
 
+    // Sweeps line 2 back and forth when the message is wider than the display.
+    var scroller: Marquee = .{};
+
     // The loop runs fast so the displayed second flips close to the player's
     // own tick; it is a scheduler, not a redraw rate. Polling is rate limited
     // inside `player.poll()`, and identical frames are never written to the
@@ -94,6 +98,10 @@ pub fn runBlurayClocks(
         clock_buf = undefined;
         cmd_parts.clearRetainingCapacity();
         try str_utils.clearVorneLineBuf(&linebuf);
+
+        // One clock reading for the whole frame, so the cue-file check and the
+        // scroll position cannot disagree about what "now" is.
+        const now_ms = time.nowMillis(io);
 
         // Get current local timestamp
         // const utc_timestamp = std.time.timestamp();
@@ -137,7 +145,6 @@ pub fn runBlurayClocks(
         }
 
         if (loaded_name_len > 0) {
-            const now_ms = time.nowMillis(io);
             if (now_ms >= next_stat_ms) {
                 next_stat_ms = now_ms + CUE_STAT_INTERVAL_MS;
                 const name = name_buf[0..loaded_name_len];
@@ -175,13 +182,18 @@ pub fn runBlurayClocks(
         // us the feature is running rather than a menu or a trailer, so the
         // decision is the operator's.
         try str_utils.clearVorneLineBuf(&line2buf);
+        // A warning cue is pinned rather than swept: it has to be readable the
+        // instant it appears, not a sweep later.
+        var may_scroll = true;
         const line2: []const u8 = if (cue_state.isArmed()) blk: {
             // A stopped player has no meaningful position. A paused one holds
             // its last position, so the cue on screen stays put, which is what
             // you want when someone pauses mid-message.
             if (player.state.run_status == .Stopped) break :blk "";
             const list = cue_list orelse break :blk "";
-            break :blk list.textAt(player.playTimeMillis()) orelse "";
+            const cue = list.at(player.playTimeMillis()) orelse break :blk "";
+            may_scroll = cue.scroll;
+            break :blk cue.text;
         } else if (loaded_name_len > 0)
             // Disarmed: show which file is loaded, so it is obvious the right
             // one was picked before starting the disc.
@@ -189,7 +201,12 @@ pub fn runBlurayClocks(
         else
             "Blu-Ray mode";
 
-        try str_utils.copyLeftJustify(&line2buf, line2, @min(line2.len, 20), null);
+        const line2_window = if (may_scroll)
+            scroller.window(line2, str_utils.maxchars, now_ms)
+        else
+            line2[0..@min(line2.len, str_utils.maxchars)];
+
+        try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_window.len, 20), null);
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
 
         if (cmd_parts.items.len > 0 and !std.mem.eql(u8, cmd_parts.items, last_cmd.items)) {
@@ -289,18 +306,7 @@ pub const BlurayPlayer = struct {
     /// so this may need to become key-dependent if a key ever fails to work.
     const AUTH_FORM_LEN = 2;
 
-    /// Poll cadence while hunting for a tick edge. Each edge is bracketed to
-    /// roughly half this, which is far below what the display can show.
-    const FAST_POLL_MS: i64 = 100;
-    /// Half-width of the straddle window placed around each predicted edge.
-    /// Also the largest phase error the lock will tolerate before re-hunting.
-    const EDGE_GUARD_MS: i64 = 75;
-    /// Cadence when the player is not playing. Kept short because the event we
-    /// are waiting for is the transition back into playback, and every
-    /// millisecond of delay noticing it is a millisecond of stale display.
-    const IDLE_POLL_MS: i64 = 300;
-    /// Back off after a failed request rather than hammering the player.
-    const ERROR_RETRY_MS: i64 = 2000;
+    // The poll cadence is owned entirely by `phase_lock.zig`; tune it there.
 
     /// Initialize a new BlurayPlayer instance
     pub fn init(io: Io, allocator: std.mem.Allocator) Self {

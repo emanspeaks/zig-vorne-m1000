@@ -19,6 +19,15 @@ reloaded when it changes. If a save leaves it unparseable, the previously loaded
 cues stay up and the error goes to the service log, so fix and save again.
 
 NOTE
+Text longer than 20 columns scrolls: the window slides right until the end is
+visible, then slides back, pausing at each end long enough to read.
+
+Start a message with * to pin it instead. That marks a warning line, which has
+to be readable the instant it appears rather than a sweep later, so it is
+truncated at 20 columns rather than scrolled. The * is shown on the display as
+written, so keep the message short enough to fit alongside it.
+
+NOTE
 A cue identifier line (like "opening" below) is optional and is ignored.
 
 opening
@@ -33,6 +42,11 @@ FIRST ACT
 
 01:47:30.000 --> 01:47:55.000
 TEARS IN RAIN
+
+NOTE A warning line: pinned, never scrolled.
+
+01:50:00.000 --> 01:50:20.000
+* LOUD PART COMING
 
 01:52:00.000 --> 01:53:00.000
 THE END

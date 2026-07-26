@@ -29,6 +29,14 @@ pub const Cue = struct {
     /// Exclusive: a cue covers `[start_ms, end_ms)`.
     end_ms: i64,
     text: []const u8,
+    /// Whether text too wide for the display may scroll.
+    ///
+    /// False for a payload written with a leading `*`: a warning line, which
+    /// has to be readable at a glance rather than over the course of a sweep,
+    /// so it is truncated instead. The `*` stays in `text` -- it is part of how
+    /// the line reads on the panel, marking it out as special, not just a
+    /// parsing directive.
+    scroll: bool,
 };
 
 /// A parsed cue file. Every slice inside points into `arena`.
@@ -48,17 +56,17 @@ pub const CueList = struct {
         child.destroy(self.arena);
     }
 
-    /// Text to show at `t_ms`, or null when no cue covers that instant.
+    /// The cue covering `t_ms`, or null when there is none.
     ///
     /// Overlapping cues are legal in WebVTT but meaningless on a single line,
     /// so the latest-starting cue that is still open wins.
-    pub fn textAt(self: CueList, t_ms: i64) ?[]const u8 {
-        var found: ?[]const u8 = null;
+    pub fn at(self: CueList, t_ms: i64) ?Cue {
+        var found: ?Cue = null;
         for (self.cues) |cue| {
             // Sorted by start, so once a cue starts in the future nothing
             // after it can be active either.
             if (cue.start_ms > t_ms) break;
-            if (t_ms < cue.end_ms) found = cue.text;
+            if (t_ms < cue.end_ms) found = cue;
         }
         return found;
     }
@@ -121,14 +129,21 @@ pub fn parse(child_allocator: std.mem.Allocator, source: []const u8) ParseError!
             try appendPayload(a, &text, payload);
         }
 
+        // A payload beginning with `*` is a warning line: it has to be readable
+        // at a glance, so it is never scrolled. The marker itself stays in the
+        // text, since it is what marks the line out as special on the panel.
+        const cue_text = try text.toOwnedSlice(a);
+        const scroll = cue_text.len == 0 or cue_text[0] != '*';
+
         try cues.append(a, .{
             .start_ms = span.start_ms,
             .end_ms = span.end_ms,
-            .text = try text.toOwnedSlice(a),
+            .text = cue_text,
+            .scroll = scroll,
         });
     }
 
-    // Cues are conventionally in order already, but `textAt` relies on it, so
+    // Cues are conventionally in order already, but `at` relies on it, so
     // do not take the file's word for it.
     std.mem.sort(Cue, cues.items, {}, lessThanStart);
 
@@ -324,7 +339,7 @@ test "parses a hand-written cue file" {
     try testing.expectEqualStrings("TEARS IN RAIN", list.cues[1].text);
 }
 
-test "textAt covers the half-open interval and the gaps between cues" {
+test "at covers the half-open interval and the gaps between cues" {
     const source =
         "WEBVTT\n\n" ++
         "00:00:10.000 --> 00:00:20.000\nFIRST\n\n" ++
@@ -333,14 +348,14 @@ test "textAt covers the half-open interval and the gaps between cues" {
     var list = try parse(testing.allocator, source);
     defer list.deinit();
 
-    try testing.expectEqual(@as(?[]const u8, null), list.textAt(0));
-    try testing.expectEqual(@as(?[]const u8, null), list.textAt(9_999));
-    try testing.expectEqualStrings("FIRST", list.textAt(10_000).?);
-    try testing.expectEqualStrings("FIRST", list.textAt(19_999).?);
+    try testing.expectEqual(@as(?Cue, null), list.at(0));
+    try testing.expectEqual(@as(?Cue, null), list.at(9_999));
+    try testing.expectEqualStrings("FIRST", list.at(10_000).?.text);
+    try testing.expectEqualStrings("FIRST", list.at(19_999).?.text);
     // End is exclusive, so the line clears exactly when the cue expires.
-    try testing.expectEqual(@as(?[]const u8, null), list.textAt(20_000));
-    try testing.expectEqualStrings("SECOND", list.textAt(35_000).?);
-    try testing.expectEqual(@as(?[]const u8, null), list.textAt(40_000));
+    try testing.expectEqual(@as(?Cue, null), list.at(20_000));
+    try testing.expectEqualStrings("SECOND", list.at(35_000).?.text);
+    try testing.expectEqual(@as(?Cue, null), list.at(40_000));
 }
 
 test "NOTE blocks and their contents never reach the display" {
@@ -398,7 +413,7 @@ test "a malformed cue is skipped without losing the rest of the file" {
     try testing.expectEqualStrings("FINE", list.cues[0].text);
 }
 
-test "out-of-order cues are sorted so textAt stays correct" {
+test "out-of-order cues are sorted so at stays correct" {
     const source =
         "WEBVTT\n\n" ++
         "00:00:30.000 --> 00:00:40.000\nLATER\n\n" ++
@@ -408,8 +423,52 @@ test "out-of-order cues are sorted so textAt stays correct" {
     defer list.deinit();
 
     try testing.expectEqualStrings("EARLIER", list.cues[0].text);
-    try testing.expectEqualStrings("EARLIER", list.textAt(15_000).?);
-    try testing.expectEqualStrings("LATER", list.textAt(35_000).?);
+    try testing.expectEqualStrings("EARLIER", list.at(15_000).?.text);
+    try testing.expectEqualStrings("LATER", list.at(35_000).?.text);
+}
+
+test "a leading asterisk marks a warning line that must not scroll" {
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:01.000 --> 00:00:02.000\n" ++
+        "*  LOUD PART COMING UP RIGHT NOW\n\n" ++
+        "00:00:05.000 --> 00:00:06.000\n" ++
+        "3m17 Charming The Pziiffelback\n\n" ++
+        // Only a *leading* asterisk is a marker; one inside the text is text.
+        "00:00:09.000 --> 00:00:10.000\n" ++
+        "2m11 The Dragon *Book*\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    const warning = list.at(1_500).?;
+    try testing.expect(!warning.scroll);
+    // The marker is displayed, not consumed: it is what makes the line read as
+    // a warning on the panel. Spacing after it is the author's to choose.
+    try testing.expectEqualStrings("*  LOUD PART COMING UP RIGHT NOW", warning.text);
+
+    const normal = list.at(5_500).?;
+    try testing.expect(normal.scroll);
+    try testing.expectEqualStrings("3m17 Charming The Pziiffelback", normal.text);
+
+    const inner = list.at(9_500).?;
+    try testing.expect(inner.scroll);
+    try testing.expectEqualStrings("2m11 The Dragon *Book*", inner.text);
+}
+
+test "an asterisk on a multi-line payload still marks the whole cue" {
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:01.000 --> 00:00:02.000\n" ++
+        "*STOP\n" ++
+        "THE FIGHT\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    const cue = list.at(1_500).?;
+    try testing.expect(!cue.scroll);
+    try testing.expectEqualStrings("*STOP THE FIGHT", cue.text);
 }
 
 test "a file without the signature is rejected" {
