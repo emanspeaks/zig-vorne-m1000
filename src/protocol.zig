@@ -26,21 +26,25 @@ pub const group_crc16 = SOH ++ "u";
 
 pub const timeout_ms: u32 = 2000;
 
+/// Discard whatever the unit has sent back, without blocking.
+///
+/// Nothing in this program interprets the reply, so waiting for one only adds
+/// latency to the render loop. Draining keeps the tty input buffer from filling
+/// up (there is no hardware flow control configured, so unread bytes are simply
+/// dropped by the kernel).
+fn drainInput(port: *serial.SerialPort) void {
+    var buffer: [128]u8 = undefined;
+    while (true) {
+        const received = port.readWithTimeout(&buffer, 0) catch return;
+        // A short read means the buffer is empty; an oversized value means the
+        // underlying read() returned an error code rather than a length.
+        if (received == 0 or received > buffer.len) return;
+    }
+}
+
 pub fn send(port: *serial.SerialPort, msg: []const u8) !void {
     _ = port.write(msg);
-
-    var buffer: [128]u8 = undefined;
-    const received = port.readWithTimeout(&buffer, timeout_ms) catch |err| switch (err) {
-        error.PollError => {
-            std.debug.print("Error polling for data.\n", .{});
-            return;
-        },
-    };
-
-    if (received == 0) {
-        const timeout_seconds: f64 = @as(f64, @floatFromInt(timeout_ms)) / 1000.0;
-        std.debug.print("No response (timeout after {d:.3} seconds).\n", .{timeout_seconds});
-    }
+    drainInput(port);
 }
 
 pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, allocator: std.mem.Allocator) !void {

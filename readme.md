@@ -8,6 +8,18 @@ This directory contains scripts and configuration to run the Zig Vorne M1000 dis
 
 The Zig-based Vorne M1000 display service that interfaces with the serial display.
 
+### Blu-ray Status (`--bluray`)
+
+Polls a **Panasonic DP-UB820-K** Blu-ray player over the network and shows the
+elapsed play time and transport state on the display.
+
+- Uses Panasonic's legacy LAN control interface at
+  `POST http://<ip>/WAN/dvdr/dvdr_ctrl.cgi`, which requires the
+  `User-Agent: MEI-LAN-REMOTE-CALL` header
+- The player's IP address is read from `bluray_ip.txt`
+- Play time is reported only in whole seconds, so the displayed time is
+  interpolated between polls to stay in sync with the player
+
 ### VLC Status Server
 
 A C-based Windows server that provides VLC media player status broadcasting. See `vlc/README.md` for details.
@@ -65,7 +77,7 @@ A C-based Windows server that provides VLC media player status broadcasting. See
   sudo systemctl stop zig-vorne-m1000
   ```
 
-- **Disable auto-start (but keep installed):**
+- **Disable auto-start (but keep it installed):**
 
   ```bash
   sudo systemctl disable zig-vorne-m1000

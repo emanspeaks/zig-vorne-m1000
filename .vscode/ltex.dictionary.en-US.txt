@@ -1,0 +1,9 @@
+Zig
+Zig-based
+Vorne
+MinGW
+cmake
+systemd
+openHAB
+uhd-player
+bd-player
