@@ -818,7 +818,14 @@ pub const BlurayPlayer = struct {
         sample_ms: i64,
         rtt_ms: i64,
         run_status: BlurayPlayerRunStatus,
+        /// Compensated for the round trip already elapsed by the time this is
+        /// in hand -- see `getStatus`. This is what feeds `state` and, from
+        /// there, the display.
         play_time_seconds: u32,
+        /// Exactly what the CGI returned, before compensation. Kept only for
+        /// the log line, so the correction itself stays checkable against
+        /// real hardware rather than being silently baked in.
+        reported_play_time_seconds: u32,
         is_standby: bool,
     };
 
@@ -837,8 +844,8 @@ pub const BlurayPlayer = struct {
         self.state.is_standby = sample.is_standby;
         self.last_update_time = sample.sample_ms;
 
-        std.debug.print("poll: reported={d} status={s} rtt={d}ms\n", .{
-            sample.play_time_seconds, @tagName(sample.run_status), sample.rtt_ms,
+        std.debug.print("poll: reported={d} position={d} status={s} rtt={d}ms\n", .{
+            sample.reported_play_time_seconds, sample.play_time_seconds, @tagName(sample.run_status), sample.rtt_ms,
         });
     }
 
@@ -896,9 +903,30 @@ pub const BlurayPlayer = struct {
         const play_time = std.fmt.parseInt(u32, parsed[1], 10) catch 0;
 
         if (play_time == std.math.maxInt(u32) - 1) { // -2 becomes maxInt-1 when parsed as u32
-            return .{ .sample_ms = sample_ms, .rtt_ms = rtt_ms, .run_status = .Stopped, .play_time_seconds = 0, .is_standby = true };
+            return .{ .sample_ms = sample_ms, .rtt_ms = rtt_ms, .run_status = .Stopped, .play_time_seconds = 0, .reported_play_time_seconds = 0, .is_standby = true };
         }
-        return .{ .sample_ms = sample_ms, .rtt_ms = rtt_ms, .run_status = play_state, .play_time_seconds = play_time, .is_standby = play_state == .Stopped };
+
+        // By the time this response is in hand, roughly `rtt_ms` of real time
+        // has passed since the player read its own clock to answer -- while
+        // playback is actually advancing, add that back in so the displayed
+        // position reflects "now" rather than "whenever the player happened
+        // to respond". A rough correction (this is a whole round trip, not
+        // the midpoint) but a strictly one-sided bias, unlike jitter, so
+        // leaving it uncorrected means the display is *always* behind, never
+        // just occasionally imprecise.
+        const play_time_seconds = if (play_state == .Playing)
+            play_time +| @as(u32, @intCast(@divFloor(rtt_ms, 1000)))
+        else
+            play_time;
+
+        return .{
+            .sample_ms = sample_ms,
+            .rtt_ms = rtt_ms,
+            .run_status = play_state,
+            .play_time_seconds = play_time_seconds,
+            .reported_play_time_seconds = play_time,
+            .is_standby = play_state == .Stopped,
+        };
     }
 
     /// Send HTTP request to the Blu-ray player
