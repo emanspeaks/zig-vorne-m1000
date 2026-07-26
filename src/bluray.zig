@@ -55,6 +55,29 @@ const DISPLAY_IDLE_SLICE_MS: i64 = 25;
 /// that a message cannot sit on screen after playback has moved on.
 const stale_position_ms: i64 = 2500;
 
+/// Why line 2 currently holds whatever it holds. Logged only when it changes
+/// (`runBlurayClocks`'s `seen_line2_source`), the same "log on change, not
+/// every frame" discipline as the rest of this file's diagnostics -- this one
+/// exists because "line 2 isn't updating" and "line 2 is correctly blank /
+/// correctly showing the file name" turned out to look identical from the web
+/// page and the panel alike, with no way to tell which branch actually ran.
+const Line2Source = enum {
+    /// Armed, live position, a cue covers it: showing that cue's text.
+    cue,
+    /// Armed, but the position is not live (not playing, or the last poll is
+    /// too old) -- see `Snapshot.positionIsLive`.
+    armed_not_live,
+    /// Armed and live, but `cueLoop` has not published a parsed file yet (or
+    /// the selection was cleared).
+    armed_no_cue_list,
+    /// Armed and live, cues are loaded, but none covers the current position.
+    armed_no_cue_here,
+    /// Disarmed, a file is selected: showing its name.
+    filename,
+    /// Disarmed, nothing selected: the "Blu-Ray mode" fallback.
+    nothing_selected,
+};
+
 pub fn runBlurayClocks(
     io: Io,
     allocator: std.mem.Allocator,
@@ -98,6 +121,8 @@ pub fn runBlurayClocks(
     var name_buf: [cues.max_name_len]u8 = undefined;
     var name_len: usize = 0;
     var seen_generation: u64 = 0;
+    // For "log only on change" below -- see `Line2Source`.
+    var seen_line2_source: ?Line2Source = null;
 
     // Everything that can block for an unbounded time runs on its own thread,
     // so that this loop only ever does arithmetic, a memcmp and one serial
@@ -200,6 +225,9 @@ pub fn runBlurayClocks(
             seen_generation = generation;
             name_len = 0;
             if (cue_state.currentName(&name_buf)) |name| name_len = name.len;
+            std.debug.print("bluray: cue selection generation -> {d}, name='{s}'\n", .{
+                generation, name_buf[0..name_len],
+            });
         }
 
         // Line 2: the message due at the current play position, but only once
@@ -210,6 +238,7 @@ pub fn runBlurayClocks(
         // A warning cue is pinned rather than swept: it has to be readable the
         // instant it appears, not a sweep later.
         var may_scroll = true;
+        var line2_source: Line2Source = undefined;
         const line2: []const u8 = if (cue_state.isArmed()) blk: {
             // Only show a cue while the position it is keyed to is actually
             // being tracked. Stopped, paused, seeking, or simply not answering
@@ -217,19 +246,40 @@ pub fn runBlurayClocks(
             // and a frozen position pins whatever cue happened to cover it on
             // screen indefinitely -- which is exactly what happens when you
             // work the transport controls mid-message.
-            if (!snap.positionIsLive(now_ms)) break :blk "";
-            const list = cue_list orelse break :blk "";
+            if (!snap.positionIsLive(now_ms)) {
+                line2_source = .armed_not_live;
+                break :blk "";
+            }
+            const list = cue_list orelse {
+                line2_source = .armed_no_cue_list;
+                break :blk "";
+            };
             // Outside every cue's span the line is blank, checked afresh each
             // pass rather than left holding the last message.
-            const cue = list.at(snap.playTimeMillis(now_ms)) orelse break :blk "";
+            const cue = list.at(snap.playTimeMillis(now_ms)) orelse {
+                line2_source = .armed_no_cue_here;
+                break :blk "";
+            };
             may_scroll = cue.scroll;
+            line2_source = .cue;
             break :blk cue.text;
-        } else if (name_len > 0)
+        } else if (name_len > 0) blk: {
             // Disarmed: show which file is loaded, so it is obvious the right
             // one was picked before starting the disc.
-            cues.baseName(name_buf[0..name_len])
-        else
-            "Blu-Ray mode";
+            line2_source = .filename;
+            break :blk cues.baseName(name_buf[0..name_len]);
+        } else blk: {
+            line2_source = .nothing_selected;
+            break :blk "Blu-Ray mode";
+        };
+
+        if (seen_line2_source == null or line2_source != seen_line2_source.?) {
+            seen_line2_source = line2_source;
+            std.debug.print(
+                "bluray: line2 source -> {s} (armed={}, live={}, name='{s}', has_cue_list={})\n",
+                .{ @tagName(line2_source), cue_state.isArmed(), snap.positionIsLive(now_ms), name_buf[0..name_len], cue_list != null },
+            );
+        }
 
         const line2_window = if (may_scroll)
             scroller.window(line2, str_utils.maxchars, now_ms)
