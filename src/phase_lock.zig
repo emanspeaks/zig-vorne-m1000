@@ -1080,6 +1080,83 @@ test "a seek re-bases the anchor instead of stalling the display" {
     try expectInSync(&sim, &lock);
 }
 
+test "a chapter jump back reacquires the exact value, not off by one" {
+    // The reported failure: after jumping back a chapter, the display settles
+    // a full second off and stays there. A pure *value* error with correct
+    // phase survives every straddle check (both samples move together), so it
+    // can only be caught by the value paths -- mid_second, the hunt drift
+    // check, and the post_edge rebase. This walks the full reacquire for
+    // several jump sizes and jump timings (so the jump lands in front of
+    // different poll kinds), then holds for many seconds; `expectInSync`
+    // asserts *exact* equality away from the edges, where no rounding
+    // ambiguity can excuse an off-by-one.
+    const jumps = [_]i64{ 600_000 - 411, 600_000, 123_456 };
+    for (jumps) |jump_ms| {
+        for (0..3) |pre_steps| {
+            var lock = PhaseLock.init;
+            var sim: Sim = .{ .content_ms = 3_000_000 };
+            sim.stepN(&lock, 20);
+            try expectInSync(&sim, &lock);
+            sim.stepN(&lock, pre_steps);
+
+            sim.content_ms -= jump_ms;
+            sim.stepN(&lock, 40);
+            try expectInSync(&sim, &lock);
+
+            // Hold: every pass must agree exactly at mid-second instants.
+            for (0..60) |_| {
+                sim.step(&lock);
+                try expectInSync(&sim, &lock);
+            }
+        }
+    }
+}
+
+test "reacquire through a transient stop during the jump lands on the exact value" {
+    // A chapter jump can pass through a momentary Stopped report while the
+    // player repositions. That path runs reset() and then the resumed() +
+    // sampleRunning() pair that `bluray.recordSample` performs -- replicated
+    // here literally, since that sequencing lives in bluray.zig outside Sim.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 3_000_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // The jump executes; the player briefly reports stopped.
+    sim.running = false;
+    sim.stepN(&lock, 2);
+    try std.testing.expect(!lock.hasAnchor());
+
+    // Land one chapter back, mid-second, and resume.
+    sim.content_ms -= 600_000 - 411;
+    sim.running = true;
+
+    // recordSample's resume path, verbatim: resumed() then sampleRunning()
+    // with the same sample, then schedule.
+    const wait = lock.next_poll_ms - sim.now_ms;
+    if (wait > 0) sim.advance(wait);
+    const kind = lock.next_kind;
+    sim.advance(10);
+    const sample_ms = sim.now_ms;
+    const value = sim.reported();
+    sim.advance(10);
+    lock.resumed(sample_ms, value);
+    lock.sampleRunning(sample_ms, kind, value);
+    lock.schedule(sim.now_ms, kind, true);
+
+    // The clock must be roughly right immediately (that is resumed()'s job)...
+    const shown = lock.predict(sim.now_ms, 0);
+    try std.testing.expect(@abs(@as(i64, shown) - @as(i64, sim.reported())) <= 1);
+
+    // ...and exactly right once reacquired, staying so.
+    sim.stepN(&lock, 40);
+    try expectInSync(&sim, &lock);
+    for (0..60) |_| {
+        sim.step(&lock);
+        try expectInSync(&sim, &lock);
+    }
+}
+
 test "a hunt bracket requires an exact +1 tick, not merely a changed value" {
     // Directly exercises the bug: two consecutive hunt samples where the value
     // fell must never be accepted as if they had bracketed a normal forward

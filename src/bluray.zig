@@ -806,6 +806,18 @@ const LockObservable = struct {
         };
     }
 
+    /// `PhaseLock.predict`, computed from this captured state. Mirrors that
+    /// function exactly, so the drift printed per poll is the drift the lock
+    /// itself was facing when it evaluated the sample -- computed against the
+    /// anchor as it stood *before* the sample was folded in, since afterwards
+    /// a rebase would have already erased the disagreement being measured.
+    /// Meaningful only when `have_anchor`; callers check.
+    fn predictAt(self: LockObservable, at_ms: i64) u32 {
+        const elapsed_ms = at_ms - self.anchor_ms;
+        if (elapsed_ms < 0) return self.anchor_sec;
+        return self.anchor_sec +| @as(u32, @intCast(@divFloor(elapsed_ms, 1000)));
+    }
+
     /// Log whatever changed between `before` (an earlier capture) and `self`
     /// (the current state), attributing it to the poll of kind `kind` that ran
     /// in between. Silent when nothing changed, which is most polls -- a
@@ -857,6 +869,8 @@ pub const BlurayPlayer = struct {
     secret_key: ?[]const u8,
     state: BlurayPlayerState,
     last_update_time: i64,
+    /// Round trip of the most recent successful request, for telemetry.
+    last_rtt_ms: i64,
     http_client: std.http.Client,
 
     /// Tracks the phase of the player's 1 Hz tick so the displayed time can be
@@ -890,6 +904,7 @@ pub const BlurayPlayer = struct {
             .secret_key = config.loadBlurayKey(io, allocator),
             .state = BlurayPlayerState.init(),
             .last_update_time = 0,
+            .last_rtt_ms = 0,
             .http_client = std.http.Client{ .allocator = allocator, .io = io },
             .lock = .init,
         };
@@ -919,12 +934,9 @@ pub const BlurayPlayer = struct {
         // inside it would fire on every one of the hundreds of steps in a
         // single test). Comparing its externally-visible state before and after
         // instead gives the same visibility without that cost, from the layer
-        // that already does I/O. Every field that a caller could plausibly ask
-        // "did the lock just do something?" about is covered here, not only
-        // the anchor value -- entering/leaving `locked`, starting a refresh,
-        // and the bracket tightening (`anchor_err_ms` shrinking) are all real
-        // events with nothing else to report them.
+        // that already does I/O.
         const before = LockObservable.capture(&self.lock);
+        const prev_sample_ms = self.last_update_time;
 
         self.getStatus(kind) catch |err| {
             std.debug.print("Failed to get Blu-ray status: {}\n", .{err});
@@ -933,7 +945,55 @@ pub const BlurayPlayer = struct {
         };
         self.lock.schedule(time.nowMillis(self.io), kind, self.state.run_status == .Playing);
 
-        LockObservable.capture(&self.lock).logChangesFrom(before, kind);
+        // Everything below is reporting only, and its placement is what keeps
+        // it from affecting the sync itself:
+        //   * the sample window (the sent/recv timestamps inside `getStatus`)
+        //     closed before any printing, so a slow console cannot skew a
+        //     sample instant;
+        //   * `next_poll_ms` is an absolute deadline chosen above, so time
+        //     spent printing comes out of this thread's subsequent sleep, not
+        //     out of the poll cadence;
+        //   * this is the polling thread -- the render loop never executes any
+        //     of it.
+        const after = LockObservable.capture(&self.lock);
+        after.logChangesFrom(before, kind);
+
+        if (self.last_update_time == prev_sample_ms) {
+            // The request went out but no sample landed: player off, CGI
+            // error, or an unparseable response. Previously silent, which made
+            // "the PLL is not updating" indistinguishable from "everything
+            // agrees" in the log.
+            std.debug.print("pll: {s} no sample (player off or CGI error)\n", .{@tagName(kind)});
+            return;
+        }
+
+        const sample_ms = self.last_update_time;
+        const reported = self.state.play_time_seconds;
+        if (self.state.run_status != .Playing) {
+            std.debug.print("pll: {s} reported={d} status={s} rtt={d}ms\n", .{
+                @tagName(kind), reported, @tagName(self.state.run_status), self.last_rtt_ms,
+            });
+        } else if (before.have_anchor) {
+            // The line that matters when chasing drift: the value the player
+            // reported vs. what the pre-sample anchor predicted for that same
+            // instant. drift=0 means the model and the player agree exactly;
+            // a persistent nonzero drift with `into` well away from 0/1000 is
+            // a genuine value error on our side; drift of +-1 with `into` near
+            // an edge is rounding ambiguity, not error.
+            const predicted = before.predictAt(sample_ms);
+            const drift = @as(i64, reported) - @as(i64, predicted);
+            const into_ms = @mod(sample_ms - before.anchor_ms, 1000);
+            std.debug.print("pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}{s}\n", .{
+                @tagName(kind),          reported,          predicted,
+                drift,                   into_ms,           after.anchor_err_ms,
+                self.last_rtt_ms,        if (after.locked) "locked" else "hunting",
+                if (after.refreshing) "+refresh" else "",
+            });
+        } else {
+            std.debug.print("pll: {s} reported={d} (no anchor yet) rtt={d}ms\n", .{
+                @tagName(kind), reported, self.last_rtt_ms,
+            });
+        }
     }
 
     /// Current state in the form the display consumes.
@@ -1007,6 +1067,7 @@ pub const BlurayPlayer = struct {
         };
         defer self.allocator.free(response);
         const recv_ms = time.nowMillis(self.io);
+        self.last_rtt_ms = recv_ms - sent_ms;
         // The player read its own clock somewhere inside the request window.
         // The midpoint is the least-biased estimate; timestamping on arrival
         // would bias every sample late by roughly a full round trip.
