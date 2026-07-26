@@ -68,6 +68,18 @@ pub const SerialPort = struct {
         std.debug.print("Serial port configured: 19200 8N1 raw mode\n", .{});
     }
 
+    /// How long a single write attempt may wait for the port to be writable
+    /// before giving up. A 20-column line is on the order of 17 ms of wire
+    /// time at 19200 baud, so this is generous slack, not a tight budget --
+    /// its only job is to convert "the kernel write buffer will never drain"
+    /// (a wedged USB-serial adapter, a wiring/flow-control fault holding CTS
+    /// low) from an unbounded hang into a bounded, logged, retried-next-pass
+    /// failure. The display loop is a real-time task with a hard rule that
+    /// nothing on it may block unboundedly; a plain blocking `write(2)` on a
+    /// tty is exactly that hazard, since the kernel is free to block the
+    /// caller until the device drains, however long that takes.
+    const write_timeout_ms = 500;
+
     /// Write the whole of `data`, looping over short writes.
     ///
     /// `linux.write` returns the raw syscall result: a negated errno (as a
@@ -78,9 +90,17 @@ pub const SerialPort = struct {
     /// caller that only ever issued one call and ignored the count (as this
     /// used to) would have no way to notice a display command that was only
     /// partially sent.
-    pub fn write(self: *SerialPort, data: []const u8) error{WriteFailed}!void {
+    pub fn write(self: *SerialPort, data: []const u8) error{ WriteFailed, WriteTimeout }!void {
         var remaining = data;
         while (remaining.len > 0) {
+            var poll_fd = linux.pollfd{
+                .fd = self.fd,
+                .events = linux.POLL.OUT,
+                .revents = 0,
+            };
+            const poll_result = linux.poll(@ptrCast(&poll_fd), 1, write_timeout_ms);
+            if (poll_result <= 0) return error.WriteTimeout;
+
             const result = linux.write(self.fd, remaining.ptr, remaining.len);
             const signed: isize = @bitCast(result);
             // <= 0 covers both a negated errno and a zero-byte write, which

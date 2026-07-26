@@ -261,16 +261,19 @@ pub fn runBlurayClocks(
             // work the transport controls mid-message.
             if (!snap.positionIsLive(now_ms)) {
                 line2_source = .armed_not_live;
+                seen_cue_span = null;
                 break :blk "";
             }
             const list = cue_list orelse {
                 line2_source = .armed_no_cue_list;
+                seen_cue_span = null;
                 break :blk "";
             };
             // Outside every cue's span the line is blank, checked afresh each
             // pass rather than left holding the last message.
             const cue = list.at(snap.playTimeMillis(now_ms)) orelse {
                 line2_source = .armed_no_cue_here;
+                seen_cue_span = null;
                 break :blk "";
             };
             may_scroll = cue.scroll;
@@ -294,11 +297,17 @@ pub fn runBlurayClocks(
             break :blk cue.text;
         } else if (name_len > 0) blk: {
             // Disarmed: show which file is loaded, so it is obvious the right
-            // one was picked before starting the disc.
+            // one was picked before starting the disc. Also clears the seen
+            // cue span, so re-arming into the very same cue (stop/start
+            // around the same position) logs it again instead of staying
+            // silent because the span "hasn't changed" since before the
+            // disarm.
             line2_source = .filename;
+            seen_cue_span = null;
             break :blk cues.baseName(name_buf[0..name_len]);
         } else blk: {
             line2_source = .nothing_selected;
+            seen_cue_span = null;
             break :blk "Blu-Ray mode";
         };
 
@@ -353,11 +362,19 @@ pub fn runBlurayClocks(
         if (!have_last or !std.mem.eql(u8, &line2buf, &last_line2)) {
             cmd_parts.clearRetainingCapacity();
             try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
+            // Every attempt, not just failures -- this is the one point that
+            // can confirm or rule out the send path itself when the panel
+            // and the `bluray: cue -> ...`/`line2 source ->` logs disagree
+            // about what should be on screen.
+            var readable: std.ArrayList(u8) = .empty;
+            defer readable.deinit(allocator);
+            vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
             if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
                 last_line2 = line2buf;
                 sent_anything = true;
+                std.debug.print("bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
             } else |err| {
-                std.debug.print("bluray: failed to send line 2: {}\n", .{err});
+                std.debug.print("bluray: sending line 2: \"{s}\" send status: {}\n", .{ readable.items, err });
             }
         }
         if (sent_anything) have_last = true;
