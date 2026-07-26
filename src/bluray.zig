@@ -123,6 +123,11 @@ pub fn runBlurayClocks(
     var seen_generation: u64 = 0;
     // For "log only on change" below -- see `Line2Source`.
     var seen_line2_source: ?Line2Source = null;
+    // A cue's [start_ms, end_ms) span is unique within a well-formed file, so
+    // it stands in for cue identity: `line2_source` alone stays `.cue` across
+    // every cue in a file, which hid exactly the transition worth seeing when
+    // a scroll looks like it got interrupted partway through.
+    var seen_cue_span: ?struct { start_ms: i64, end_ms: i64 } = null;
 
     // Everything that can block for an unbounded time runs on its own thread,
     // so that this loop only ever does arithmetic, a memcmp and one serial
@@ -262,6 +267,14 @@ pub fn runBlurayClocks(
             };
             may_scroll = cue.scroll;
             line2_source = .cue;
+            if (seen_cue_span == null or seen_cue_span.?.start_ms != cue.start_ms or seen_cue_span.?.end_ms != cue.end_ms) {
+                seen_cue_span = .{ .start_ms = cue.start_ms, .end_ms = cue.end_ms };
+                const cols = (str_utils.strlensz(cue.text) catch unreachable)[0];
+                std.debug.print(
+                    "bluray: cue -> [{d}..{d}) scroll={} {d} bytes, {d} cols: \"{s}\"\n",
+                    .{ cue.start_ms, cue.end_ms, cue.scroll, cue.text.len, cols, cue.text },
+                );
+            }
             break :blk cue.text;
         } else if (name_len > 0) blk: {
             // Disarmed: show which file is loaded, so it is obvious the right

@@ -20,3 +20,4 @@ EWMA
 bool
 rtt
 unparseable
+unextrapolated
