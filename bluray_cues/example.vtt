@@ -6,9 +6,12 @@ Second-line messages for Blu-ray mode. Copy files like this one into
 
 Timestamps are elapsed play time as the player reports it, i.e. counting from
 the moment the title started playing -- not from the start of the disc. The
-display is 20 columns wide; anything longer is clipped. Stick to plain ASCII:
-the panel is not a UTF-8 device, and a multi-byte character eats more than one
-column and renders as garbage.
+display is 20 columns wide; anything longer scrolls.
+
+Accented characters are fine: write "Jónsi" or "Café" normally and they are
+converted to the panel's own glyphs. Curly quotes and dashes fold to ASCII.
+Anything with no glyph at all becomes a single "?" rather than corrupting the
+line.
 
 Cues are only drawn once you press "Start cues" on the web page. The player
 reports elapsed time and nothing else, so nothing here can tell the feature

@@ -68,7 +68,13 @@ pub const error_retry_ms: i64 = 2000;
 /// the round trip allows. Hunting is a burst, not a steady state.
 pub const hunt_patience: u32 = 40;
 /// Widest bracket worth anchoring to at all, once patience has run out.
-pub const max_bracket_ms: i64 = 400;
+pub const max_bracket_ms: i64 = 250;
+/// Widest the straddle may ever be opened.
+///
+/// The pair has to sit either side of *one* edge. As the half-width approaches
+/// 500 ms it spans the whole second and starts bracketing two, at which point
+/// its check fails constantly and thrashes the lock instead of protecting it.
+pub const max_guard_ms: i64 = 300;
 /// Re-acquire the anchor from scratch this often. The straddle only ever
 /// confirms the existing estimate and never improves it, so without this a lock
 /// taken from a loose bracket would stay loose for the rest of the disc, and
@@ -88,6 +94,16 @@ pub const PhaseLock = struct {
     anchor_err_ms: i64,
     /// When the current anchor was acquired, for periodic re-acquisition.
     locked_at_ms: i64,
+    /// Whether an anchor exists at all, independent of whether its phase is
+    /// currently trusted.
+    ///
+    /// Once the tick has been bracketed even once, the model keeps running from
+    /// that anchor -- free-wheeling -- through hunts, refreshes and network
+    /// trouble. Only a real discontinuity throws it away. Without this a lost
+    /// lock sent the display back to the last raw sample, which changes only
+    /// when a poll lands: the clock visibly stalls and then jumps, which is far
+    /// worse than coasting on a slightly stale estimate.
+    have_anchor: bool,
     /// Hunting for a fresh bracket while still locked.
     ///
     /// A periodic re-sync must not drop the lock. Dropping it would send
@@ -112,6 +128,7 @@ pub const PhaseLock = struct {
         .anchor_sec = 0,
         .anchor_err_ms = 0,
         .locked_at_ms = 0,
+        .have_anchor = false,
         .refreshing = false,
         .prev_sample_ms = 0,
         .prev_sample_sec = 0,
@@ -129,18 +146,55 @@ pub const PhaseLock = struct {
         return self.phase == .locked;
     }
 
-    /// Abandon the phase estimate and any bracket in progress.
+    /// Whether `predict` has anything to extrapolate from.
+    pub fn hasAnchor(self: *const PhaseLock) bool {
+        return self.have_anchor;
+    }
+
+    /// Stop trusting the phase and hunt for a fresh bracket, while the existing
+    /// anchor carries on driving the display.
+    ///
+    /// Losing the phase does not mean the counter stopped counting, so the best
+    /// available estimate is still the old anchor run forward. Discarding it
+    /// here would stall the display for the length of the hunt.
     pub fn drop(self: *PhaseLock) void {
         self.phase = .searching;
-        self.anchor_err_ms = 0;
         self.have_prev_sample = false;
         self.hunt_samples = 0;
         self.refreshing = false;
     }
 
-    /// Predicted counter value at `at_ms`, or `fallback` when unlocked.
+    /// Throw the anchor away entirely.
+    ///
+    /// Only for a genuine discontinuity -- the counter stopped or paused --
+    /// where nothing about the old model applies any more and free-wheeling
+    /// from it would confidently display a time that is simply wrong.
+    pub fn reset(self: *PhaseLock) void {
+        self.drop();
+        self.have_anchor = false;
+        self.anchor_err_ms = 0;
+    }
+
+    /// Re-point the anchor at a fresh sample without claiming to know the phase.
+    ///
+    /// For a seek: the counter is still running, but the old anchor's *value*
+    /// is now wrong, so free-wheeling from it would show the wrong time.
+    /// Anchoring on the sample instant is correct to within a second straight
+    /// away, and the hunt tightens the phase from there -- far better than
+    /// stalling the display until a new bracket turns up.
+    fn rebase(self: *PhaseLock, sample_ms: i64, value_sec: u32) void {
+        self.drop();
+        self.anchor_ms = sample_ms;
+        self.anchor_sec = value_sec;
+        // The value is right; where inside the second it changes is not known.
+        self.anchor_err_ms = 500;
+        self.have_anchor = true;
+    }
+
+    /// Predicted counter value at `at_ms`, or `fallback` when there is no
+    /// anchor to extrapolate from.
     pub fn predict(self: *const PhaseLock, at_ms: i64, fallback: u32) u32 {
-        if (self.phase != .locked) return fallback;
+        if (!self.have_anchor) return fallback;
         const elapsed_ms = at_ms - self.anchor_ms;
         if (elapsed_ms < 0) return self.anchor_sec;
         return self.anchor_sec +| @as(u32, @intCast(@divFloor(elapsed_ms, 1000)));
@@ -165,13 +219,29 @@ pub const PhaseLock = struct {
     /// `2 * anchor_err_ms` equals `gap + rtt`, which covers `anchor_err_ms +
     /// rtt/2` for any non-negative gap.
     fn guardMs(self: *const PhaseLock) i64 {
-        return @max(edge_guard_ms, 2 * self.anchor_err_ms);
+        return @min(max_guard_ms, @max(edge_guard_ms, 2 * self.anchor_err_ms));
     }
 
-    /// Record that the source is not running. Resuming restarts the tick at an
-    /// unrelated phase, so any lock is void.
+    /// Whether the straddle is worth running at all.
+    ///
+    /// The pair has to land either side of *one* edge. That needs the guard to
+    /// exceed the anchor's own uncertainty while still staying well inside half
+    /// a second. On a slow link both cannot hold at once: the guard saturates,
+    /// the pair stops bracketing reliably, and its check then fails over and
+    /// over, thrashing the lock it exists to protect.
+    ///
+    /// In that regime the mid-second value check plus periodic re-hunting is
+    /// the whole useful mechanism. The phase stays as good as the last hunt
+    /// made it, which is all the round trip allows anyway.
+    fn straddleUseful(self: *const PhaseLock) bool {
+        return 2 * self.anchor_err_ms <= max_guard_ms;
+    }
+
+    /// Record that the source is not running. Nothing is counting, and resuming
+    /// restarts the tick at an unrelated phase, so the anchor is void rather
+    /// than merely untrusted -- there is nothing to free-wheel.
     pub fn sampleStopped(self: *PhaseLock) void {
-        self.drop();
+        self.reset();
     }
 
     /// Fold one sample taken while the source is running into the lock.
@@ -202,6 +272,7 @@ pub const PhaseLock = struct {
                     self.anchor_err_ms = err_ms;
                     self.locked_at_ms = sample_ms;
                     self.phase = .locked;
+                    self.have_anchor = true;
                     self.refreshing = false;
                     self.hunt_samples = 0;
                 }
@@ -238,9 +309,10 @@ pub const PhaseLock = struct {
             },
             .hunt, .pre_edge => {
                 // Sampled close to an edge, where +/-1 is genuinely ambiguous.
-                // Anything beyond that is a seek to somewhere else entirely.
+                // Anything beyond that is a seek to somewhere else entirely,
+                // which invalidates the anchor's value as well as its phase.
                 const drift = @as(i64, value_sec) - @as(i64, self.predict(sample_ms, value_sec));
-                if (drift < -1 or drift > 1) self.drop();
+                if (drift < -1 or drift > 1) self.rebase(sample_ms, value_sec);
             },
         }
     }
@@ -272,6 +344,14 @@ pub const PhaseLock = struct {
             return;
         }
 
+        // Too loose to straddle: fall back to value checks alone, which stay
+        // reliable at any round trip because they are taken far from an edge.
+        if (!self.straddleUseful()) {
+            self.next_poll_ms = self.midSecondAfter(now_ms);
+            self.next_kind = .mid_second;
+            return;
+        }
+
         const guard = self.guardMs();
         switch (completed) {
             .pre_edge => {
@@ -281,9 +361,7 @@ pub const PhaseLock = struct {
             },
             .post_edge => {
                 // Then check the value from the quietest point in the second.
-                var mid = self.nextEdgeAfter(now_ms) - 500;
-                if (mid <= now_ms) mid += 1000;
-                self.next_poll_ms = mid;
+                self.next_poll_ms = self.midSecondAfter(now_ms);
                 self.next_kind = .mid_second;
             },
             .hunt, .mid_second => {
@@ -293,6 +371,12 @@ pub const PhaseLock = struct {
                 self.next_kind = .pre_edge;
             },
         }
+    }
+
+    /// The next instant midway between two predicted edges, strictly ahead.
+    fn midSecondAfter(self: *const PhaseLock, now_ms: i64) i64 {
+        const mid = self.nextEdgeAfter(now_ms) - 500;
+        return if (mid > now_ms) mid else mid + 1000;
     }
 
     /// A failed request leaves a gap in sampling, invalidating any bracket.
@@ -608,7 +692,97 @@ test "the anchor is re-acquired periodically rather than trusted forever" {
     try expectInSync(&sim, &lock);
 }
 
-test "predict falls back while unlocked" {
+test "predict falls back only when there is no anchor at all" {
     var lock = PhaseLock.init;
     try std.testing.expectEqual(@as(u32, 42), lock.predict(1_000_000, 42));
+}
+
+test "the clock keeps running while the lock is being re-acquired" {
+    // The reported failure: during a re-sync the displayed time stalled and
+    // then jumped. Losing the phase does not mean the counter stopped counting,
+    // so the anchor must keep driving the display through the hunt. Falling
+    // back to the last raw sample freezes it until the next poll lands.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 40_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // Force the phase to be re-hunted.
+    lock.drop();
+    try std.testing.expect(!lock.isLocked());
+    try std.testing.expect(lock.hasAnchor());
+
+    // Across the whole hunt the prediction must track the truth continuously,
+    // never sticking at one value and never going backwards.
+    var previous = lock.predict(sim.now_ms, 0);
+    var advanced: usize = 0;
+    for (0..40) |_| {
+        sim.step(&lock);
+        const shown = lock.predict(sim.now_ms, 0);
+        try std.testing.expect(shown >= previous); // never stalls backwards
+        if (shown > previous) advanced += 1;
+        // Never more than a second adrift while free-wheeling.
+        const truth = sim.reported();
+        const err = @abs(@as(i64, shown) - @as(i64, truth));
+        try std.testing.expect(err <= 1);
+        previous = shown;
+    }
+    // And it really did keep ticking rather than sitting still.
+    try std.testing.expect(advanced >= 2);
+    try expectInSync(&sim, &lock);
+}
+
+test "a stop discards the anchor rather than free-wheeling past it" {
+    // Free-wheeling is only right while the counter is actually counting. A
+    // stopped player is not, so coasting would confidently show a time that is
+    // simply wrong.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 12_000 };
+    sim.stepN(&lock, 20);
+    try std.testing.expect(lock.hasAnchor());
+
+    lock.sampleStopped();
+    try std.testing.expect(!lock.hasAnchor());
+    try std.testing.expectEqual(@as(u32, 99), lock.predict(sim.now_ms, 99));
+}
+
+test "a seek re-bases the anchor instead of stalling the display" {
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 100_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // Jump somewhere unrelated. The anchor's value is now wrong, so it must be
+    // re-pointed at the new position -- but it must still have one, so the
+    // clock keeps moving while the phase is re-hunted.
+    sim.content_ms += 900_000 + 321;
+    sim.stepN(&lock, 3);
+    try std.testing.expect(lock.hasAnchor());
+    const shown = lock.predict(sim.now_ms, 0);
+    const err = @abs(@as(i64, shown) - @as(i64, sim.reported()));
+    try std.testing.expect(err <= 1);
+
+    sim.stepN(&lock, 30);
+    try expectInSync(&sim, &lock);
+}
+
+test "the straddle never opens wider than it can bracket one edge" {
+    // A half-width approaching 500 ms spans the whole second and starts
+    // bracketing two edges, at which point the check fails every time and
+    // thrashes the lock instead of protecting it.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 8_000, .rtt_ms = 250 };
+
+    sim.stepN(&lock, hunt_patience + 40);
+    try std.testing.expect(lock.guardMs() <= max_guard_ms);
+    try std.testing.expect(lock.guardMs() < 500);
+
+    // Even at this round trip it must hold a lock most of the time rather than
+    // oscillating between locked and hunting.
+    var locked_polls: usize = 0;
+    for (0..200) |_| {
+        sim.step(&lock);
+        if (lock.isLocked()) locked_polls += 1;
+    }
+    try std.testing.expect(locked_polls * 100 / 200 >= 70);
 }

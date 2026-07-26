@@ -270,14 +270,19 @@ pub const Snapshot = struct {
     run_status: BlurayPlayerRunStatus = .Stopped,
     /// Last value the player actually reported.
     play_time_seconds: u32 = 0,
-    /// Phase-lock anchor. The rest is meaningful only when `locked`.
-    locked: bool = false,
+    /// Phase-lock anchor. The rest is meaningful only when `has_anchor`.
+    ///
+    /// This deliberately tracks whether an anchor *exists*, not whether its
+    /// phase is currently trusted. The clock has to keep running while the lock
+    /// hunts for a fresh bracket; falling back to the raw value there would
+    /// stall the display until the next poll landed and then jump.
+    has_anchor: bool = false,
     anchor_ms: i64 = 0,
     anchor_sec: u32 = 0,
 
     /// Play position in milliseconds at `now_ms`.
     pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
-        if (self.run_status != .Playing or !self.locked) {
+        if (self.run_status != .Playing or !self.has_anchor) {
             return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
         }
         return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms);
@@ -293,7 +298,7 @@ pub const Snapshot = struct {
     /// When the displayed second next changes, or null when nothing is ticking
     /// and so there is no future moment worth waking up for.
     pub fn nextTickMs(self: Snapshot, now_ms: i64) ?i64 {
-        if (self.run_status != .Playing or !self.locked) return null;
+        if (self.run_status != .Playing or !self.has_anchor) return null;
         return self.anchor_ms + (@divFloor(now_ms - self.anchor_ms, 1000) + 1) * 1000;
     }
 };
@@ -494,7 +499,7 @@ pub const BlurayPlayer = struct {
         return .{
             .run_status = self.state.run_status,
             .play_time_seconds = self.state.play_time_seconds,
-            .locked = self.lock.isLocked(),
+            .has_anchor = self.lock.hasAnchor(),
             .anchor_ms = self.lock.anchor_ms,
             .anchor_sec = self.lock.anchor_sec,
         };
@@ -515,8 +520,10 @@ pub const BlurayPlayer = struct {
             return;
         }
 
-        // Playback just (re)started; the previous phase means nothing now.
-        if (!was_playing) self.lock.drop();
+        // Playback just (re)started. The counter resumes at an unrelated phase
+        // and possibly an unrelated position, so the old anchor is void rather
+        // than merely untrusted.
+        if (!was_playing) self.lock.reset();
 
         self.lock.sampleRunning(sample_ms, kind, play_time);
     }
@@ -750,7 +757,7 @@ test "a locked snapshot ticks with the player, not with when it was polled" {
     const snap: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 100,
-        .locked = true,
+        .has_anchor = true,
         .anchor_ms = 50_000,
         .anchor_sec = 100,
     };
@@ -770,7 +777,7 @@ test "nextTickMs is the instant the display must be redrawn" {
     const snap: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 100,
-        .locked = true,
+        .has_anchor = true,
         .anchor_ms = 50_000,
         .anchor_sec = 100,
     };
@@ -789,7 +796,7 @@ test "nextTickMs is the instant the display must be redrawn" {
 
     // An unlocked snapshot cannot predict an edge either.
     var unlocked = snap;
-    unlocked.locked = false;
+    unlocked.has_anchor = false;
     try std.testing.expectEqual(@as(?i64, null), unlocked.nextTickMs(50_500));
 }
 
@@ -797,7 +804,7 @@ test "an unlocked or paused snapshot falls back to the last reported second" {
     const paused: Snapshot = .{
         .run_status = .Paused,
         .play_time_seconds = 1234,
-        .locked = true,
+        .has_anchor = true,
         .anchor_ms = 50_000,
         .anchor_sec = 100,
     };
@@ -808,7 +815,7 @@ test "an unlocked or paused snapshot falls back to the last reported second" {
     const searching: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 77,
-        .locked = false,
+        .has_anchor = false,
     };
     try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
 }

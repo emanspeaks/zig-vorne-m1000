@@ -23,6 +23,7 @@
 //! one cue should not blank the display for a whole movie.
 
 const std = @import("std");
+const vorne_charset = @import("vorne_charset.zig");
 
 pub const Cue = struct {
     start_ms: i64,
@@ -125,6 +126,16 @@ pub fn parse(child_allocator: std.mem.Allocator, source: []const u8) ParseError!
         while (lines.next()) |payload_line| {
             const payload = std.mem.trim(u8, payload_line, " \t");
             if (payload.len == 0) break;
+            // A timing line ends the payload even with no blank line before it.
+            // Cue text can never contain `-->`, so such a line can only be the
+            // start of the next cue -- and hand-written files routinely run
+            // cues together, since the blank line carries no meaning to a
+            // human. Without this the payload swallows every following cue up
+            // to the next blank line, merging a whole run of them into one.
+            if (std.mem.indexOf(u8, payload, "-->") != null) {
+                lines.pushBack(payload_line);
+                break;
+            }
             if (text.items.len > 0) try text.append(a, ' ');
             try appendPayload(a, &text, payload);
         }
@@ -178,8 +189,16 @@ fn blockKeyword(line: []const u8, keyword: []const u8) ?[]const u8 {
 const LineIter = struct {
     rest: []const u8,
     done: bool = false,
+    /// A line that was read but turned out to belong to the next block, handed
+    /// back so the outer loop sees it. One line of lookahead is all the grammar
+    /// needs: a cue payload only ever over-reads by the timing line that ends it.
+    pending: ?[]const u8 = null,
 
     fn next(self: *LineIter) ?[]const u8 {
+        if (self.pending) |line| {
+            self.pending = null;
+            return line;
+        }
         if (self.done) return null;
         if (std.mem.indexOfScalar(u8, self.rest, '\n')) |nl| {
             const line = self.rest[0..nl];
@@ -188,6 +207,10 @@ const LineIter = struct {
         }
         self.done = true;
         return std.mem.trimEnd(u8, self.rest, "\r");
+    }
+
+    fn pushBack(self: *LineIter, line: []const u8) void {
+        self.pending = line;
     }
 
     /// Consume the remainder of the current block, up to and including the
@@ -281,12 +304,23 @@ fn appendPayload(
                 try out.append(allocator, '&');
                 i += 1;
             },
-            else => |c| {
-                try out.append(allocator, c);
-                i += 1;
+            else => {
+                // Everything else is text, transcoded from UTF-8 into the
+                // panel's own character set. Doing it here means `text` is
+                // measured in display columns from this point on, which is what
+                // the width and scrolling logic assumes.
+                const run_end = nextMarkup(line, i);
+                try vorne_charset.encodeUtf8(allocator, out, line[i..run_end]);
+                i = run_end;
             },
         }
     }
+}
+
+/// End of the plain-text run starting at `from`: the next `<` or `&`, or the
+/// end of the line.
+fn nextMarkup(line: []const u8, from: usize) usize {
+    return std.mem.indexOfAnyPos(u8, line, from, "<&") orelse line.len;
 }
 
 /// The escapes WebVTT defines. The two direction marks have no glyph, so they
@@ -427,6 +461,76 @@ test "out-of-order cues are sorted so at stays correct" {
     try testing.expectEqualStrings("LATER", list.at(35_000).?.text);
 }
 
+test "cues run together without blank lines are kept separate" {
+    // Regression guard. Hand-written files group cues visually and leave out
+    // the blank line between them; treating only a blank line as the end of a
+    // payload merged every such run into a single cue whose text was the rest
+    // of the group, timing lines and all.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:00.000 --> 00:01:01.000\n" ++
+        "1m2alt Berk Alt\n" ++
+        "00:01:01.000 --> 00:06:05.000\n" ++
+        "1m2[37] This Is Berk\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    try testing.expectEqual(@as(usize, 2), list.cues.len);
+    try testing.expectEqualStrings("1m2alt Berk Alt", list.cues[0].text);
+    try testing.expectEqualStrings("1m2[37] This Is Berk", list.cues[1].text);
+    try testing.expectEqual(@as(i64, 61_000), list.cues[1].start_ms);
+
+    // And the right one is live at the right moment.
+    try testing.expectEqualStrings("1m2alt Berk Alt", list.at(30_000).?.text);
+    try testing.expectEqualStrings("1m2[37] This Is Berk", list.at(120_000).?.text);
+}
+
+test "a run-together warning countdown produces one cue per step" {
+    // The shape the real cue files use: three warnings a second apart running
+    // straight into the cue itself, with no blank lines anywhere.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:09:14.000 --> 00:09:15.000\n***1m7a War Room\n" ++
+        "00:09:15.000 --> 00:09:16.000\n**1m7a War Room\n" ++
+        "00:09:16.000 --> 00:09:17.000\n*1m7a War Room\n" ++
+        "00:09:17.000 --> 00:09:56.000\n1m7a War Room\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    try testing.expectEqual(@as(usize, 4), list.cues.len);
+    try testing.expectEqualStrings("***1m7a War Room", list.at(554_500).?.text);
+    try testing.expectEqualStrings("**1m7a War Room", list.at(555_500).?.text);
+    try testing.expectEqualStrings("*1m7a War Room", list.at(556_500).?.text);
+
+    const actual = list.at(557_500).?;
+    try testing.expectEqualStrings("1m7a War Room", actual.text);
+    // Only the warnings are pinned; the cue itself scrolls if it needs to.
+    try testing.expect(actual.scroll);
+    try testing.expect(!list.at(554_500).?.scroll);
+}
+
+test "a payload still ends at a blank line, and multi-line payloads survive" {
+    // The new rule must not break the ordinary case: a genuine two-line payload
+    // has to keep joining, since neither of its lines contains a timing arrow.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:01.000 --> 00:00:02.000\n" ++
+        "FIRST LINE\n" ++
+        "SECOND LINE\n" ++
+        "\n" ++
+        "00:00:05.000 --> 00:00:06.000\n" ++
+        "NEXT CUE\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    try testing.expectEqual(@as(usize, 2), list.cues.len);
+    try testing.expectEqualStrings("FIRST LINE SECOND LINE", list.cues[0].text);
+    try testing.expectEqualStrings("NEXT CUE", list.cues[1].text);
+}
+
 test "a leading asterisk marks a warning line that must not scroll" {
     const source =
         "WEBVTT\n\n" ++
@@ -469,6 +573,42 @@ test "an asterisk on a multi-line payload still marks the whole cue" {
     const cue = list.at(1_500).?;
     try testing.expect(!cue.scroll);
     try testing.expectEqualStrings("*STOP THE FIGHT", cue.text);
+}
+
+test "cue text is transcoded into the panel's character set" {
+    // The panel is not a UTF-8 device, so a track name written with the obvious
+    // character has to become the panel's own byte for that glyph -- otherwise
+    // it arrives as two bytes of mojibake and throws the column count out too.
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:01.000 --> 00:00:02.000\n" ++
+        "J\u{00F3}nsi: Sticks & Stones\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    const text = list.cues[0].text;
+    // 22 columns, one byte each, rather than 23 bytes for 22 columns.
+    try testing.expectEqual(@as(usize, 22), text.len);
+    try testing.expectEqual(@as(u8, 0xA2), text[1]); // CP437 o-acute
+    try testing.expectEqualStrings("nsi: Sticks & Stones", text[2..]);
+}
+
+test "transcoding does not disturb entity decoding or tag stripping" {
+    const source =
+        "WEBVTT\n\n" ++
+        "00:00:01.000 --> 00:00:02.000\n" ++
+        "<b>Caf\u{00E9}</b> &amp; Cr\u{00E8}me\n";
+
+    var list = try parse(testing.allocator, source);
+    defer list.deinit();
+
+    const text = list.cues[0].text;
+    try testing.expectEqualStrings("Caf", text[0..3]);
+    try testing.expectEqual(@as(u8, 0x82), text[3]); // e-acute
+    try testing.expectEqualStrings(" & Cr", text[4..9]);
+    try testing.expectEqual(@as(u8, 0x8A), text[9]); // e-grave
+    try testing.expectEqualStrings("me", text[10..]);
 }
 
 test "a file without the signature is rejected" {
