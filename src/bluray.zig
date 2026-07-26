@@ -28,7 +28,7 @@ pub fn runBlurayClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode
 
     // Initialize frame timer for real-time operation
     // var timer = frame_timer.FrameTimer.init(1.0); // 1 FPS target
-    var timer = frame_timer.FrameTimer.init(io, 0.2); // 1 FPS target
+    var timer = frame_timer.FrameTimer.init(io, 5); // 5 FPS target
 
     // Initialize Blu-ray player
     var player = BlurayPlayer.init(io, allocator);
