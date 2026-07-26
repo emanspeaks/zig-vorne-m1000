@@ -381,30 +381,28 @@ pub const PhaseLock = struct {
             self.next_kind = .hunt;
             return;
         }
-        // Locked: roughly one check per second, with the *sample* instant --
-        // which lands `sample_lag_ms` after the scheduled send -- placed at a
-        // rotating offset within the modelled second rather than always at
-        // its middle. The rotation is what keeps the estimator alive while
-        // locked: a sample parked mid-second has the interval [-530, +530],
-        // which can neither narrow the accumulated estimate nor contradict
-        // it, so a sub-second phase shift (a short pause, drift) would stay
-        // invisible for as long as the lock held. Sweeping the placement
-        // means every part of the second gets probed within a few polls, and
-        // a shifted phase produces a contradicting sample almost immediately.
-        // Near-edge samples need no special treatment -- a +-1 reading there
-        // is not ambiguity but exactly the evidence the interval encodes.
+        // Locked: poll again as soon as reasonable, not as soon as physically
+        // possible. There is no urgency once locked -- only confirmation --
+        // but no reason either to sit idle beyond a small deliberate gap: the
+        // round trip already spent getting here (folded into `now_ms`, which
+        // is measured *after* the previous response arrived) is the only real
+        // throttle this design needs, since it is set by how fast the device
+        // itself can answer.
         //
-        // Descending offsets so consecutive targets are ~800 ms apart (a
-        // steady cadence under the 1 s cap) while covering the whole second
-        // every five polls.
-        const offsets = [_]i64{ 500, 300, 100, 900, 700 };
-        const off = offsets[self.maintain_slot % offsets.len];
-        self.maintain_slot +%= 1;
-        const lag = self.sample_lag_ms;
-        const base = self.nextEdgeAfter(now_ms + lag) - 1000; // last edge at or before now+lag
-        var target = base + off;
-        if (target <= now_ms + lag) target += 1000;
-        self.next_poll_ms = target - lag;
+        // The stagger (same mechanism as hunting) is what keeps the estimator
+        // alive while locked, not the interval's width: a sample parked at a
+        // fixed offset every time -- mid-second especially -- has the same
+        // interval every poll and can neither narrow the accumulated estimate
+        // nor contradict it, so a sub-second phase shift would stay invisible
+        // for as long as the lock held. Moving the offset means every part of
+        // the second gets probed within a few polls, and a shifted phase
+        // produces a contradicting sample almost immediately. Near-edge
+        // samples need no special treatment -- a +-1 reading there is not
+        // ambiguity but exactly the evidence the interval encodes.
+        const gap = fast_poll_ms +
+            poll_stagger_step_ms * @as(i64, @intCast(self.stagger % poll_stagger_cycle));
+        self.stagger +%= 1;
+        self.next_poll_ms = now_ms + gap;
         self.next_kind = .mid_second;
     }
 
@@ -535,7 +533,7 @@ test "stays locked and in sync over a long run" {
     try expectInSync(&sim, &lock);
 }
 
-test "locked maintenance costs about one poll per second" {
+test "locked maintenance polls back-to-back, throttled only by the round trip" {
     var lock = PhaseLock.init;
     var sim: Sim = .{ .content_ms = 2_000 };
     sim.stepN(&lock, 50);
@@ -546,11 +544,14 @@ test "locked maintenance costs about one poll per second" {
     sim.stepN(&lock, polls);
     const elapsed_ms = sim.now_ms - start_ms;
 
-    // The rotating maintenance placement advances ~800 ms per poll; the cap
-    // makes more than ~1/s impossible and drift-free sim gives no reason to
-    // re-acquire at the faster cadence.
-    try std.testing.expect(elapsed_ms >= 20_000);
-    try std.testing.expect(elapsed_ms <= 35_000);
+    // Each dispatch follows the previous response by only the round trip
+    // (baked into `now_ms`) plus the small stagger -- no deliberate idle is
+    // added on top. At this sim's low rtt (20 ms) that puts every poll well
+    // under the 1 s cap; a slow, ~1 s round trip settles near the cap on its
+    // own (see "a one-second round trip locks via interval intersection").
+    const max_gap = fast_poll_ms + poll_stagger_step_ms * (poll_stagger_cycle - 1) + sim.rtt_ms;
+    try std.testing.expect(elapsed_ms <= polls * max_gap);
+    try std.testing.expect(elapsed_ms >= polls * (fast_poll_ms + sim.rtt_ms));
 }
 
 test "re-locks after a pause that is never observed as paused status" {
@@ -876,10 +877,17 @@ test "a slow round trip still locks, with the same accuracy" {
     try std.testing.expect(lock.anchor_err_ms <= edge_guard_ms);
     try expectInSync(&sim, &lock);
 
-    // And having locked, it drops to the 1/s maintenance cadence.
+    // And having locked, maintenance polling continues at this round trip's
+    // own pace (rtt plus a small stagger) rather than idling for no reason --
+    // see "locked maintenance polls back-to-back, throttled only by the
+    // round trip".
     const start_ms = sim.now_ms;
-    sim.stepN(&lock, 20);
-    try std.testing.expect(sim.now_ms - start_ms > 15_000);
+    const polls = 20;
+    sim.stepN(&lock, polls);
+    const elapsed_ms = sim.now_ms - start_ms;
+    const max_gap = fast_poll_ms + poll_stagger_step_ms * (poll_stagger_cycle - 1) + sim.rtt_ms;
+    try std.testing.expect(elapsed_ms <= polls * max_gap);
+    try std.testing.expect(elapsed_ms >= polls * (fast_poll_ms + sim.rtt_ms));
 }
 
 test "a one-second round trip locks via interval intersection" {
