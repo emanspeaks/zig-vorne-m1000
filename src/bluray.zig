@@ -5,7 +5,6 @@ const config = @import("config.zig");
 const time = @import("time.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
-const frame_timer = @import("frame_timer.zig");
 const phase_lock = @import("phase_lock.zig");
 const PollKind = phase_lock.PollKind;
 const Mode = @import("mode.zig").Mode;
@@ -25,6 +24,18 @@ pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 /// editable while a disc is running.
 pub const CUE_STAT_INTERVAL_MS: i64 = 1000;
 
+/// Longest the polling thread sleeps in one go. Only bounds how quickly it
+/// notices a mode change; the poll cadence itself comes from the phase lock.
+const POLL_THREAD_SLICE_MS: i64 = 50;
+
+/// Ceiling on how long the display loop sleeps when it has nothing scheduled.
+///
+/// The two clocks on line 1 are woken for exactly: the loop sleeps until the
+/// next real-time second or the next playback tick, whichever comes first. This
+/// only bounds the latency of everything not modelled that way -- a scroll
+/// step, a cue boundary, a mode change.
+const DISPLAY_IDLE_SLICE_MS: i64 = 25;
+
 pub fn runBlurayClocks(
     io: Io,
     allocator: std.mem.Allocator,
@@ -38,10 +49,14 @@ pub fn runBlurayClocks(
     var cmd_parts = std.ArrayList(u8).empty;
     defer cmd_parts.deinit(allocator);
 
-    // Last payload actually written to the display, so identical frames can be
-    // skipped instead of re-clocking the same bytes out at 19200 baud.
-    var last_cmd = std.ArrayList(u8).empty;
-    defer last_cmd.deinit(allocator);
+    // Last content written to each line, so only a line that actually changed
+    // is re-clocked out. At 19200 baud a full 20 column line costs about 17 ms
+    // to transmit, and the playback second usually ticks while line 2 is
+    // unchanged, so sending them separately halves the time between the tick
+    // and the display catching up with it.
+    var last_line1: [maxbufsz]u8 = undefined;
+    var last_line2: [maxbufsz]u8 = undefined;
+    var have_last = false;
 
     var playtime_buf: [maxbufsz]u8 = undefined;
     var clock_buf: [maxbufsz]u8 = undefined;
@@ -67,21 +82,20 @@ pub fn runBlurayClocks(
     // Sweeps line 2 back and forth when the message is wider than the display.
     var scroller: Marquee = .{};
 
-    // The loop runs fast so the displayed second flips close to the player's
-    // own tick; it is a scheduler, not a redraw rate. Polling is rate limited
-    // inside `player.poll()`, and identical frames are never written to the
-    // display, so a high rate here costs neither HTTP requests nor serial
-    // traffic.
-    var timer = frame_timer.FrameTimer.init(io, 20);
-
-    // Initialize Blu-ray player
-    var player = BlurayPlayer.init(io, allocator);
-    defer player.deinit();
+    // The player is polled on its own thread. It must not happen here: a poll
+    // costs a round trip, and the phase lock deliberately schedules its polls
+    // either side of the player's tick edge, which is exactly the instant this
+    // loop needs to be redrawing. Polling inline made every tick land a round
+    // trip late no matter how accurate the lock itself was.
+    var cell: SnapshotCell = .{};
+    var stop_poller = std.atomic.Value(bool).init(false);
+    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, &stop_poller });
+    defer {
+        stop_poller.store(true, .release);
+        poller.join();
+    }
 
     while (true) {
-        // Start frame timing
-        timer.frameStart();
-
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
             std.debug.print("Blu-Ray display received shutdown signal, exiting gracefully...\n", .{});
@@ -103,15 +117,13 @@ pub fn runBlurayClocks(
         // scroll position cannot disagree about what "now" is.
         const now_ms = time.nowMillis(io);
 
-        // Get current local timestamp
-        // const utc_timestamp = std.time.timestamp();
-
-        // calculate total running time
-        player.poll();
-        playtime = player.playTime();
+        // Read the player's published state and evaluate it for *now*, rather
+        // than using a value that was current whenever the last poll happened.
+        const snap = cell.read();
+        playtime = snap.playTimeSeconds(now_ms);
         const playtime_hms = time.timedeltaToHms(playtime);
         const playtime_str = time.formatHms(playtime_hms, &playtime_buf) catch unreachable;
-        const runstatus_str = switch (player.state.run_status) {
+        const runstatus_str = switch (snap.run_status) {
             .Stopped => STOPCHAR,
             .Playing => PLAYCHAR,
             .Paused => PAUSECHAR,
@@ -128,7 +140,6 @@ pub fn runBlurayClocks(
         try str_utils.copyLeftJustify(&linebuf, clock_str, @min(clock_str.len, 20 -| playtime_str.len), null);
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
-        try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
 
         // Pick up a cue file the moment the web page selects a different one,
         // and pick up edits to the file that is already showing.
@@ -189,9 +200,9 @@ pub fn runBlurayClocks(
             // A stopped player has no meaningful position. A paused one holds
             // its last position, so the cue on screen stays put, which is what
             // you want when someone pauses mid-message.
-            if (player.state.run_status == .Stopped) break :blk "";
+            if (snap.run_status == .Stopped) break :blk "";
             const list = cue_list orelse break :blk "";
-            const cue = list.at(player.playTimeMillis()) orelse break :blk "";
+            const cue = list.at(snap.playTimeMillis(now_ms)) orelse break :blk "";
             may_scroll = cue.scroll;
             break :blk cue.text;
         } else if (loaded_name_len > 0)
@@ -207,16 +218,36 @@ pub fn runBlurayClocks(
             line2[0..@min(line2.len, str_utils.maxchars)];
 
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_window.len, 20), null);
-        try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
 
-        if (cmd_parts.items.len > 0 and !std.mem.eql(u8, cmd_parts.items, last_cmd.items)) {
-            protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items) catch |err| return err;
-            last_cmd.clearRetainingCapacity();
-            try last_cmd.appendSlice(allocator, cmd_parts.items);
+        // Send only the lines that actually changed. The playback second and
+        // the time of day tick at unrelated moments, and line 2 usually does
+        // not change at all, so redrawing everything would put a whole extra
+        // line of serial traffic between the tick and the display showing it.
+        if (!have_last or !std.mem.eql(u8, &linebuf, &last_line1)) {
+            try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+        }
+        if (!have_last or !std.mem.eql(u8, &line2buf, &last_line2)) {
+            try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
         }
 
-        // Handle frame timing and sleep
-        try timer.frameEnd();
+        if (cmd_parts.items.len > 0) {
+            protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items) catch |err| return err;
+            last_line1 = linebuf;
+            last_line2 = line2buf;
+            have_last = true;
+        }
+
+        // Sleep until the next moment something on the display is due to
+        // change: the next playback tick, or the next real-time second. Waking
+        // on a fixed grid instead would quantise every tick to the grid period,
+        // which is exactly the lateness this loop exists to avoid.
+        var wake_ms = now_ms + DISPLAY_IDLE_SLICE_MS;
+        if (snap.nextTickMs(now_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
+        const next_second_ms = (@divFloor(now_ms, 1000) + 1) * 1000;
+        wake_ms = @min(wake_ms, next_second_ms);
+
+        const sleep_ms = wake_ms - time.nowMillis(io);
+        if (sleep_ms > 0) try io.sleep(.fromMilliseconds(sleep_ms), .awake);
     }
 }
 
@@ -225,6 +256,103 @@ pub const BlurayPlayerRunStatus = enum {
     Playing,
     Paused,
 };
+
+/// Everything the display needs to know about the player, in a form it can
+/// evaluate for any instant without touching the network.
+///
+/// This is the whole point of the split. A poll costs a round trip, and the
+/// polls that matter most are deliberately scheduled right next to the player's
+/// tick edge -- which is exactly when the display needs to be redrawing. Poll
+/// inline and every tick is redrawn a round trip late, which no amount of
+/// phase-lock accuracy can make up for. So the polling thread publishes this,
+/// and the display loop evaluates it at the moment it actually draws.
+pub const Snapshot = struct {
+    run_status: BlurayPlayerRunStatus = .Stopped,
+    /// Last value the player actually reported.
+    play_time_seconds: u32 = 0,
+    /// Phase-lock anchor. The rest is meaningful only when `locked`.
+    locked: bool = false,
+    anchor_ms: i64 = 0,
+    anchor_sec: u32 = 0,
+
+    /// Play position in milliseconds at `now_ms`.
+    pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
+        if (self.run_status != .Playing or !self.locked) {
+            return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
+        }
+        return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms);
+    }
+
+    /// The whole second the player is showing at `now_ms`.
+    pub fn playTimeSeconds(self: Snapshot, now_ms: i64) u32 {
+        const ms = self.playTimeMillis(now_ms);
+        if (ms <= 0) return 0;
+        return @intCast(@divFloor(ms, std.time.ms_per_s));
+    }
+
+    /// When the displayed second next changes, or null when nothing is ticking
+    /// and so there is no future moment worth waking up for.
+    pub fn nextTickMs(self: Snapshot, now_ms: i64) ?i64 {
+        if (self.run_status != .Playing or !self.locked) return null;
+        return self.anchor_ms + (@divFloor(now_ms - self.anchor_ms, 1000) + 1) * 1000;
+    }
+};
+
+/// Hands a `Snapshot` from the polling thread to the display loop.
+///
+/// A spin lock, for the same reason as in `cues.zig`: the critical section is a
+/// copy of a handful of words, and `std.Thread.Mutex` does not exist in 0.16.
+const SnapshotCell = struct {
+    guard: std.atomic.Value(bool) = .init(false),
+    value: Snapshot = .{},
+
+    fn acquire(self: *SnapshotCell) void {
+        while (self.guard.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *SnapshotCell) void {
+        self.guard.store(false, .release);
+    }
+
+    fn publish(self: *SnapshotCell, value: Snapshot) void {
+        self.acquire();
+        defer self.release();
+        self.value = value;
+    }
+
+    fn read(self: *SnapshotCell) Snapshot {
+        self.acquire();
+        defer self.release();
+        return self.value;
+    }
+};
+
+/// Poll the player on its own thread, publishing each result for the display.
+///
+/// Runs until `stop` is set. Sleeps in short slices rather than straight
+/// through to the next poll so that a mode change is noticed promptly.
+fn pollLoop(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cell: *SnapshotCell,
+    stop: *std.atomic.Value(bool),
+) void {
+    var player = BlurayPlayer.init(io, allocator);
+    defer player.deinit();
+
+    while (!stop.load(.acquire)) {
+        player.poll();
+        cell.publish(player.snapshot());
+
+        const now_ms = time.nowMillis(io);
+        const wait_ms = @min(player.lock.next_poll_ms - now_ms, POLL_THREAD_SLICE_MS);
+        if (wait_ms > 0) {
+            io.sleep(.fromMilliseconds(wait_ms), .awake) catch return;
+        }
+    }
+}
 
 pub const BlurayPlayerState = struct {
     play_time_seconds: u32,
@@ -354,29 +482,22 @@ pub const BlurayPlayer = struct {
         self.lock.schedule(time.nowMillis(self.io), kind, self.state.run_status == .Playing);
     }
 
-    /// Current play time in seconds, extrapolated from the phase lock.
+    /// Current state in the form the display consumes.
     ///
     /// The player reports whole seconds only, and each poll costs a network
     /// round trip, so the raw value is inherently stale. Once the phase of the
     /// player's 1 Hz tick is known, the displayed second can be computed from
-    /// our own clock and will flip at the same instant the player's does.
-    pub fn playTime(self: *Self) u32 {
-        if (self.state.run_status != .Playing) return self.state.play_time_seconds;
-        return self.lock.predict(time.nowMillis(self.io), self.state.play_time_seconds);
-    }
-
-    /// Current play time in milliseconds.
-    ///
-    /// The player itself only ever reports whole seconds, but the phase lock
-    /// knows where the second boundaries fall, so sub-second position comes for
-    /// free once locked -- which is what cue timing wants, since a cue file has
-    /// millisecond resolution. Falls back to the whole second when there is no
-    /// lock to interpolate from.
-    pub fn playTimeMillis(self: *Self) i64 {
-        const seconds_ms = @as(i64, self.state.play_time_seconds) * std.time.ms_per_s;
-        if (self.state.run_status != .Playing or !self.lock.isLocked()) return seconds_ms;
-        return @as(i64, self.lock.anchor_sec) * std.time.ms_per_s +
-            (time.nowMillis(self.io) - self.lock.anchor_ms);
+    /// our own clock and will flip at the same instant the player's does -- but
+    /// that computation belongs wherever the drawing happens, not here, so what
+    /// is published is the anchor rather than a value read at poll time.
+    pub fn snapshot(self: *const Self) Snapshot {
+        return .{
+            .run_status = self.state.run_status,
+            .play_time_seconds = self.state.play_time_seconds,
+            .locked = self.lock.isLocked(),
+            .anchor_ms = self.lock.anchor_ms,
+            .anchor_sec = self.lock.anchor_sec,
+        };
     }
 
     /// Fold one status sample into the phase lock.
@@ -623,6 +744,74 @@ pub const BlurayPlayer = struct {
         // };
     }
 };
+
+test "a locked snapshot ticks with the player, not with when it was polled" {
+    // Anchor: the player showed second 100 at t = 50_000.
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .play_time_seconds = 100,
+        .locked = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+
+    // The value advances with the local clock between polls...
+    try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(50_000));
+    try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(50_999));
+    // ...and flips exactly on the player's own edge, not a moment later.
+    try std.testing.expectEqual(@as(u32, 101), snap.playTimeSeconds(51_000));
+    try std.testing.expectEqual(@as(u32, 107), snap.playTimeSeconds(57_400));
+
+    // Millisecond position is what cue timing runs off.
+    try std.testing.expectEqual(@as(i64, 100_400), snap.playTimeMillis(50_400));
+}
+
+test "nextTickMs is the instant the display must be redrawn" {
+    const snap: Snapshot = .{
+        .run_status = .Playing,
+        .play_time_seconds = 100,
+        .locked = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+
+    // Waking here is what keeps the redraw on the player's edge rather than on
+    // whatever grid the loop would otherwise have used.
+    try std.testing.expectEqual(@as(?i64, 51_000), snap.nextTickMs(50_000));
+    try std.testing.expectEqual(@as(?i64, 51_000), snap.nextTickMs(50_999));
+    try std.testing.expectEqual(@as(?i64, 52_000), snap.nextTickMs(51_000));
+
+    // Nothing is ticking when paused or stopped, so there is nothing to wake
+    // for and the loop should fall back to its idle slice.
+    var paused = snap;
+    paused.run_status = .Paused;
+    try std.testing.expectEqual(@as(?i64, null), paused.nextTickMs(50_500));
+
+    // An unlocked snapshot cannot predict an edge either.
+    var unlocked = snap;
+    unlocked.locked = false;
+    try std.testing.expectEqual(@as(?i64, null), unlocked.nextTickMs(50_500));
+}
+
+test "an unlocked or paused snapshot falls back to the last reported second" {
+    const paused: Snapshot = .{
+        .run_status = .Paused,
+        .play_time_seconds = 1234,
+        .locked = true,
+        .anchor_ms = 50_000,
+        .anchor_sec = 100,
+    };
+    // A paused player holds its position however much wall time passes.
+    try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(50_000));
+    try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(999_000));
+
+    const searching: Snapshot = .{
+        .run_status = .Playing,
+        .play_time_seconds = 77,
+        .locked = false,
+    };
+    try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
+}
 
 test "authValue is uppercase hex SHA-256 of key ++ nonce" {
     // SHA-256("ab"), i.e. key "a" concatenated with nonce "b".

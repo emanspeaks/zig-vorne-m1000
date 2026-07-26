@@ -73,7 +73,10 @@ pub const max_bracket_ms: i64 = 400;
 /// confirms the existing estimate and never improves it, so without this a lock
 /// taken from a loose bracket would stay loose for the rest of the disc, and
 /// slow drift between the two clocks would never be corrected.
-pub const relock_interval_ms: i64 = 120_000;
+///
+/// A refresh does not drop the lock -- see `refreshing` -- so this can be
+/// frequent without the display ever falling back to a raw sample.
+pub const relock_interval_ms: i64 = 5_000;
 
 pub const PhaseLock = struct {
     phase: Phase,
@@ -83,8 +86,16 @@ pub const PhaseLock = struct {
     /// Half-width of the bracket that produced `anchor_ms`: how uncertain the
     /// anchor is, which also sets how wide the straddle has to be.
     anchor_err_ms: i64,
-    /// When the current lock was acquired, for periodic re-acquisition.
+    /// When the current anchor was acquired, for periodic re-acquisition.
     locked_at_ms: i64,
+    /// Hunting for a fresh bracket while still locked.
+    ///
+    /// A periodic re-sync must not drop the lock. Dropping it would send
+    /// `predict` back to the last raw sample for the length of the hunt, and
+    /// the display would visibly stutter every time it re-synced. Instead the
+    /// existing anchor keeps driving the display while a new one is hunted, and
+    /// is replaced only once there is something better to replace it with.
+    refreshing: bool,
     /// Previous sample, used to bracket an edge.
     prev_sample_ms: i64,
     prev_sample_sec: u32,
@@ -101,6 +112,7 @@ pub const PhaseLock = struct {
         .anchor_sec = 0,
         .anchor_err_ms = 0,
         .locked_at_ms = 0,
+        .refreshing = false,
         .prev_sample_ms = 0,
         .prev_sample_sec = 0,
         .have_prev_sample = false,
@@ -123,6 +135,7 @@ pub const PhaseLock = struct {
         self.anchor_err_ms = 0;
         self.have_prev_sample = false;
         self.hunt_samples = 0;
+        self.refreshing = false;
     }
 
     /// Predicted counter value at `at_ms`, or `fallback` when unlocked.
@@ -189,6 +202,7 @@ pub const PhaseLock = struct {
                     self.anchor_err_ms = err_ms;
                     self.locked_at_ms = sample_ms;
                     self.phase = .locked;
+                    self.refreshing = false;
                     self.hunt_samples = 0;
                 }
             }
@@ -238,7 +252,7 @@ pub const PhaseLock = struct {
             self.next_kind = .hunt;
             return;
         }
-        if (self.phase != .locked) {
+        if (self.phase != .locked or self.refreshing) {
             // Back off once the hunt has clearly stopped converging, so a
             // source that never yields a tight bracket is not polled at the
             // hunt rate indefinitely.
@@ -248,7 +262,11 @@ pub const PhaseLock = struct {
             return;
         }
         if (now_ms - self.locked_at_ms >= relock_interval_ms) {
-            self.drop();
+            // Start hunting a fresh bracket, but keep the current anchor
+            // driving the display until a better one arrives, so a re-sync is
+            // invisible rather than a stutter.
+            self.refreshing = true;
+            self.hunt_samples = 0;
             self.next_poll_ms = now_ms + fast_poll_ms;
             self.next_kind = .hunt;
             return;
@@ -499,21 +517,65 @@ test "recovers from a rewind of a whole number of seconds" {
     try expectInSync(&sim, &lock);
 }
 
-test "locked cadence is three polls per second" {
+test "locked cadence stays modest rather than degenerating into fast polling" {
     var lock = PhaseLock.init;
     var sim: Sim = .{ .content_ms = 2_000 };
     sim.stepN(&lock, 20);
     try expectInSync(&sim, &lock);
 
     const start_ms = sim.now_ms;
-    const polls = 30;
+    const polls = 60;
     sim.stepN(&lock, polls);
     const elapsed_ms = sim.now_ms - start_ms;
 
-    // Three polls per second means ~10 s for 30 polls. Fail loudly if this
-    // degenerates into continuous fast polling, which would hammer the player.
-    try std.testing.expect(elapsed_ms > 8_000);
-    try std.testing.expect(elapsed_ms < 12_000);
+    // Three checks per second, plus a hunt burst every `relock_interval_ms`.
+    // The exact average does not matter; what matters is that it stays far
+    // below the hunt rate, which would hammer the player's small web server.
+    const per_second = @divFloor(polls * 1000, elapsed_ms);
+    try std.testing.expect(per_second >= 3);
+    try std.testing.expect(per_second <= 8);
+}
+
+test "a periodic refresh never drops the lock" {
+    // The refresh exists to keep the anchor fresh, but dropping the lock to do
+    // it would send `predict` back to the last raw sample for the length of the
+    // hunt -- a visible stutter every few seconds, which is worse than the
+    // staleness it set out to fix.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 20_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    var refreshes_seen: usize = 0;
+    var was_refreshing = false;
+
+    // Several refresh intervals' worth of running.
+    const until_ms = sim.now_ms + 4 * relock_interval_ms;
+    while (sim.now_ms < until_ms) {
+        sim.step(&lock);
+        if (lock.refreshing and !was_refreshing) refreshes_seen += 1;
+        was_refreshing = lock.refreshing;
+
+        // The invariant: locked at every single point along the way.
+        try expectInSync(&sim, &lock);
+    }
+
+    // And the refreshes really did happen, so the test is not vacuous.
+    try std.testing.expect(refreshes_seen >= 3);
+}
+
+test "a refresh re-anchors rather than merely restating the old estimate" {
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 7_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+    const first_anchor_at = lock.locked_at_ms;
+
+    while (sim.now_ms < first_anchor_at + relock_interval_ms + 3_000) sim.step(&lock);
+
+    try std.testing.expect(lock.locked_at_ms > first_anchor_at);
+    try std.testing.expect(!lock.refreshing);
+    try expectInSync(&sim, &lock);
 }
 
 test "a slow round trip still produces a lock rather than hunting forever" {
