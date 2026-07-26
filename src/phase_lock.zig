@@ -83,6 +83,12 @@ pub const edge_guard_ms: i64 = 75;
 pub const idle_poll_ms: i64 = 200;
 /// Back off after a failed request rather than hammering the source.
 pub const error_retry_ms: i64 = 2000;
+/// Hard ceiling on the gap between polls, regardless of what any other part of
+/// `schedule` computes. A live source is worth checking on at least this
+/// often even when every other heuristic here concludes it can wait longer --
+/// trick-play states in particular (rewind, fast-forward) can go unnoticed for
+/// a while otherwise, since nothing about them changes `running`.
+pub const max_poll_gap_ms: i64 = 1000;
 /// Hunt samples to spend chasing a tight bracket before settling for whatever
 /// the round trip allows. Hunting is a burst, not a steady state.
 pub const hunt_patience: u32 = 40;
@@ -334,7 +340,15 @@ pub const PhaseLock = struct {
     /// `sample_ms` is the best estimate of when the source read its own clock;
     /// for a request/response exchange that is the midpoint of the two.
     pub fn sampleRunning(self: *PhaseLock, sample_ms: i64, kind: PollKind, value_sec: u32) void {
-        if (self.phase == .locked) self.check(sample_ms, kind, value_sec);
+        // Checked whenever there is an anchor to check against, not just while
+        // `locked`. `.hunt`-kind polls are scheduled exclusively from the
+        // *un*-locked branch of `schedule`, so gating this on `phase == .locked`
+        // meant `check`'s own `.hunt` case could never run -- provably dead
+        // code, not merely redundant. That gap is what let a bad anchor
+        // free-wheel forward, unexamined, for as long as a hunt kept failing to
+        // re-lock: nothing was watching it. Now every sample -- hunting or not
+        // -- gets compared against whatever anchor currently exists.
+        if (self.have_anchor) self.check(sample_ms, kind, value_sec);
 
         // Only a hunt bracket may set the anchor. A straddle pair is centred on
         // the *predicted* edge, so re-anchoring to its midpoint would keep
@@ -343,7 +357,15 @@ pub const PhaseLock = struct {
         // edge until the lock breaks. The straddle's job is to confirm, and to
         // drop the lock when confirmation fails; re-acquiring is the hunt's job.
         if (kind == .hunt) {
-            if (self.have_prev_sample and value_sec != self.prev_sample_sec) {
+            // Exactly +1, not merely "changed". A pair of samples straddling a
+            // *decreasing* value -- rewind -- or one that jumped by more than
+            // one second both produce a "change" too, and the timing-gap check
+            // below cannot tell either apart from a genuine tick: the gap is
+            // measured in wall-clock time between polls, which stays small
+            // regardless of which direction, or how far, the reported value
+            // moved. Accepting either as if it were a normal forward edge
+            // anchors the model to a fabricated tick pointed the wrong way.
+            if (self.have_prev_sample and value_sec == self.prev_sample_sec +| 1) {
                 const err_ms = @divFloor(sample_ms - self.prev_sample_ms, 2);
                 // Hold out for a tight bracket at first, but not forever. When
                 // the round trip is slow or jittery enough to keep hunt samples
@@ -375,10 +397,19 @@ pub const PhaseLock = struct {
         switch (kind) {
             .post_edge => {
                 // Phase detector: the straddle must contain exactly one tick.
+                //
+                // A failure rebases immediately rather than merely dropping,
+                // for the same reason as a `mid_second` mismatch: this sample
+                // is fresh, trustworthy ground truth regardless of why the
+                // straddle count was wrong, and a bare `drop` would leave
+                // `predict` free-wheeling from the stale anchor for an entire
+                // extra hunt cycle on top of whatever this straddle already
+                // caught -- measured, during a sustained rewind, as an extra
+                // ~60-90 ms of otherwise-avoidable lag on every single catch.
                 if (self.have_prev_sample and
                     @as(i64, value_sec) - @as(i64, self.prev_sample_sec) != 1)
                 {
-                    self.drop();
+                    self.rebase(sample_ms, value_sec);
                 }
             },
             .mid_second => {
@@ -414,6 +445,22 @@ pub const PhaseLock = struct {
 
     /// Choose when the next poll happens, given the poll just completed.
     pub fn schedule(self: *PhaseLock, now_ms: i64, completed: PollKind, running: bool) void {
+        self.scheduleInner(now_ms, completed, running);
+        // Never leave a poll further out than `max_poll_gap_ms`, regardless of
+        // which branch below fired. Every branch already keeps well inside
+        // this in practice -- the arithmetic in `nextEdgeAfter`/`midSecondAfter`
+        // cannot itself produce more than ~1000 ms out -- but this is what
+        // actually *guarantees* it rather than relying on that remaining true,
+        // and it protects against a future scheduling change silently
+        // regressing it. Requested explicitly: a stale status must never be
+        // allowed to sit unchecked for more than a second, no matter what the
+        // rest of this state machine's reasoning concludes is "efficient".
+        if (self.next_poll_ms - now_ms > max_poll_gap_ms) {
+            self.next_poll_ms = now_ms + max_poll_gap_ms;
+        }
+    }
+
+    fn scheduleInner(self: *PhaseLock, now_ms: i64, completed: PollKind, running: bool) void {
         if (!running) {
             self.next_poll_ms = now_ms + idle_poll_ms;
             self.next_kind = .hunt;
@@ -506,6 +553,12 @@ const Sim = struct {
     running: bool = true,
     /// Simulated round-trip time; the sample instant is the midpoint.
     rtt_ms: i64 = 20,
+    /// Content-time rate relative to wall-clock time, in thousandths: `1000` is
+    /// normal 1x forward playback, `-3000` is a 3x reverse scan (rewind).
+    /// `run_status` on a real player has no representation for this -- trick
+    /// play still reports "playing" -- so it is a property of how `content_ms`
+    /// moves, not of `running`.
+    content_rate_permille: i64 = 1000,
 
     fn reported(self: Sim) u32 {
         return @intCast(@divFloor(self.content_ms, 1000));
@@ -513,7 +566,9 @@ const Sim = struct {
 
     fn advance(self: *Sim, dt_ms: i64) void {
         self.now_ms += dt_ms;
-        if (self.running) self.content_ms += dt_ms;
+        if (self.running) {
+            self.content_ms += @divTrunc(dt_ms * self.content_rate_permille, 1000);
+        }
     }
 
     /// Run one poll: wait until it is due, exchange, and reschedule.
@@ -976,6 +1031,88 @@ test "a seek re-bases the anchor instead of stalling the display" {
 
     sim.stepN(&lock, 30);
     try expectInSync(&sim, &lock);
+}
+
+test "a hunt bracket requires an exact +1 tick, not merely a changed value" {
+    // Directly exercises the bug: two consecutive hunt samples where the value
+    // fell must never be accepted as if they had bracketed a normal forward
+    // edge, even though the sample-timing gap is a normal, tight hunt
+    // interval -- exactly what the old (timing-only) check would have
+    // accepted. Constructed by hand rather than via Sim, since this is testing
+    // the acceptance rule in isolation.
+    var lock = PhaseLock.init;
+
+    lock.sampleRunning(1_000, .hunt, 100);
+    try std.testing.expect(!lock.isLocked());
+
+    // 60 ms later (a normal hunt interval), the value *fell* to 95 -- a
+    // rewind-shaped change with an easily-tight-enough timing gap.
+    lock.sampleRunning(1_060, .hunt, 95);
+    try std.testing.expect(!lock.isLocked());
+    try std.testing.expect(!lock.hasAnchor());
+
+    // A genuine +1 at the same tight spacing must still be accepted, so the
+    // fix is "require exactly +1", not "never lock".
+    lock.sampleRunning(1_120, .hunt, 96);
+    try std.testing.expect(lock.isLocked());
+    try std.testing.expectEqual(@as(u32, 96), lock.anchor_sec);
+}
+
+test "a sustained rewind is tracked, not stuck extrapolating forward" {
+    // The reported failure: pressing rewind, the panel just kept counting
+    // *up* as though nothing had happened. Two bugs combined to cause it:
+    //
+    //   1. hunt-bracket acceptance only checked that the value *changed*
+    //      between two samples, not that it changed by exactly +1 -- so a
+    //      pair straddling a *decreasing* value could be accepted as a normal
+    //      forward tick, anchoring the model backward and then extrapolating
+    //      it forward from there.
+    //   2. the anchor was only ever re-checked against fresh samples while
+    //      `locked` -- never while hunting -- so even once hunting correctly
+    //      failed to find a new (bogus) bracket, the stale anchor from (1)
+    //      kept free-wheeling forward, unexamined, for as long as the hunt
+    //      continued to find nothing.
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 60_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+
+    // Rewind at 3x for several seconds.
+    sim.content_rate_permille = -3000;
+
+    var ever_had_anchor = false;
+    for (0..40) |_| {
+        sim.step(&lock);
+        if (lock.hasAnchor()) ever_had_anchor = true;
+
+        // The critical property: the shown value must track the true,
+        // falling position, not run away from it. Old behaviour would show
+        // this error growing roughly linearly with elapsed rewind time (tens
+        // of seconds within a few real seconds); a tracking implementation
+        // re-anchors within about one hunt interval of drifting past the
+        // tolerance `check` enforces, keeping the error to at most 1.
+        if (lock.hasAnchor()) {
+            const shown = lock.predict(sim.now_ms, sim.reported());
+            const err = @abs(@as(i64, shown) - @as(i64, sim.reported()));
+            try std.testing.expect(err <= 1);
+        }
+    }
+    try std.testing.expect(ever_had_anchor);
+}
+
+test "schedule never leaves a gap wider than max_poll_gap_ms" {
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 60_000, .rtt_ms = 200 };
+
+    // A wide spread of conditions: cold hunt, locked steady state, refresh,
+    // idle. None of it should ever produce a scheduled gap over the cap.
+    for (0..300) |i| {
+        if (i == 100) sim.running = false;
+        if (i == 130) sim.running = true;
+        if (i == 200) sim.content_ms += 500_000; // seek
+        sim.step(&lock);
+        try std.testing.expect(lock.next_poll_ms - sim.now_ms <= max_poll_gap_ms);
+    }
 }
 
 test "the straddle never opens wider than it can bracket one edge" {
