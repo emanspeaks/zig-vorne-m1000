@@ -44,15 +44,17 @@ fn drainInput(port: *serial.SerialPort) void {
 }
 
 pub fn send(port: *serial.SerialPort, msg: []const u8) !void {
-    _ = port.write(msg);
+    try port.write(msg);
     drainInput(port);
 }
 
 pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, allocator: std.mem.Allocator) !void {
-    const sent = port.write(msg);
+    try port.write(msg);
 
-    // Print hex representation to see actual bytes
-    std.debug.print("Sent {d} bytes to address {d}: ", .{ sent, address });
+    // Print hex representation to see actual bytes. A successful write() now
+    // always means the whole message went out -- see its own doc -- so the
+    // count is just msg.len, not something read back from the write itself.
+    std.debug.print("Sent {d} bytes to address {d}: ", .{ msg.len, address });
 
     for (msg) |byte| {
         std.debug.print("{X:0>2} ", .{byte});

@@ -10,6 +10,7 @@ const PollKind = phase_lock.PollKind;
 const Mode = @import("mode.zig").Mode;
 const cues = @import("cues.zig");
 const webvtt = @import("webvtt.zig");
+const vorne_charset = @import("vorne_charset.zig");
 const Marquee = @import("marquee.zig").Marquee;
 
 const Writer = std.Io.Writer;
@@ -18,6 +19,9 @@ const maxbufsz = str_utils.maxbufsz;
 pub const PLAYCHAR = protocol.DLE ++ "P"; // ►
 pub const PAUSECHAR = "\xba"; // ║
 pub const STOPCHAR = protocol.DLE ++ "G"; // ■
+/// Below-space graphic character 0x0F (☼), reached the same way as the
+/// other DLE-escaped glyphs on this panel: 0x40 + the code, so 0x4F = 'O'.
+pub const SUNCHAR = protocol.DLE ++ "O"; // ☼
 
 /// How often the selected cue file is checked for edits. One `stat` per second
 /// is nothing next to the HTTP polling already going on, and it makes the file
@@ -173,7 +177,6 @@ pub fn runBlurayClocks(
 
         playtime_buf = undefined;
         clock_buf = undefined;
-        cmd_parts.clearRetainingCapacity();
         try str_utils.clearVorneLineBuf(&linebuf);
 
         // One clock reading for the whole frame, so the cue-file check and the
@@ -204,7 +207,12 @@ pub fn runBlurayClocks(
         // deadlines to meet.
         const local_ms = now_ms + @as(i64, zone.load().offset_sec) * std.time.ms_per_s;
         const clock_str = time.formatClock(@divFloor(local_ms, std.time.ms_per_s), &clock_buf) catch unreachable;
-        try str_utils.copyLeftJustify(&linebuf, clock_str, @min(clock_str.len, 20 -| playtime_str.len), null);
+        // The extra `-| 1` reserves the column right after the clock for
+        // SUNCHAR below, the same way space for the play time is already
+        // reserved -- otherwise an unrealistically long play time could
+        // shrink the clock's own budget without leaving room for it.
+        try str_utils.copyLeftJustify(&linebuf, clock_str, @min(clock_str.len, 20 -| playtime_str.len -| 1), null);
+        try str_utils.copyLeftJustify(&linebuf, SUNCHAR, 1, clock_str.len);
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
 
@@ -270,9 +278,17 @@ pub fn runBlurayClocks(
             if (seen_cue_span == null or seen_cue_span.?.start_ms != cue.start_ms or seen_cue_span.?.end_ms != cue.end_ms) {
                 seen_cue_span = .{ .start_ms = cue.start_ms, .end_ms = cue.end_ms };
                 const cols = (str_utils.strlensz(cue.text) catch unreachable)[0];
+                // `cue.text` is already transcoded into the panel's own
+                // character set (see webvtt.zig's `appendPayload`), so
+                // printing it directly is mojibake or an invisible control
+                // byte on an ordinary terminal for anything outside plain
+                // ASCII -- decode it back to readable UTF-8 for the log.
+                var readable: std.ArrayList(u8) = .empty;
+                defer readable.deinit(allocator);
+                vorne_charset.decodeToUtf8(allocator, &readable, cue.text) catch {};
                 std.debug.print(
                     "bluray: cue -> [{d}..{d}) scroll={} {d} bytes, {d} cols: \"{s}\"\n",
-                    .{ cue.start_ms, cue.end_ms, cue.scroll, cue.text.len, cols, cue.text },
+                    .{ cue.start_ms, cue.end_ms, cue.scroll, cue.text.len, cols, readable.items },
                 );
             }
             break :blk cue.text;
@@ -301,23 +317,50 @@ pub fn runBlurayClocks(
 
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_window.len, 20), null);
 
-        // Send only the lines that actually changed. The playback second and
-        // the time of day tick at unrelated moments, and line 2 usually does
-        // not change at all, so redrawing everything would put a whole extra
-        // line of serial traffic between the tick and the display showing it.
+        // Send only the lines that actually changed, and as two independent
+        // writes rather than one combined one -- previously they were bundled
+        // into a single `cmd_parts`/`sendUnitDisplayCmd` call whenever both
+        // changed in the same pass, which meant line 2's own ~17 ms of serial
+        // time (see the module doc) sat directly in front of line 1's, on the
+        // wire, every time. That is invisible most of the time, since the two
+        // rarely change in the same pass -- except during a marquee sweep,
+        // which touches line 2 roughly every 400 ms and so collides with a
+        // real-time clock tick often enough to be visible as the clock
+        // advancing unevenly specifically while scrolling. Two separate
+        // writes mean line 1 is never delayed by line 2's content, or the
+        // reverse.
+        // `sendUnitDisplayCmd` failing (a short or failed serial write --
+        // see `SerialPort.write`) is logged and skipped, not propagated: a
+        // transient hiccup here should not take the whole display service
+        // down. Critically, `last_lineN` is only updated on a *successful*
+        // send, so a failure does not get recorded as "shown" -- the same
+        // content is retried on the very next pass instead of silently
+        // never reaching the panel until something else happens to change
+        // it. Before this, a failed write and a real "nothing changed"
+        // looked identical from here, which is exactly the class of bug
+        // that presented as line 2 randomly not updating.
+        var sent_anything = false;
         if (!have_last or !std.mem.eql(u8, &linebuf, &last_line1)) {
+            cmd_parts.clearRetainingCapacity();
             try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
+                last_line1 = linebuf;
+                sent_anything = true;
+            } else |err| {
+                std.debug.print("bluray: failed to send line 1: {}\n", .{err});
+            }
         }
         if (!have_last or !std.mem.eql(u8, &line2buf, &last_line2)) {
+            cmd_parts.clearRetainingCapacity();
             try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
+            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
+                last_line2 = line2buf;
+                sent_anything = true;
+            } else |err| {
+                std.debug.print("bluray: failed to send line 2: {}\n", .{err});
+            }
         }
-
-        if (cmd_parts.items.len > 0) {
-            protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items) catch |err| return err;
-            last_line1 = linebuf;
-            last_line2 = line2buf;
-            have_last = true;
-        }
+        if (sent_anything) have_last = true;
 
         // Sleep until the next moment something on the display is due to
         // change: the next playback tick, the next real-time second, or the

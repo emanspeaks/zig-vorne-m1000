@@ -318,6 +318,55 @@ pub fn encodeUtf8(
 }
 
 // ---------------------------------------------------------------------------
+// Decoding: panel bytes in, UTF-8 out
+// ---------------------------------------------------------------------------
+
+/// Decode panel bytes back into readable UTF-8 -- the inverse of
+/// `encodeUtf8`, for logging and debugging. Nothing on the actual display
+/// path needs this; the panel only ever consumes the forward direction. It
+/// exists because a transcoded cue (say, an accented letter or one of the
+/// graphic characters below the space) prints as mojibake or an invisible
+/// control byte on an ordinary UTF-8 terminal, which made a debug log
+/// showing the exact bytes about to be sent to the panel unreadable for the
+/// one thing a human actually wants to check: is this the right text.
+///
+/// Not a guaranteed exact round trip of `encodeUtf8` -- several UTF-8
+/// characters fold to the same ASCII stand-in (curly quotes, en/em dash),
+/// and `unmappable` ('?') already lost whatever it replaced -- but every
+/// byte `encodeUtf8` can actually produce decodes back to something
+/// legible.
+pub fn decodeToUtf8(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const b = text[i];
+        if (b == DLE and i + 1 < text.len) {
+            const code = text[i + 1];
+            // Mirrors `encodeCodepoint`'s own bound: only 0x40..0x5F ever
+            // gets emitted (the last control_chars entry, DEL, is dead code
+            // on the encode side -- see its own loop -- so decoding it here
+            // would claim to round-trip a byte sequence that never actually
+            // comes out of encodeUtf8).
+            if (code >= 0x40 and code - 0x40 < 0x20 and !isPlaceholder(control_chars[code - 0x40])) {
+                try out.appendSlice(allocator, control_chars[code - 0x40]);
+                i += 2;
+                continue;
+            }
+        }
+        if (b >= 0x80 and !isPlaceholder(extended_chars[b - 0x80])) {
+            try out.appendSlice(allocator, extended_chars[b - 0x80]);
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, b);
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -422,4 +471,45 @@ test "invalid UTF-8 degrades to one replacement per bad byte" {
     const got = try encode("ok\xFFhere");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("ok?here", got);
+}
+
+fn decode(text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try decodeToUtf8(testing.allocator, &out, text);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "decodeToUtf8 reads back an accented letter encodeUtf8 produced" {
+    const encoded = try encode("J\u{00F3}nsi: Sticks & Stones");
+    defer testing.allocator.free(encoded);
+    const got = try decode(encoded);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("J\u{00F3}nsi: Sticks & Stones", got);
+}
+
+test "decodeToUtf8 reads back a DLE-escaped glyph without consuming an extra byte" {
+    // Same case marquee.zig and str_utils.zig regression-test: DLE + code
+    // byte is one column on the panel, and has to decode back to exactly one
+    // glyph here too, with the byte after it untouched. "\x10P" is what
+    // encodeUtf8 produces for the right-pointing triangle (its own test:
+    // "graphic characters below the space use a DLE escape").
+    const got = try decode("\x10PX");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("\u{25BA}X", got);
+}
+
+test "decodeToUtf8 passes plain ASCII through untouched" {
+    const got = try decode("3m25 Romantic Flight");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("3m25 Romantic Flight", got);
+}
+
+test "decodeToUtf8 leaves an unrecognized DLE sequence alone rather than eating a byte" {
+    // 0x40 + 0x20 = 0x60, one past the last code encodeUtf8 ever emits (see
+    // its own comment) -- if this file's encode and decode bounds ever
+    // disagreed, this is the byte that would expose it.
+    const got = try decode("\x10\x60");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("\x10\x60", got);
 }

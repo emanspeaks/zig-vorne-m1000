@@ -68,8 +68,29 @@ pub const SerialPort = struct {
         std.debug.print("Serial port configured: 19200 8N1 raw mode\n", .{});
     }
 
-    pub fn write(self: *SerialPort, data: []const u8) usize {
-        return linux.write(self.fd, data.ptr, data.len);
+    /// Write the whole of `data`, looping over short writes.
+    ///
+    /// `linux.write` returns the raw syscall result: a negated errno (as a
+    /// huge `usize`, when reinterpreted as `isize` it is negative) on
+    /// failure, or otherwise the number of bytes actually written -- which
+    /// can be *less than requested even when nothing is wrong*, so a single
+    /// call is not enough to guarantee the whole buffer reached the wire. A
+    /// caller that only ever issued one call and ignored the count (as this
+    /// used to) would have no way to notice a display command that was only
+    /// partially sent.
+    pub fn write(self: *SerialPort, data: []const u8) error{WriteFailed}!void {
+        var remaining = data;
+        while (remaining.len > 0) {
+            const result = linux.write(self.fd, remaining.ptr, remaining.len);
+            const signed: isize = @bitCast(result);
+            // <= 0 covers both a negated errno and a zero-byte write, which
+            // on a real device means something is wrong (full buffer with no
+            // drain in sight, or the far end has gone away) rather than
+            // "try again" -- looping on it would spin the render loop
+            // forever instead of ever reporting the failure.
+            if (signed <= 0) return error.WriteFailed;
+            remaining = remaining[@intCast(signed)..];
+        }
     }
 
     pub fn read(self: *SerialPort, buffer: []u8) usize {
