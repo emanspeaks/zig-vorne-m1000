@@ -5,7 +5,6 @@ const config = @import("config.zig");
 const time = @import("time.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
-const phase_lock = @import("phase_lock.zig");
 const Mode = @import("mode.zig").Mode;
 const cues = @import("cues.zig");
 const webvtt = @import("webvtt.zig");
@@ -23,31 +22,10 @@ pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 /// editable while a disc is running.
 pub const CUE_STAT_INTERVAL_MS: i64 = 1000;
 
-/// Longest any poll-worker thread sleeps in one go. Only bounds how quickly
-/// it notices shutdown; the poll cadence itself comes from `frame_interval_ms`
-/// / `poll_workers` below.
+/// Longest the polling thread sleeps in one go. Only bounds how quickly it
+/// notices shutdown; the poll itself is otherwise back-to-back with the
+/// player's own response time as the only throttle -- see `pollLoop`.
 const POLL_THREAD_SLICE_MS: i64 = 50;
-
-/// How often the poll-worker pool as a whole dispatches a new request to the
-/// player -- matches the display's own ~4 Hz update rate.
-pub const frame_interval_ms: i64 = 250;
-/// Workers running concurrently, so the pool can actually sustain a dispatch
-/// every `frame_interval_ms` against the ~1000-1200 ms round trip measured on
-/// real hardware, with a spare slot of margin. Requests genuinely overlap --
-/// each worker is a full poll-sleep-poll loop of its own -- rather than one
-/// poller working through a queue, because the round trip is the bottleneck:
-/// a single poller cannot dispatch faster than it can wait for a reply.
-pub const poll_workers: usize = 5;
-/// Added to each worker's own cycle length so it never settles into an exact,
-/// repeating multiple of `frame_interval_ms`. `frame_interval_ms` itself
-/// evenly divides 1000 ms, so without this, a worker whose requests fall into
-/// a steady rhythm -- including the pathological case where the round trip
-/// itself happens to be a whole number of seconds -- would have every one of
-/// its own samples land at the same point in the counter's second forever,
-/// which `phase_lock.zig`'s interval intersection can never narrow past. See
-/// its module doc and the "round trip that divides the second exactly" test.
-const poll_stagger_step_ms: i64 = 17;
-const poll_stagger_cycle: u32 = 5;
 
 /// How often the cue thread checks the file and, less often, the timezone.
 /// Also bounds how quickly it notices a mode change.
@@ -82,7 +60,6 @@ pub fn runBlurayClocks(
     port: anytype,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
-    resync_requested: *std.atomic.Value(bool),
 ) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
@@ -125,34 +102,24 @@ pub fn runBlurayClocks(
     // write. It is a real-time task: each wake exists because something is due
     // on screen at that instant, and there is no catching up afterwards.
     //
-    //   * the player is polled by a pool of `poll_workers` threads running
-    //     `pollWorker`, dispatching continuously rather than reacting to a
-    //     computed schedule. Every result is folded into the same shared
-    //     `player`, through `player_guard`.
+    //   * the player is polled on `pollLoop`. A poll costs a round trip, and
+    //     the loop dispatches the next one immediately after the previous
+    //     response arrives -- no schedule to compute, just the player's own
+    //     response time as the pace.
     //   * the cue file is watched and parsed on `cueLoop`, along with the
     //     timezone. Both are file I/O, and a cue file arrives whenever it
     //     happens to be saved.
-    var player = BlurayPlayer.init(io, allocator);
-    defer player.deinit();
-    var player_guard: PlayerGuard = .{};
     var cell: SnapshotCell = .{};
     var cue_cell: CueCell = .{};
     defer cue_cell.deinit();
     var zone: time.SharedZone = .init(time.getTimezoneInfo(io));
 
     var stop_workers = std.atomic.Value(bool).init(false);
-    // Shared across the whole pool: see `poll_stagger_step_ms`.
-    var poll_stagger = std.atomic.Value(u32).init(0);
-    var pollers: [poll_workers]std.Thread = undefined;
-    for (0..poll_workers) |i| {
-        pollers[i] = try std.Thread.spawn(.{}, pollWorker, .{
-            io, &player, &player_guard, &cell, i, resync_requested, &poll_stagger, &stop_workers,
-        });
-    }
+    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, &stop_workers });
     const cue_thread = try std.Thread.spawn(.{}, cueLoop, .{ io, allocator, cue_state, &cue_cell, &zone, &stop_workers });
     defer {
         stop_workers.store(true, .release);
-        for (&pollers) |*t| t.join();
+        poller.join();
         cue_thread.join();
     }
 
@@ -289,14 +256,16 @@ pub fn runBlurayClocks(
         }
 
         // Sleep until the next moment something on the display is due to
-        // change: the next playback tick, the next real-time second, or the
-        // next scroll step. Waking on a fixed grid instead would quantize each
-        // of them to the grid period -- which for the two clocks is the
-        // lateness this loop exists to avoid, and for the scroll is visible as
-        // stutter, since evenly spaced steps are the whole of what makes a
-        // character-cell marquee look smooth.
+        // change: the next real-time second, or the next scroll step. Waking
+        // on a fixed grid instead would quantize each of them to the grid
+        // period -- which for the clock is the lateness this loop exists to
+        // avoid, and for the scroll is visible as stutter, since evenly
+        // spaced steps are the whole of what makes a character-cell marquee
+        // look smooth. The play-time second has no such schedule to compute:
+        // it only ever changes when a fresh poll result arrives, which the
+        // idle slice below picks up (and only redraws) within
+        // `DISPLAY_IDLE_SLICE_MS` -- see `bluray.Snapshot`.
         var wake_ms = now_ms + DISPLAY_IDLE_SLICE_MS;
-        if (snap.nextTickMs(now_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
         // The displayed second flips on a local-time boundary. Offsets are
         // whole minutes, so that is also a UTC second boundary.
         const next_second_ms = (@divFloor(now_ms, 1000) + 1) * 1000;
@@ -344,30 +313,24 @@ pub const BlurayPlayerRunStatus = enum {
     Paused,
 };
 
-/// Fixed, hand-tunable forward offset folded into every extrapolated position
-/// before it reaches the display or drives cue timing.
+/// Fixed, hand-tunable offset folded into the raw play position before it
+/// reaches the display or drives cue timing.
 ///
-/// `phase_lock.PhaseLock.predict` is deliberately unbiased with respect to what
-/// the player reports over the network -- it drives the lock's own
-/// self-consistency checks against those raw reports, so biasing it there would
-/// make the lock see permanent, spurious drift and fight itself. But there are
-/// latencies downstream of the player's own report that no amount of
-/// network-side correction can see: time spent in the player's own
-/// decode/output pipeline, a TV or AVR's own processing delay, anything between
-/// "the player's internal counter reached N" and a human seeing second N
-/// appear on the screen. If the panel is observed to consistently read behind
-/// what is actually playing even after `phase_lock`'s own accuracy is accounted
-/// for, this is the knob: increase it in small steps (50-100 ms at a time)
-/// while comparing the panel against the picture, until they line up. A
-/// negative value pulls the display back instead.
+/// The player's own report is shown as-is, with no interpolation between
+/// polls -- see `Snapshot`. But there are latencies downstream of that report
+/// that polling faster can never see: time spent in the player's own
+/// decode/output pipeline, a TV or AVR's own processing delay, anything
+/// between "the player's internal counter reached N" and a human seeing
+/// second N appear on the screen. If the panel is observed to consistently
+/// read behind what is actually playing, this is the knob: increase it in
+/// small steps (50-100 ms at a time) while comparing the panel against the
+/// picture, until they line up. A negative value pulls the display back
+/// instead. Since the display only ever shows whole seconds, a lead smaller
+/// than the remaining fraction of the current second has no visible effect
+/// until it accumulates enough to cross a second boundary.
 ///
 /// No principled default exists -- it depends on hardware this code cannot
-/// see -- so it starts at zero. Rule out a stall first, though: a resume that
-/// stalls the display (see `phase_lock.PhaseLock.resumed`) produces exactly
-/// the same symptom -- the panel reading a second or so behind -- as genuine
-/// downstream hardware latency, but no lead value fixes a stall, since it is
-/// not a constant offset. Re-check after confirming the clock keeps advancing
-/// through a resume before tuning this.
+/// see -- so it starts at zero.
 ///
 /// Settable two ways, both funnelled through `setDisplayLead`: once at startup
 /// from `display_lead_config_path`, and live from the web page. Because it can
@@ -476,45 +439,41 @@ pub fn setDisplayLead(io: Io, value: i64) void {
 }
 
 /// Everything the display needs to know about the player, in a form it can
-/// evaluate for any instant without touching the network.
+/// evaluate without touching the network.
 ///
-/// This is the whole point of the split. A poll costs a round trip, and the
-/// polls that matter most are deliberately scheduled right next to the player's
-/// tick edge -- which is exactly when the display needs to be redrawing. Poll
-/// inline and every tick is redrawn a round trip late, which no amount of
-/// phase-lock accuracy can make up for. So the polling thread publishes this,
-/// and the display loop evaluates it at the moment it actually draws.
+/// This is the whole point of the split. A poll costs a round trip; polling
+/// inline from the render loop would redraw every tick a round trip late. So
+/// the polling thread publishes this, and the display loop reads it at the
+/// moment it actually draws -- but it is exactly what the last poll reported,
+/// with no interpolation between polls. The displayed play time only ever
+/// changes when a fresh sample lands, and steps in whatever increments the
+/// player itself reports in (usually, but not guaranteed to be, one second at
+/// a time).
 pub const Snapshot = struct {
     run_status: BlurayPlayerRunStatus = .Stopped,
     /// Last value the player actually reported.
     play_time_seconds: u32 = 0,
-    /// Phase-lock anchor. The rest is meaningful only when `has_anchor`.
-    ///
-    /// This deliberately tracks whether an anchor *exists*, not whether its
-    /// phase is currently trusted. The clock has to keep running while the lock
-    /// hunts for a fresh bracket; falling back to the raw value there would
-    /// stall the display until the next poll landed and then jump.
-    has_anchor: bool = false,
-    anchor_ms: i64 = 0,
-    anchor_sec: u32 = 0,
     /// When the player last answered. Requests fail while it is busy -- trick
-    /// play especially -- and the poller then backs off, so a snapshot can be
-    /// seconds old without anything looking wrong about it.
+    /// play especially -- so a snapshot can be seconds old without anything
+    /// looking wrong about it.
     sampled_ms: i64 = 0,
 
-    /// Whether the play position is being actively tracked, and so can be
-    /// trusted for anything that keys off *where* playback is.
+    /// Whether the play position is fresh enough to be trusted for anything
+    /// that keys off *where* playback is.
     ///
-    /// Without an anchor the position is just whatever the last poll reported,
-    /// frozen until the next one lands: fine to show on the clock, but it would
-    /// pin a cue on screen long after playback left it behind.
+    /// The position is always just whatever the last poll reported, frozen
+    /// until the next one lands: fine to show on the clock even if a request
+    /// or two has failed, but a position stale enough would pin a cue on
+    /// screen long after playback actually left it behind.
     pub fn positionIsLive(self: Snapshot, now_ms: i64) bool {
         return self.run_status == .Playing and
-            self.has_anchor and
             now_ms - self.sampled_ms <= stale_position_ms;
     }
 
-    /// Play position in milliseconds at `now_ms`, `display_lead_ms` included.
+    /// Play position in milliseconds, `display_lead_ms` included. No
+    /// extrapolation from `now_ms` -- this is exactly the last poll's raw
+    /// value, plus the lead; `now_ms` exists only for parity with
+    /// `positionIsLive` and so callers don't need two different call shapes.
     pub fn playTimeMillis(self: Snapshot, now_ms: i64) i64 {
         return self.playTimeMillisLeadBy(now_ms, display_lead_ms.load(.acquire));
     }
@@ -524,37 +483,15 @@ pub const Snapshot = struct {
     /// regression-testing -- can be exercised with concrete numbers regardless
     /// of whatever the live value is currently tuned to.
     fn playTimeMillisLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) i64 {
-        if (self.run_status != .Playing or !self.has_anchor) {
-            return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
-        }
-        return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms) + lead_ms;
+        _ = now_ms;
+        return @as(i64, self.play_time_seconds) * std.time.ms_per_s + lead_ms;
     }
 
-    /// The whole second the player is showing at `now_ms`.
+    /// The whole second the player is showing.
     pub fn playTimeSeconds(self: Snapshot, now_ms: i64) u32 {
         const ms = self.playTimeMillis(now_ms);
         if (ms <= 0) return 0;
         return @intCast(@divFloor(ms, std.time.ms_per_s));
-    }
-
-    /// When the displayed second next changes, or null when nothing is ticking
-    /// and so there is no future moment worth waking up for.
-    pub fn nextTickMs(self: Snapshot, now_ms: i64) ?i64 {
-        return self.nextTickMsLeadBy(now_ms, display_lead_ms.load(.acquire));
-    }
-
-    /// `nextTickMs` with an explicit lead. See `playTimeMillisLeadBy`.
-    ///
-    /// Shifting the anchor `lead_ms` earlier before computing the edge is what
-    /// keeps this in lockstep with `playTimeMillisLeadBy`: the wake schedule and
-    /// the value it is waking up to show must never describe two different
-    /// instants, in either direction, or a step could be woken for and then
-    /// find nothing has actually changed yet (or the reverse: change without a
-    /// wake to redraw it).
-    fn nextTickMsLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) ?i64 {
-        if (self.run_status != .Playing or !self.has_anchor) return null;
-        const effective_anchor_ms = self.anchor_ms - lead_ms;
-        return effective_anchor_ms + (@divFloor(now_ms - effective_anchor_ms, 1000) + 1) * 1000;
     }
 };
 
@@ -730,88 +667,44 @@ const SnapshotCell = struct {
     }
 };
 
-/// Guards `player`'s shared mutable state (`.state`, `.last_update_time`,
-/// `.lock`) across the poll-worker pool. A spin lock, for the same reason as
-/// `SnapshotCell`: the critical section is small -- fold one sample into the
-/// phase lock, or read a `Snapshot` back out -- and `std.Thread.Mutex` does
-/// not exist in 0.16.
-const PlayerGuard = struct {
-    guard: std.atomic.Value(bool) = .init(false),
-
-    fn acquire(self: *PlayerGuard) void {
-        while (self.guard.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    fn release(self: *PlayerGuard) void {
-        self.guard.store(false, .release);
-    }
-};
-
-/// Sleep until `deadline_ms`, in slices no longer than `POLL_THREAD_SLICE_MS`
-/// so `stop` is noticed promptly rather than only after a whole cycle.
-fn sleepUntil(io: Io, deadline_ms: i64, stop: *std.atomic.Value(bool)) void {
-    while (!stop.load(.acquire)) {
-        const remaining = deadline_ms - time.nowMillis(io);
-        if (remaining <= 0) return;
-        io.sleep(.fromMilliseconds(@min(remaining, POLL_THREAD_SLICE_MS)), .awake) catch return;
-    }
-}
-
-/// One of `poll_workers` threads polling the same shared `player`.
+/// Poll the player on its own thread, publishing each result for the display.
 ///
-/// Dispatches continuously rather than reacting to a computed schedule: this
-/// worker's own loop targets one request every `poll_workers *
-/// frame_interval_ms`, and the pool as a whole -- `poll_workers` of these,
-/// each started `frame_interval_ms` apart -- sustains a dispatch roughly
-/// every `frame_interval_ms`, limited only by how fast the player itself can
-/// answer. A result completing out of dispatch order is not a bug to guard
-/// against here: `BlurayPlayer.poll` drops anything older than what is
-/// already recorded.
+/// Dispatches the next request immediately after the previous one completes --
+/// no artificial delay, no concurrency. A single in-flight request at a time
+/// is deliberate: the player answers `cCMD_PST` in ~1000 ms while a disc
+/// plays, which is by itself a tighter cadence than the display needs, and an
+/// earlier version of this code that ran several requests concurrently found
+/// the player's own small embedded web server appears to serialize them --
+/// answering N concurrent requests in N times as long, not in parallel --
+/// which only made every individual response slower for no throughput gained.
 ///
-/// Runs until `stop` is set.
-fn pollWorker(
+/// Runs until `stop` is set. Sleeps in short slices rather than straight
+/// through so that shutdown is noticed promptly even while idle (e.g. no IP
+/// configured).
+fn pollLoop(
     io: Io,
-    player: *BlurayPlayer,
-    guard: *PlayerGuard,
+    allocator: std.mem.Allocator,
     cell: *SnapshotCell,
-    worker: usize,
-    resync_requested: *std.atomic.Value(bool),
-    stagger: *std.atomic.Value(u32),
     stop: *std.atomic.Value(bool),
 ) void {
-    const initial_offset_ms = @as(i64, @intCast(worker)) * frame_interval_ms;
-    if (initial_offset_ms > 0) {
-        sleepUntil(io, time.nowMillis(io) + initial_offset_ms, stop);
-    }
+    var player = BlurayPlayer.init(io, allocator);
+    defer player.deinit();
 
     while (!stop.load(.acquire)) {
-        // A one-shot signal from the web page: `swap` both reads and clears
-        // it atomically, so a request cannot be lost or double-fired between
-        // the check and the reset. Every worker checks it, not just one --
-        // harmless, since only whichever worker's `swap` lands first actually
-        // sees `true`, and it means the button is noticed within one worker's
-        // dispatch (~`frame_interval_ms`) instead of a whole pool cycle.
-        if (resync_requested.swap(false, .acq_rel)) {
-            std.debug.print("pollWorker: forced PLL resync requested from the web page\n", .{});
-            guard.acquire();
-            player.lock.drop();
-            guard.release();
+        const started_ms = time.nowMillis(io);
+        player.poll();
+        cell.publish(player.snapshot());
+
+        // Dispatch the next request immediately -- see the doc comment above
+        // for why. This sleep is not pacing the poll cadence; it only guards
+        // against spinning the CPU when there is nothing to poll (no IP
+        // configured, so `poll` returns instantly instead of after a round
+        // trip), and it is the only place this loop checks `stop` in that
+        // case, so it also bounds shutdown latency then.
+        const elapsed_ms = time.nowMillis(io) - started_ms;
+        if (elapsed_ms < POLL_THREAD_SLICE_MS) {
+            io.sleep(.fromMilliseconds(POLL_THREAD_SLICE_MS - elapsed_ms), .awake) catch return;
         }
-
-        const dispatch_ms = time.nowMillis(io);
-        player.poll(guard, cell, worker);
-
-        // Back on cycle if the round trip left slack, immediately (plus the
-        // stagger) if it ran long. The stagger has to apply to both cases --
-        // see `poll_stagger_step_ms` for why skipping it in the overrun case
-        // would matter.
-        const s = stagger.fetchAdd(1, .monotonic);
-        const jitter_ms = poll_stagger_step_ms * @as(i64, @intCast(s % poll_stagger_cycle));
-        const cycle_ms = @as(i64, @intCast(poll_workers)) * frame_interval_ms + jitter_ms;
-        const target_ms = @max(dispatch_ms + cycle_ms, time.nowMillis(io) + jitter_ms);
-        sleepUntil(io, target_ms, stop);
     }
 }
 
@@ -859,74 +752,6 @@ pub const Command = enum {
     }
 };
 
-/// A snapshot of the fields of `phase_lock.PhaseLock` that anything watching
-/// the log would plausibly want to know changed, taken before and after a
-/// poll to report what actually happened.
-///
-/// Exists because `phase_lock.zig` is deliberately I/O-free -- see its module
-/// doc -- so this observation, and the decision about what counts as
-/// "something happened", lives here instead, in the layer that already does
-/// I/O and is not exercised hundreds of times per test.
-const LockObservable = struct {
-    have_anchor: bool,
-    locked: bool,
-    anchor_ms: i64,
-    anchor_sec: u32,
-    anchor_err_ms: i64,
-
-    fn capture(lock: *const phase_lock.PhaseLock) LockObservable {
-        return .{
-            .have_anchor = lock.have_anchor,
-            .locked = lock.isLocked(),
-            .anchor_ms = lock.anchor_ms,
-            .anchor_sec = lock.anchor_sec,
-            .anchor_err_ms = lock.anchor_err_ms,
-        };
-    }
-
-    /// `PhaseLock.predict`, computed from this captured state. Mirrors that
-    /// function exactly, so the drift printed per poll is the drift the lock
-    /// itself was facing when it evaluated the sample -- computed against the
-    /// anchor as it stood *before* the sample was folded in, since afterwards
-    /// a rebase would have already erased the disagreement being measured.
-    /// Meaningful only when `have_anchor`; callers check.
-    fn predictAt(self: LockObservable, at_ms: i64) u32 {
-        const elapsed_ms = at_ms - self.anchor_ms;
-        if (elapsed_ms < 0) return self.anchor_sec;
-        return self.anchor_sec +| @as(u32, @intCast(@divFloor(elapsed_ms, 1000)));
-    }
-
-    /// Log whatever changed between `before` (an earlier capture) and `self`
-    /// (the current state), attributing it to the poll from worker `worker`
-    /// that ran in between. Silent when nothing changed, which is most polls
-    /// -- a sample that simply agreed with the accumulated estimate.
-    fn logChangesFrom(self: LockObservable, before: LockObservable, worker: usize) void {
-        if (!before.have_anchor and self.have_anchor) {
-            std.debug.print("phase_lock: anchor acquired -> sec={d} at ms={d} (+-{d}ms, worker={d})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, worker });
-        } else if (before.have_anchor and !self.have_anchor) {
-            std.debug.print("phase_lock: anchor cleared (worker={d})\n", .{worker});
-        } else if (self.have_anchor and (self.anchor_ms != before.anchor_ms or self.anchor_sec != before.anchor_sec)) {
-            std.debug.print("phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, worker={d}, locked={})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, worker, self.locked });
-        }
-
-        if (!before.locked and self.locked) {
-            std.debug.print("phase_lock: locked (+-{d}ms, worker={d})\n", .{ self.anchor_err_ms, worker });
-        } else if (before.locked and !self.locked) {
-            std.debug.print("phase_lock: lost lock, re-acquiring (worker={d})\n", .{worker});
-        }
-
-        // Interval tightening: same anchor, narrower error bound. Not itself
-        // a resync, so kept quieter than the events above -- useful when
-        // specifically watching convergence, noisy otherwise.
-        if (self.have_anchor and before.have_anchor and
-            self.anchor_ms == before.anchor_ms and self.anchor_sec == before.anchor_sec and
-            self.anchor_err_ms != before.anchor_err_ms)
-        {
-            std.debug.print("phase_lock: estimate tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
-        }
-    }
-};
-
 /// Client for a Panasonic DP-UB820-K.
 ///
 /// This is Panasonic's legacy LAN control interface rather than a modern REST
@@ -942,17 +767,11 @@ pub const BlurayPlayer = struct {
     /// polling works either way; control commands require it on stock firmware.
     secret_key: ?[]const u8,
     state: BlurayPlayerState,
-    /// `sample_ms` of the most recently *applied* sample -- the ordering
-    /// guard in `poll` that keeps a straggler from an earlier, slower
-    /// dispatch from regressing state a fresher one already updated.
+    /// When the player last actually answered, so a frozen position (stopped,
+    /// paused, or simply not responding) can be told from a live one -- see
+    /// `Snapshot.positionIsLive`.
     last_update_time: i64,
     http_client: std.http.Client,
-
-    /// Tracks the phase of the player's 1 Hz tick so the displayed time can
-    /// be interpolated from the local clock between polls. See
-    /// `phase_lock.zig`; the poll cadence itself is owned by the pool in
-    /// `pollWorker`, not by the lock.
-    lock: phase_lock.PhaseLock,
 
     const Self = @This();
     /// Required by the DP-UB820-K; the CGI returns an error without it.
@@ -979,7 +798,6 @@ pub const BlurayPlayer = struct {
             .state = BlurayPlayerState.init(),
             .last_update_time = 0,
             .http_client = std.http.Client{ .allocator = allocator, .io = io },
-            .lock = .init,
         };
     }
 
@@ -995,7 +813,7 @@ pub const BlurayPlayer = struct {
     }
 
     /// One HTTP round trip's worth of status, before it is folded into
-    /// `player`'s shared state by `poll`.
+    /// `self` by `poll`.
     const StatusSample = struct {
         sample_ms: i64,
         rtt_ms: i64,
@@ -1004,128 +822,39 @@ pub const BlurayPlayer = struct {
         is_standby: bool,
     };
 
-    /// Poll once and fold the result into the shared phase lock and state, if
-    /// it says anything newer than what is already recorded.
-    ///
-    /// The network round trip itself (`getStatus`) touches none of `self`'s
-    /// shared fields and is safe to run concurrently from every worker in the
-    /// pool at once -- see its own doc. Only the fold is serialized, through
-    /// `guard`, and it is a short critical section: a comparison, a few field
-    /// writes, and one call into the phase lock.
-    pub fn poll(self: *Self, guard: *PlayerGuard, cell: *SnapshotCell, worker: usize) void {
+    /// Poll once and record exactly what came back -- no interpolation, no
+    /// locking, no memory of previous samples beyond `state` /
+    /// `last_update_time` themselves. What the display shows is this stored
+    /// state plus `display_lead_ms` applied at render time; see `Snapshot`.
+    pub fn poll(self: *Self) void {
         const sample = self.getStatus() catch |err| {
-            std.debug.print("worker={d} failed to get Blu-ray status: {}\n", .{ worker, err });
+            std.debug.print("failed to get Blu-ray status: {}\n", .{err});
             return;
         };
 
-        guard.acquire();
-        defer guard.release();
+        self.state.run_status = sample.run_status;
+        self.state.play_time_seconds = sample.play_time_seconds;
+        self.state.is_standby = sample.is_standby;
+        self.last_update_time = sample.sample_ms;
 
-        if (sample.sample_ms <= self.last_update_time) {
-            // A straggler from an earlier, slower-to-answer dispatch, landing
-            // after a fresher sample already updated the model: concurrent,
-            // overlapping requests can complete in any order, and the shared
-            // state must only ever advance on newer evidence, never regress.
-            std.debug.print("worker={d} dropped a stale sample (sample_ms={d} <= last={d})\n", .{
-                worker, sample.sample_ms, self.last_update_time,
-            });
-        } else {
-            // `phase_lock.zig` is deliberately free of I/O (its own module
-            // doc: "so the state machine can be tested deterministically" --
-            // a print inside it would fire on every one of the hundreds of
-            // steps in a single test). Comparing its externally-visible state
-            // before and after instead gives the same visibility without that
-            // cost, from the layer that already does I/O.
-            const before = LockObservable.capture(&self.lock);
-            self.recordSample(sample.sample_ms, sample.run_status, sample.play_time_seconds);
-            self.state.is_standby = sample.is_standby;
-            const after = LockObservable.capture(&self.lock);
-            after.logChangesFrom(before, worker);
-
-            const reported = sample.play_time_seconds;
-            if (sample.run_status != .Playing) {
-                std.debug.print("pll: worker={d} reported={d} status={s} rtt={d}ms\n", .{
-                    worker, reported, @tagName(sample.run_status), sample.rtt_ms,
-                });
-            } else if (before.have_anchor) {
-                // The line that matters when chasing drift: the value the
-                // player reported vs. what the pre-sample anchor predicted
-                // for that same instant. drift=0 means the model and the
-                // player agree exactly; a persistent nonzero drift with
-                // `into` well away from 0/1000 is a genuine value error on
-                // our side; drift of +-1 with `into` near an edge is
-                // rounding ambiguity, not error.
-                const predicted = before.predictAt(sample.sample_ms);
-                const drift = @as(i64, reported) - @as(i64, predicted);
-                const into_ms = @mod(sample.sample_ms - before.anchor_ms, 1000);
-                std.debug.print("pll: worker={d} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}\n", .{
-                    worker,           reported,       predicted,
-                    drift,            into_ms,        after.anchor_err_ms,
-                    sample.rtt_ms,    if (after.locked) "locked" else "hunting",
-                });
-            } else {
-                std.debug.print("pll: worker={d} reported={d} (no anchor yet) rtt={d}ms\n", .{
-                    worker, reported, sample.rtt_ms,
-                });
-            }
-        }
-
-        cell.publish(self.snapshot());
+        std.debug.print("poll: reported={d} status={s} rtt={d}ms\n", .{
+            sample.play_time_seconds, @tagName(sample.run_status), sample.rtt_ms,
+        });
     }
 
-    /// Current state in the form the display consumes. Call only while
-    /// holding `guard` -- the same critical section `poll` reads it from.
-    ///
-    /// The player reports whole seconds only, and each poll costs a network
-    /// round trip, so the raw value is inherently stale. Once the phase of the
-    /// player's 1 Hz tick is known, the displayed second can be computed from
-    /// our own clock and will flip at the same instant the player's does -- but
-    /// that computation belongs wherever the drawing happens, not here, so what
-    /// is published is the anchor rather than a value read at poll time.
+    /// Current state in the form the display consumes.
     pub fn snapshot(self: *const Self) Snapshot {
         return .{
             .run_status = self.state.run_status,
             .play_time_seconds = self.state.play_time_seconds,
-            .has_anchor = self.lock.hasAnchor(),
             .sampled_ms = self.last_update_time,
-            .anchor_ms = self.lock.anchor_ms,
-            .anchor_sec = self.lock.anchor_sec,
         };
     }
 
-    /// Fold one status sample into the phase lock. Called only from `poll`,
-    /// already holding `guard`.
-    ///
-    /// `sample_ms` is the best estimate of when the player read its own clock.
-    fn recordSample(self: *Self, sample_ms: i64, run_status: BlurayPlayerRunStatus, play_time: u32) void {
-        const was_playing = self.state.run_status == .Playing;
-        self.state.run_status = run_status;
-        self.state.play_time_seconds = play_time;
-        self.last_update_time = sample_ms;
-
-        if (run_status != .Playing) {
-            // Nothing is ticking, and resuming will restart the tick at an
-            // unrelated phase, so the lock is void.
-            self.lock.sampleStopped();
-            return;
-        }
-
-        // Playback just (re)started. The counter resumes at an unrelated phase
-        // and often an unrelated position, but the display must not stall
-        // waiting for a fresh bracket to form -- anchor immediately on this
-        // first sample (`PhaseLock.resumed`) and let the hunt that follows
-        // tighten it, rather than discarding the anchor outright and leaving
-        // `predict` with nothing to show until a full cold hunt completes.
-        if (!was_playing) self.lock.resumed(sample_ms, play_time);
-
-        self.lock.sampleRunning(sample_ms, play_time);
-    }
-
-    /// The network round trip and response parsing only -- touches none of
-    /// `self`'s shared state, so any number of workers may call this
-    /// concurrently. See `http_client`'s own thread-safety note
-    /// ("Connections are opened in a thread-safe manner") and
-    /// `ip_address`/`secret_key`, set once at `init` and never mutated after.
+    /// The network round trip and response parsing. Touches none of `self`'s
+    /// state -- `poll` folds the result in separately -- which is what keeps
+    /// this function itself trivially testable-in-isolation-shaped, even
+    /// though nothing currently calls it concurrently.
     fn getStatus(self: *Self) !StatusSample {
         if (self.ip_address == null) {
             return error.NoIpAddress;
@@ -1336,72 +1065,44 @@ pub const BlurayPlayer = struct {
     }
 };
 
-test "a locked snapshot ticks with the player, not with when it was polled" {
-    // Anchor: the player showed second 100 at t = 50_000.
+test "playTimeSeconds and playTimeMillis show exactly the last reported value" {
+    // No interpolation: whatever wall-clock instant this is evaluated at, the
+    // answer is the same until a fresh poll actually changes `play_time_seconds`.
     const snap: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 100,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
+        .sampled_ms = 50_000,
     };
 
-    // The value advances with the local clock between polls...
     try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(50_000));
     try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(50_999));
-    // ...and flips exactly on the player's own edge, not a moment later.
-    try std.testing.expectEqual(@as(u32, 101), snap.playTimeSeconds(51_000));
-    try std.testing.expectEqual(@as(u32, 107), snap.playTimeSeconds(57_400));
-
-    // Millisecond position is what cue timing runs off.
-    try std.testing.expectEqual(@as(i64, 100_400), snap.playTimeMillis(50_400));
+    try std.testing.expectEqual(@as(u32, 100), snap.playTimeSeconds(57_400));
+    try std.testing.expectEqual(@as(i64, 100_000), snap.playTimeMillis(50_400));
 }
 
-test "nextTickMs is the instant the display must be redrawn" {
-    const snap: Snapshot = .{
-        .run_status = .Playing,
-        .play_time_seconds = 100,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
-    };
-
-    // Waking here is what keeps the redraw on the player's edge rather than on
-    // whatever grid the loop would otherwise have used.
-    try std.testing.expectEqual(@as(?i64, 51_000), snap.nextTickMs(50_000));
-    try std.testing.expectEqual(@as(?i64, 51_000), snap.nextTickMs(50_999));
-    try std.testing.expectEqual(@as(?i64, 52_000), snap.nextTickMs(51_000));
-
-    // Nothing is ticking when paused or stopped, so there is nothing to wake
-    // for and the loop should fall back to its idle slice.
-    var paused = snap;
-    paused.run_status = .Paused;
-    try std.testing.expectEqual(@as(?i64, null), paused.nextTickMs(50_500));
-
-    // An unlocked snapshot cannot predict an edge either.
-    var unlocked = snap;
-    unlocked.has_anchor = false;
-    try std.testing.expectEqual(@as(?i64, null), unlocked.nextTickMs(50_500));
-}
-
-test "an unlocked or paused snapshot falls back to the last reported second" {
+test "a paused or stopped snapshot still shows the last reported second" {
     const paused: Snapshot = .{
         .run_status = .Paused,
         .play_time_seconds = 1234,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
+        .sampled_ms = 50_000,
     };
-    // A paused player holds its position however much wall time passes.
     try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(50_000));
     try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(999_000));
+}
 
-    const searching: Snapshot = .{
+test "positionIsLive reflects freshness of the last poll, not lock state" {
+    const fresh: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 77,
-        .has_anchor = false,
+        .sampled_ms = 50_000,
     };
-    try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
+    try std.testing.expect(fresh.positionIsLive(50_000));
+    try std.testing.expect(fresh.positionIsLive(50_000 + stale_position_ms));
+    try std.testing.expect(!fresh.positionIsLive(50_000 + stale_position_ms + 1));
+
+    var paused = fresh;
+    paused.run_status = .Paused;
+    try std.testing.expect(!paused.positionIsLive(50_000));
 }
 
 test "parseDisplayLeadConfig accepts signed integers and rejects garbage" {
@@ -1451,55 +1152,33 @@ test "setDisplayLead applies to the running process immediately" {
     try std.testing.expectEqual(@as(i64, 250), display_lead_ms.load(.acquire));
 }
 
-test "display_lead_ms shifts the displayed position and its tick schedule together" {
+test "display_lead_ms shifts the displayed position, applied at the end and nowhere else" {
     const snap: Snapshot = .{
         .run_status = .Playing,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
+        .play_time_seconds = 100,
+        .sampled_ms = 50_000,
     };
 
-    // With no lead, position and tick line up with the raw anchor.
-    try std.testing.expectEqual(@as(i64, 110_000), snap.playTimeMillisLeadBy(60_000, 0));
-    try std.testing.expectEqual(@as(i64, 51_000), snap.nextTickMsLeadBy(50_000, 0).?);
+    // With no lead, the raw reported value passes through unchanged.
+    try std.testing.expectEqual(@as(i64, 100_000), snap.playTimeMillisLeadBy(60_000, 0));
 
-    // A lead of 237 ms must move both outputs by exactly 237 ms and no more:
-    // the clock and its own wake schedule can never disagree about what "now"
-    // means once a lead is applied, or a redraw would fire before -- or after
-    // -- the value it exists to show has actually changed.
-    try std.testing.expectEqual(@as(i64, 110_237), snap.playTimeMillisLeadBy(60_000, 237));
-    try std.testing.expectEqual(@as(i64, 51_000 - 237), snap.nextTickMsLeadBy(50_000, 237).?);
+    // A lead of 237 ms moves the output by exactly 237 ms and no more, and
+    // does not depend on `now_ms` -- there is nothing else in the formula for
+    // it to interact with.
+    try std.testing.expectEqual(@as(i64, 100_237), snap.playTimeMillisLeadBy(60_000, 237));
+    try std.testing.expectEqual(@as(i64, 100_237), snap.playTimeMillisLeadBy(999_999, 237));
 }
 
-test "playTimeMillis and nextTickMs are wired to the live display_lead_ms" {
-    // Proves the public entry points actually reach the atomic, not just that
-    // the LeadBy helpers compute the right formula in isolation.
+test "playTimeMillis is wired to the live display_lead_ms" {
+    // Proves the public entry point actually reaches the atomic, not just
+    // that the LeadBy helper computes the right formula in isolation.
     const snap: Snapshot = .{
         .run_status = .Playing,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
+        .play_time_seconds = 100,
+        .sampled_ms = 50_000,
     };
     const lead = display_lead_ms.load(.acquire);
     try std.testing.expectEqual(snap.playTimeMillisLeadBy(60_000, lead), snap.playTimeMillis(60_000));
-    try std.testing.expectEqual(snap.nextTickMsLeadBy(50_000, lead), snap.nextTickMs(50_000));
-}
-
-test "nextTickMs marks exactly when playTimeSeconds increments, whatever the lead" {
-    // The invariant that actually matters, independent of DISPLAY_LEAD_MS's
-    // current value: the wake schedule and the second it wakes up to show must
-    // never come apart.
-    const snap: Snapshot = .{
-        .run_status = .Playing,
-        .has_anchor = true,
-        .anchor_ms = 50_000,
-        .anchor_sec = 100,
-    };
-    const now: i64 = 60_000;
-    const before = snap.playTimeSeconds(now);
-    const tick = snap.nextTickMs(now).?;
-    try std.testing.expectEqual(before, snap.playTimeSeconds(tick - 1));
-    try std.testing.expectEqual(before + 1, snap.playTimeSeconds(tick));
 }
 
 test "authValue is uppercase hex SHA-256 of key ++ nonce" {
