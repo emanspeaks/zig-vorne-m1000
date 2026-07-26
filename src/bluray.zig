@@ -61,6 +61,7 @@ pub fn runBlurayClocks(
     port: anytype,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
+    resync_requested: *std.atomic.Value(bool),
 ) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
@@ -115,7 +116,7 @@ pub fn runBlurayClocks(
     var zone: time.SharedZone = .init(time.getTimezoneInfo(io));
 
     var stop_workers = std.atomic.Value(bool).init(false);
-    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, &stop_workers });
+    const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, resync_requested, &stop_workers });
     const cue_thread = try std.Thread.spawn(.{}, cueLoop, .{ io, allocator, cue_state, &cue_cell, &zone, &stop_workers });
     defer {
         stop_workers.store(true, .release);
@@ -705,12 +706,21 @@ fn pollLoop(
     io: Io,
     allocator: std.mem.Allocator,
     cell: *SnapshotCell,
+    resync_requested: *std.atomic.Value(bool),
     stop: *std.atomic.Value(bool),
 ) void {
     var player = BlurayPlayer.init(io, allocator);
     defer player.deinit();
 
     while (!stop.load(.acquire)) {
+        // A one-shot signal from the web page: `swap` both reads and clears it
+        // atomically, so a request cannot be lost or double-fired between the
+        // check and the reset.
+        if (resync_requested.swap(false, .acq_rel)) {
+            std.debug.print("pollLoop: forced PLL resync requested from the web page\n", .{});
+            player.lock.forceResync(time.nowMillis(io));
+        }
+
         player.poll();
         cell.publish(player.snapshot());
 
@@ -766,6 +776,68 @@ pub const Command = enum {
             .PowerOff => "RC_POWEROFF",
             .OpenClose => "RC_OP_CL",
         };
+    }
+};
+
+/// A snapshot of the fields of `phase_lock.PhaseLock` that anything watching
+/// the log would plausibly want to know changed, taken before and after a
+/// poll to report what actually happened.
+///
+/// Exists because `phase_lock.zig` is deliberately I/O-free -- see its module
+/// doc -- so this observation, and the decision about what counts as
+/// "something happened", lives here instead, in the layer that already does
+/// I/O and is not exercised hundreds of times per test.
+const LockObservable = struct {
+    have_anchor: bool,
+    locked: bool,
+    refreshing: bool,
+    anchor_ms: i64,
+    anchor_sec: u32,
+    anchor_err_ms: i64,
+
+    fn capture(lock: *const phase_lock.PhaseLock) LockObservable {
+        return .{
+            .have_anchor = lock.have_anchor,
+            .locked = lock.isLocked(),
+            .refreshing = lock.refreshing,
+            .anchor_ms = lock.anchor_ms,
+            .anchor_sec = lock.anchor_sec,
+            .anchor_err_ms = lock.anchor_err_ms,
+        };
+    }
+
+    /// Log whatever changed between `before` (an earlier capture) and `self`
+    /// (the current state), attributing it to the poll of kind `kind` that ran
+    /// in between. Silent when nothing changed, which is most polls -- a
+    /// straddle or mid-second check that simply agreed with the prediction.
+    fn logChangesFrom(self: LockObservable, before: LockObservable, kind: PollKind) void {
+        if (!before.have_anchor and self.have_anchor) {
+            std.debug.print("phase_lock: anchor acquired -> sec={d} at ms={d} (+-{d}ms, kind={s})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind) });
+        } else if (before.have_anchor and !self.have_anchor) {
+            std.debug.print("phase_lock: anchor cleared (kind={s})\n", .{@tagName(kind)});
+        } else if (self.have_anchor and (self.anchor_ms != before.anchor_ms or self.anchor_sec != before.anchor_sec)) {
+            std.debug.print("phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, kind={s}, locked={})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind), self.locked });
+        }
+
+        if (!before.locked and self.locked) {
+            std.debug.print("phase_lock: locked (+-{d}ms, kind={s})\n", .{ self.anchor_err_ms, @tagName(kind) });
+        } else if (before.locked and !self.locked) {
+            std.debug.print("phase_lock: lost lock, hunting (kind={s})\n", .{@tagName(kind)});
+        }
+
+        if (!before.refreshing and self.refreshing) {
+            std.debug.print("phase_lock: periodic refresh started (kind={s})\n", .{@tagName(kind)});
+        }
+
+        // Bracket tightening: same anchor instant, but a narrower error bound.
+        // Not itself a resync, so kept quieter than the events above -- useful
+        // when specifically watching convergence, noisy otherwise.
+        if (self.have_anchor and before.have_anchor and
+            self.anchor_ms == before.anchor_ms and self.anchor_sec == before.anchor_sec and
+            self.anchor_err_ms != before.anchor_err_ms)
+        {
+            std.debug.print("phase_lock: bracket tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
+        }
     }
 };
 
@@ -845,12 +917,14 @@ pub const BlurayPlayer = struct {
         // `phase_lock.zig` is deliberately free of I/O (its own module doc:
         // "so the state machine can be tested deterministically" -- a print
         // inside it would fire on every one of the hundreds of steps in a
-        // single test). Comparing the anchor before and after instead gives
-        // the same visibility without that cost, from the layer that already
-        // does I/O.
-        const anchor_ms_before = self.lock.anchor_ms;
-        const anchor_sec_before = self.lock.anchor_sec;
-        const had_anchor_before = self.lock.have_anchor;
+        // single test). Comparing its externally-visible state before and after
+        // instead gives the same visibility without that cost, from the layer
+        // that already does I/O. Every field that a caller could plausibly ask
+        // "did the lock just do something?" about is covered here, not only
+        // the anchor value -- entering/leaving `locked`, starting a refresh,
+        // and the bracket tightening (`anchor_err_ms` shrinking) are all real
+        // events with nothing else to report them.
+        const before = LockObservable.capture(&self.lock);
 
         self.getStatus(kind) catch |err| {
             std.debug.print("Failed to get Blu-ray status: {}\n", .{err});
@@ -859,23 +933,7 @@ pub const BlurayPlayer = struct {
         };
         self.lock.schedule(time.nowMillis(self.io), kind, self.state.run_status == .Playing);
 
-        // Report every actual change to the anchor -- the PLL's estimate of
-        // when the player's tick last crossed a second boundary -- not every
-        // poll. Most polls confirm the existing anchor and change nothing
-        // (a straddle or mid-second check that agreed with the prediction);
-        // this fires only when `sampleRunning`, `rebase`, or `resumed` actually
-        // moved it, which is the event worth seeing when chasing a sync issue.
-        if (self.lock.have_anchor and (!had_anchor_before or
-            self.lock.anchor_ms != anchor_ms_before or
-            self.lock.anchor_sec != anchor_sec_before))
-        {
-            std.debug.print(
-                "phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, kind={s}, locked={})\n",
-                .{ self.lock.anchor_sec, self.lock.anchor_ms, self.lock.anchor_err_ms, @tagName(kind), self.lock.isLocked() },
-            );
-        } else if (had_anchor_before and !self.lock.have_anchor) {
-            std.debug.print("phase_lock: anchor cleared (kind={s})\n", .{@tagName(kind)});
-        }
+        LockObservable.capture(&self.lock).logChangesFrom(before, kind);
     }
 
     /// Current state in the form the display consumes.

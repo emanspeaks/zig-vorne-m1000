@@ -215,6 +215,23 @@ pub const PhaseLock = struct {
         self.refreshing = false;
     }
 
+    /// Force an immediate re-hunt, bypassing whatever cadence the lock's own
+    /// state would otherwise have chosen next.
+    ///
+    /// Unlike the periodic refresh (`relockIntervalMs`), which waits out its
+    /// interval and then hunts gently (`refresh_hunt_poll_ms`) because nothing
+    /// is known to be wrong, this is for a caller who has decided *right now*
+    /// that the anchor should not be trusted -- an operator pressing "force
+    /// resync" on the web page because the display looks off and is not
+    /// willing to wait out however much of the interval remains. Drops the
+    /// phase (the anchor keeps free-wheeling, so the display does not stall)
+    /// and schedules the very next poll as an urgent hunt.
+    pub fn forceResync(self: *PhaseLock, now_ms: i64) void {
+        self.drop();
+        self.next_poll_ms = now_ms;
+        self.next_kind = .hunt;
+    }
+
     /// Throw the anchor away entirely.
     ///
     /// Only for a genuine discontinuity -- the counter stopped or paused --
@@ -997,6 +1014,36 @@ test "resumed anchors immediately rather than stalling like a bare reset" {
         if (lock.predict(t, 0) > resume_value) advanced = true;
     }
     try std.testing.expect(advanced);
+}
+
+test "forceResync re-hunts immediately without stalling or waiting" {
+    var lock = PhaseLock.init;
+    var sim: Sim = .{ .content_ms = 20_000 };
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
+    const anchor_before = lock.anchor_ms;
+
+    // Well inside the normal relock interval -- a periodic refresh would not
+    // have fired yet on its own.
+    try std.testing.expect(sim.now_ms - lock.locked_at_ms < relock_interval_tight_ms);
+
+    lock.forceResync(sim.now_ms);
+
+    // The clock keeps running (old anchor still in place) rather than
+    // stalling, exactly like an ordinary `drop`...
+    try std.testing.expect(!lock.isLocked());
+    try std.testing.expect(lock.hasAnchor());
+    try std.testing.expectEqual(anchor_before, lock.anchor_ms);
+
+    // ...but the next poll is scheduled *immediately*, not at whatever cadence
+    // was previously in effect, and as an urgent hunt rather than the gentle
+    // refresh cadence.
+    try std.testing.expectEqual(sim.now_ms, lock.next_poll_ms);
+    try std.testing.expectEqual(PollKind.hunt, lock.next_kind);
+
+    // And it actually does re-acquire from there.
+    sim.stepN(&lock, 20);
+    try expectInSync(&sim, &lock);
 }
 
 test "a stop discards the anchor rather than free-wheeling past it" {
