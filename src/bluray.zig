@@ -470,15 +470,21 @@ pub const Snapshot = struct {
     /// seconds old without anything looking wrong about it.
     sampled_ms: i64 = 0,
 
-    /// Whether the play position is being actively tracked, and so can be
-    /// trusted for anything that keys off *where* playback is.
+    /// Whether the play position is fresh enough to be trusted for anything
+    /// that keys off *where* playback is -- cue lookups and boundary waits.
     ///
-    /// Without an anchor the position is just whatever the last poll reported,
-    /// frozen until the next one lands: fine to show on the clock, but it would
-    /// pin a cue on screen long after playback left it behind.
+    /// Deliberately does not require `has_anchor`. `playTimeMillis` already
+    /// falls back to the raw last-polled value when there is no anchor, so
+    /// gating on the anchor here bought nothing but *silence*: while the lock
+    /// is re-acquiring (which can take a while right after a seek, a resume,
+    /// or simply a fresh start), this used to blank cues -- or leave a stale
+    /// one on screen from before arming -- until the PLL caught back up,
+    /// which reads exactly like a bug even though the underlying position was
+    /// perfectly usable the whole time. A poll landing every second or so
+    /// without smooth extrapolation between them is a worse position signal
+    /// than a locked one, but a much better one than nothing.
     pub fn positionIsLive(self: Snapshot, now_ms: i64) bool {
         return self.run_status == .Playing and
-            self.has_anchor and
             now_ms - self.sampled_ms <= stale_position_ms;
     }
 

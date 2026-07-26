@@ -9,10 +9,21 @@
 //! drift however the render loop happens to be scheduled, and a frame that
 //! arrives late lands where it should rather than one step behind.
 //!
-//! Positions are byte offsets. Cue text is expected to be plain ASCII -- the
-//! panel is not a UTF-8 device -- so bytes and columns are the same thing.
+//! Positions are *display columns*, not byte offsets -- deliberately not the
+//! same thing. Cue text has already been transcoded into the panel's own
+//! character set by the time it reaches here (`vorne_charset.encodeUtf8`, at
+//! parse time), and most of that set is one byte per column, but the graphic
+//! characters below the space (`vorne_charset.control_chars`) are a `DLE`
+//! escape: two bytes for one column. Treating `text.len` as the column count
+//! -- an earlier version of this file did -- overcounts by one for every such
+//! glyph, which shows up as the sweep stopping short of the true end and
+//! never fully reaching it, silently, for any cue containing one. `str_utils`
+//! already has to solve this same byte-vs-column distinction for the fixed
+//! display buffers, so this reuses `strlensz`/`idxChar2Str` rather than
+//! re-deriving it.
 
 const std = @import("std");
+const str_utils = @import("str_utils.zig");
 
 pub const Marquee = struct {
     /// How long each one-character step takes.
@@ -38,9 +49,10 @@ pub const Marquee = struct {
             self.started = true;
         }
 
-        if (text.len <= width) return text;
+        const chars = (str_utils.strlensz(text) catch unreachable)[0];
+        if (chars <= width) return text;
 
-        const overflow: i64 = @intCast(text.len - width);
+        const overflow: i64 = @intCast(chars - width);
         const travel_ms = overflow * self.step_ms;
         const cycle_ms = 2 * (self.hold_ms + travel_ms);
         const t = @mod(now_ms - self.started_ms, cycle_ms);
@@ -54,8 +66,14 @@ pub const Marquee = struct {
         else
             overflow - @divFloor(t - 2 * self.hold_ms - travel_ms, self.step_ms); // sliding back
 
-        const start: usize = @intCast(std.math.clamp(offset, 0, overflow));
-        return text[start .. start + width];
+        const start_char: usize = @intCast(std.math.clamp(offset, 0, overflow));
+        // Byte offsets, not column offsets: a DLE-escaped glyph anywhere
+        // before the window shifts every later byte position relative to its
+        // column position, so the slice bounds have to be looked up rather
+        // than computed by arithmetic on `start_char`/`width` directly.
+        const start_byte = str_utils.idxChar2Str(text, start_char) catch unreachable;
+        const end_byte = str_utils.idxChar2Str(text, start_char + width) catch unreachable;
+        return text[start_byte..end_byte];
     }
 
     /// When the window next changes, so the caller can sleep until exactly then.
@@ -69,9 +87,11 @@ pub const Marquee = struct {
     /// jumps read as stutter -- the scroll only looks smooth if the timing is
     /// even, which means being woken for it rather than noticing it late.
     pub fn nextStepMs(self: *const Marquee, text: []const u8, width: usize, now_ms: i64) ?i64 {
-        if (!self.started or text.len <= width) return null;
+        if (!self.started) return null;
+        const chars = (str_utils.strlensz(text) catch unreachable)[0];
+        if (chars <= width) return null;
 
-        const overflow: i64 = @intCast(text.len - width);
+        const overflow: i64 = @intCast(chars - width);
         const travel_ms = overflow * self.step_ms;
         const cycle_ms = 2 * (self.hold_ms + travel_ms);
         const t = @mod(now_ms - self.started_ms, cycle_ms);
@@ -263,4 +283,30 @@ test "text only one column too wide still scrolls" {
     const text = "123456789012345678901"; // one wider than the display
     try testing.expectEqualStrings(text[0..cols], m.window(text, cols, 0));
     try testing.expectEqualStrings(text[1..], m.window(text, cols, m.hold_ms + m.step_ms));
+}
+
+test "a DLE-escaped glyph counts as one column, not two, so the sweep reaches the true end" {
+    // "\x10P" is the same glyph as bluray.PLAYCHAR: one column, two bytes. 25
+    // columns total (10 + 1 + 14), 26 bytes -- a version that used text.len as
+    // the column count would compute overflow = 26 - 20 = 6 instead of the
+    // true 5, and the window would either stop one column short of the real
+    // end or slice straight through the DLE pair, depending on where the
+    // extra byte happened to land.
+    const text = "0123456789" ++ "\x10P" ++ "ABCDEFGHIJKLMN";
+    var m: Marquee = .{};
+
+    // Every window, at every point in the sweep, is exactly `cols` columns --
+    // never `cols` bytes, which for this text would be one column short.
+    const overflow = 5;
+    const at_end = m.hold_ms + overflow * m.step_ms;
+    var t: i64 = 0;
+    while (t <= at_end) : (t += 137) {
+        const w = m.window(text, cols, t);
+        try testing.expectEqual(@as(usize, cols), (try str_utils.strlensz(w))[0]);
+    }
+
+    // Fully swept, the window ends on the text's true final column ('N'), not
+    // one short of it -- and does not split the DLE pair it swept past.
+    const final = m.window(text, cols, at_end);
+    try testing.expectEqualStrings("56789" ++ "\x10P" ++ "ABCDEFGHIJKLMN", final);
 }
