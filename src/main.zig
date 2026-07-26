@@ -70,8 +70,12 @@ pub fn main(init: std.process.Init) !void {
     // Written by the HTTP thread, read by the Blu-ray display loop.
     var cue_state: cues.State = .{};
 
+    // One-shot "force a PLL resync now" signal from the web page, consumed by
+    // `pollLoop`. `swap`-based, so a request cannot be lost or double-fired.
+    var resync_requested = std.atomic.Value(bool).init(false);
+
     // Start HTTP server in a separate thread
-    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode, &cue_state });
+    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode, &cue_state, &resync_requested });
     server_thread.detach();
 
     // Main display loop
@@ -86,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         if (current_mode == .Clocks) {
             try clocks.runClocks(io, allocator, port, &mode);
         } else if (current_mode == .Bluray) {
-            try bluray.runBlurayClocks(io, allocator, port, &mode, &cue_state);
+            try bluray.runBlurayClocks(io, allocator, port, &mode, &cue_state, &resync_requested);
         } else if (current_mode == .Vlc) {
             try vlc.runVlcClocks(io, allocator, port, &mode);
         }
@@ -99,6 +103,7 @@ fn startHttpServer(
     port: *serial.SerialPort,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
+    resync_requested: *std.atomic.Value(bool),
 ) !void {
     const address: Io.net.IpAddress = Io.net.IpAddress.parse("0.0.0.0", 8080) catch unreachable;
     var listener = try address.listen(io, .{ .reuse_address = true });
@@ -108,7 +113,7 @@ fn startHttpServer(
 
     while (true) {
         const stream = try listener.accept(io);
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode, cue_state });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode, cue_state, resync_requested });
         thread.detach();
     }
 }
@@ -120,6 +125,7 @@ fn handleConnection(
     serial_port: *serial.SerialPort,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
+    resync_requested: *std.atomic.Value(bool),
 ) !void {
     defer stream.close(io);
 
@@ -178,6 +184,16 @@ fn handleConnection(
 
         writeCuesSection(io, allocator, w, cue_state) catch return;
         writeDisplayLeadSection(w) catch return;
+
+        w.writeAll(
+            \\<h2>Blu-Ray Sync</h2>
+            \\<p>Re-hunts the phase lock immediately instead of waiting for its
+            \\own periodic re-sync. The clock keeps running while it re-locks.</p>
+            \\<form action="/resync" method="post">
+            \\<button type="submit">Force PLL Resync</button>
+            \\</form>
+            \\
+        ) catch return;
 
         w.writeAll(
             \\</body>
@@ -326,6 +342,16 @@ fn handleConnection(
         }
 
         // Redirect back to main page
+        const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
+        try out.writeAll(response);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/resync")) {
+        // No body to parse: this is a single one-shot signal, picked up by
+        // `pollLoop` and consumed via `swap` so a request can never be lost or
+        // fire twice. Setting it while not in Blu-ray mode is harmless -- the
+        // next time that mode starts, a freshly initialized phase lock has
+        // nothing to resync anyway.
+        resync_requested.store(true, .release);
+
         const response = "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n";
         try out.writeAll(response);
     } else {
