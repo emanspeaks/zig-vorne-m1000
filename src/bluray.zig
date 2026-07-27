@@ -336,6 +336,9 @@ pub fn runBlurayClocks(
         // instant it appears, not a sweep later.
         var may_scroll = true;
         var line2_source: Line2Source = undefined;
+        // Captured before the block below can change `seen_cue_span`, so it
+        // can be compared against afterward -- see `cue_boundary`.
+        const prev_cue_span = seen_cue_span;
         const line2: []const u8 = if (cue_state.isArmed()) blk: {
             // Only show a cue while the position it is keyed to is actually
             // being tracked. Stopped, paused, seeking, or simply not answering
@@ -394,6 +397,15 @@ pub fn runBlurayClocks(
             seen_cue_span = null;
             break :blk "Blu-Ray mode";
         };
+
+        // Whether a cue's start or end marker was crossed this pass -- not
+        // whether line 2's *content* changed, which a marquee step also does,
+        // every ~400 ms, and which does not warrant this. Entering a cue's
+        // span, leaving one (to blank or to a different cue), and a disarm/
+        // rearm that resets `seen_cue_span` to null are exactly the
+        // transitions `seen_cue_span` already exists to detect (see its own
+        // doc), so this only needs to notice when this pass changed it.
+        const cue_boundary = !std.meta.eql(prev_cue_span, seen_cue_span);
 
         if (seen_line2_source == null or line2_source != seen_line2_source.?) {
             seen_line2_source = line2_source;
@@ -486,8 +498,14 @@ pub fn runBlurayClocks(
         if (entry_ms == null) entry_ms = now_ms;
         const in_entry_window = now_ms - entry_ms.? < ENTRY_FULL_REDRAW_MS;
 
+        // `cue_boundary` forces the same full, un-diffed redraw as the other
+        // conditions here -- a cue's start or end marker is exactly the
+        // moment the earlier "successful write, not necessarily a rendered
+        // frame" gap (above) is least affordable: it is the one instant
+        // someone is actually looking, so a dropped frame there should not
+        // wait for `FORCE_REFRESH_MS` to self-heal.
         const full_redraw = in_entry_window or !have_last1 or !have_last2 or
-            now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
+            cue_boundary or now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
 
         // Which lines this pass actually put in the frame, so the records are
         // updated for exactly those and no others.
