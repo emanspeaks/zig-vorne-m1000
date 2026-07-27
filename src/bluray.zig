@@ -1089,6 +1089,27 @@ const SEND_SLOW_MULTIPLE: i64 = 3;
 /// jitter look like an anomaly.
 const SEND_SLOW_MARGIN_MS: i64 = 50;
 
+/// A reply taking longer than this is flagged regardless of the adaptive
+/// baseline above -- not a multiple of anything, a hard ceiling.
+///
+/// The relative check (`SEND_SLOW_MULTIPLE`) has a blind spot: a *sustained*
+/// degradation, not a single spike, ratchets the average up one sample at a
+/// time, each one individually landing just under threshold relative to
+/// wherever the average had already climbed to from the sample before it --
+/// observed on hardware as a ~3.5 s stretch of 100-176 ms replies where only
+/// the first sample got flagged and the rest rode the rising average under
+/// the radar. An adaptive-only check can never catch that, because nothing
+/// about it is a spike relative to its own immediate history.
+///
+/// This is the backstop: the protocol has a hard physical ceiling on what a
+/// reply *should* cost, independent of any baseline. The largest frame this
+/// code ever sends is a full two-line redraw, documented (CLAUDE.md, "One
+/// frame per pass, and line 1 wins") at roughly 31 ms of wire time at 19200
+/// baud. A reply taking more than double that is not "a bigger frame" -- it
+/// is added latency, full stop, no matter how the recent average has
+/// drifted.
+const SEND_SLOW_ABSOLUTE_MS: i64 = 75;
+
 /// Owns the serial port and turns whatever the collator (`runBlurayClocks`)
 /// last published into frames on the wire.
 ///
@@ -1322,7 +1343,9 @@ fn senderLoop(
                     // `FORCE_REFRESH_MS` redraw (a bigger frame, so a bigger
                     // target for the panel to be slow answering) would
                     // produce with no accompanying deadline warning anywhere.
-                    if (send_wait_ms > send_ewma_ms * SEND_SLOW_MULTIPLE + SEND_SLOW_MARGIN_MS) {
+                    if (send_wait_ms > send_ewma_ms * SEND_SLOW_MULTIPLE + SEND_SLOW_MARGIN_MS or
+                        send_wait_ms > SEND_SLOW_ABSOLUTE_MS)
+                    {
                         slow_sends += 1;
                         std.debug.print(
                             "bluray: serial comm slow: panel took {d} ms to reply (usually ~{d} ms), {d} so far -- this is the wire/panel, not the render loop\n",
