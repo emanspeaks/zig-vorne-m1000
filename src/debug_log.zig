@@ -45,6 +45,11 @@ pub const Category = enum {
     cues,
     /// Render-loop decisions: why line 2 holds what it holds, missed deadlines.
     display,
+    /// Full, un-diffed redraws of both lines: why one was triggered. Split out
+    /// from `display` because a full redraw is comparatively rare and worth
+    /// seeing on its own, without the per-pass "line2 source" and "late pass"
+    /// chatter `display` also carries.
+    redraw,
     /// Blu-ray player status polling and the display-lead setting.
     bluray,
     /// VLC multicast receiver.

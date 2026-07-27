@@ -54,9 +54,11 @@ const CUE_THREAD_SLICE_MS: i64 = 200;
 /// The display loop is treated as a real-time task: every wake exists because
 /// something is due on screen at that instant, so being late is a defect rather
 /// than a slow frame. Nothing on the loop should be able to cause one -- all
-/// file and network I/O is on other threads -- which makes a report here a
-/// signal that something has crept back on, or that the serial write is
-/// colliding with the next deadline.
+/// file, network, *and* serial I/O is on other threads (the serial write and
+/// its wait for the panel's reply live on `senderLoop`) -- which makes a
+/// report here a genuine real-time-scheduling anomaly (OS jitter, a starved
+/// thread) rather than, as it could be before the collator/sender split,
+/// evidence of nothing more than the panel being slow to answer.
 const DEADLINE_SLACK_MS: i64 = 12;
 
 /// Ceiling on how long the display loop sleeps when it has nothing scheduled.
@@ -160,29 +162,6 @@ pub fn runBlurayClocks(
 ) !void {
     std.debug.print("Starting Blu-Ray run mode...\n", .{});
 
-    // Build the command string dynamically
-    var cmd_parts = std.ArrayList(u8).empty;
-    defer cmd_parts.deinit(allocator);
-
-    // Last content written to each line, so only a line that actually changed
-    // is re-clocked out. At 19200 baud a full 20 column line costs about 17 ms
-    // to transmit, and the playback second usually ticks while line 2 is
-    // unchanged, so skipping an unchanged line halves the time between the
-    // tick and the display catching up with it.
-    //
-    // A flag per line, because the two are now sent in separate passes and so
-    // are recorded independently. A single shared flag would mark one line's
-    // record valid on the strength of the *other* line having gone out, and
-    // the comparison would then be reading `undefined`.
-    var last_line1: [maxbufsz]u8 = undefined;
-    var last_line2: [maxbufsz]u8 = undefined;
-    var have_last1 = false;
-    var have_last2 = false;
-    // See `FORCE_REFRESH_MS`.
-    var last_refresh_ms: i64 = 0;
-    // See `ENTRY_FULL_REDRAW_MS`. Set from the first pass's `now_ms`.
-    var entry_ms: ?i64 = null;
-
     var playtime_buf: [maxbufsz]u8 = undefined;
     // Holds the play time with `LOCK_HUNTING_CHAR` prefixed. Separate from
     // `playtime_buf` because the unmarked string is the source it is built
@@ -208,8 +187,6 @@ pub fn runBlurayClocks(
     var seen_generation: u64 = 0;
     // For "log only on change" below -- see `Line2Source`.
     var seen_line2_source: ?Line2Source = null;
-    // For "log only on change" below -- see `RedrawReason`.
-    var seen_redraw_reason: ?RedrawReason = null;
     // A cue's [start_ms, end_ms) span is unique within a well-formed file, so
     // it stands in for cue identity: `line2_source` alone stays `.cue` across
     // every cue in a file, which hid exactly the transition worth seeing when
@@ -232,13 +209,25 @@ pub fn runBlurayClocks(
     defer cue_cell.deinit();
     var zone: time.SharedZone = .init(time.getTimezoneInfo(io));
 
+    // What this loop wants shown, handed to `senderLoop` -- which owns the
+    // port and decides how to actually get it onto the wire -- so that this
+    // loop is never blocked by a serial round trip. See `DrawCell` and
+    // `senderLoop`'s own doc for why the split exists.
+    var draw_cell: DrawCell = .{};
+    // A cue boundary is a one-shot event distinct from the published content
+    // itself -- see `DrawCell`'s "latest wins" doc for why folding it into
+    // the frame would risk the sender never seeing it.
+    var cue_boundary_pending: std.atomic.Value(bool) = .init(false);
+
     var stop_workers = std.atomic.Value(bool).init(false);
     const poller = try std.Thread.spawn(.{}, pollLoop, .{ io, allocator, &cell, resync_requested, &stop_workers });
     const cue_thread = try std.Thread.spawn(.{}, cueLoop, .{ io, allocator, cue_state, &cue_cell, &zone, &stop_workers });
+    const sender = try std.Thread.spawn(.{}, senderLoop, .{ io, allocator, port, &draw_cell, &cue_boundary_pending, &stop_workers });
     defer {
         stop_workers.store(true, .release);
         poller.join();
         cue_thread.join();
+        sender.join();
     }
 
     // What the previous pass scheduled, so lateness can be reported.
@@ -462,156 +451,25 @@ pub fn runBlurayClocks(
         const line2_cols = (str_utils.strlensz(line2_window) catch unreachable)[0];
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_cols, str_utils.maxchars), null);
 
-        // ONE frame per pass, and line 1 wins when both are due.
-        //
-        // The panel cannot act on a frame until the CRC terminating it has
-        // arrived and checked out, so *everything in a frame renders when the
-        // frame ends* -- line 1's bytes being written first buys it nothing.
-        // A frame carrying both lines is roughly 60 bytes against 35, which at
-        // 19200 baud is about 31 ms against 18 ms before anything appears. So
-        // whenever a scroll step landed in the same pass as a clock tick, that
-        // tick reached the panel ~13 ms later than a tick that travelled
-        // alone. Line 1 changes on two unrelated schedules (the real-time
-        // second and the playback tick) and line 2 steps every 400 ms while
-        // scrolling, so those collisions are frequent and irregularly spaced
-        // -- which is precisely the erratic clock advance, and precisely why
-        // splitting the frames appeared to cure it.
-        //
-        // Splitting is not the answer, though: two frames back to back with no
-        // gap is what made the panel drop line 2 (no flow control, small input
-        // buffer, bytes arriving while it is still parsing the previous
-        // frame). Deferring line 2 to the *next* pass instead gets both: line
-        // 1 always travels alone and always takes the same 18 ms, so the clock
-        // is even, and no two frames are ever emitted back to back. Line 2
-        // pays at most one pass of latency -- `DISPLAY_IDLE_SLICE_MS`, 25 ms,
-        // invisible on a scroll step -- and cannot starve, since line 1
-        // changes only a couple of times a second out of ~40 passes.
-        //
-        // `sendUnitDisplayCmd` failing (a short, failed, or timed-out serial
-        // write -- see `SerialPort.write`) is logged and skipped rather than
-        // propagated, so a transient hiccup does not take the display service
-        // down. A record is updated only when its own line was actually in a
-        // frame that sent successfully, so nothing is ever recorded as "shown"
-        // without having been sent: it is simply retried on the next pass.
-        cmd_parts.clearRetainingCapacity();
-        const line1_changed = !have_last1 or !std.mem.eql(u8, &linebuf, &last_line1);
-        // Whether the *content* changed, kept separate from whether it gets
-        // sent: a periodic refresh re-sends identical content, and reporting
-        // that as a line-2 update every few seconds would bury the
-        // transitions actually worth reading in the log.
-        const line2_changed = !have_last2 or !std.mem.eql(u8, &line2buf, &last_line2);
-
-        // A full redraw of *both* lines, periodically and whenever what is on
-        // the panel is unknown -- entering Blu-ray mode, or after a failed
-        // send.
-        //
-        // This is not optional once line updates are incremental. A column
-        // diff rewrites only the columns that moved, so nothing in the steady
-        // state ever repaints the rest of the line: whatever the panel lost --
-        // a dropped frame, a mode switch arriving from another display mode, a
-        // glitch on the wire -- stays lost forever. The symptom is stark and
-        // was seen on hardware: a blank line with only the seconds digits
-        // ticking, because those were the only columns anything was still
-        // sending. An earlier version scoped this refresh to line 2 alone,
-        // reasoning that line 1 rewrites itself every second anyway; that is
-        // true only while line 1 is written whole, and stopped being true the
-        // moment the diff was introduced.
-        if (entry_ms == null) entry_ms = now_ms;
-        const in_entry_window = now_ms - entry_ms.? < ENTRY_FULL_REDRAW_MS;
-
-        // `cue_boundary` forces the same full, un-diffed redraw as the other
-        // conditions here -- a cue's start or end marker is exactly the
-        // moment the earlier "successful write, not necessarily a rendered
-        // frame" gap (above) is least affordable: it is the one instant
-        // someone is actually looking, so a dropped frame there should not
-        // wait for `FORCE_REFRESH_MS` to self-heal.
-        //
-        // Priority matters only for the log line below (a pass can satisfy
-        // several of these at once, e.g. entering the mode right as a cue
-        // starts) -- every branch produces the identical `full_redraw = true`
-        // either way.
-        const redraw_reason: ?RedrawReason = if (!have_last1 or !have_last2)
-            .missing_record
-        else if (in_entry_window)
-            .entry_window
-        else if (cue_boundary)
-            .cue_boundary
-        else if (now_ms - last_refresh_ms >= FORCE_REFRESH_MS)
-            .periodic
-        else
-            null;
-        const full_redraw = redraw_reason != null;
-
-        if (redraw_reason != seen_redraw_reason) {
-            seen_redraw_reason = redraw_reason;
-            if (redraw_reason) |reason| {
-                dbg.print(.display, "bluray: full redraw -> {s}\n", .{@tagName(reason)});
-            }
-        }
-
-        // Which lines this pass actually put in the frame, so the records are
-        // updated for exactly those and no others.
-        var sent_line1 = false;
-        var sent_line2 = false;
-
-        if (full_redraw) {
-            last_refresh_ms = now_ms;
-            try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
-            try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
-            sent_line1 = true;
-            sent_line2 = true;
-        } else if (line1_changed) {
-            // Send only the columns that moved. A seconds digit is one column;
-            // redrawing all 20 to move it doubles the wire time before
-            // anything renders (nothing renders until the frame's CRC arrives)
-            // and makes that time vary with how much of the line changed. Same
-            // trick `clocks.zig` has always used for its seconds digit,
-            // generalised so the playback clock, rollovers and the transport
-            // glyph all benefit without being special-cased.
-            try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf);
-            sent_line1 = true;
-        } else if (line2_changed) {
-            // Line 2 yields to line 1 -- see the frame-arbitration note above.
-            try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf);
-            sent_line2 = true;
-        }
-
-        if (cmd_parts.items.len > 0) {
-            // Logged on every attempt, not just failures -- this is the one
-            // point that can confirm or rule out the send path itself when the
-            // panel and the `cue -> ...`/`line2 source -> ...` logs disagree
-            // about what should be on screen.
-            // Only worth reporting when line 2's content actually changed --
-            // a periodic refresh of identical bytes is not an update.
-            // `dbg.print` only skips the *writing*; its arguments are
-            // evaluated regardless. Decoding the line back to UTF-8 allocates,
-            // so it is gated on the category being on rather than done every
-            // time line 2 changes and thrown away.
-            const report_line2 = sent_line2 and line2_changed and dbg.enabled(.serial);
-            var readable: std.ArrayList(u8) = .empty;
-            defer readable.deinit(allocator);
-            if (report_line2) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
-
-            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
-                if (sent_line1) {
-                    last_line1 = linebuf;
-                    have_last1 = true;
-                }
-                if (sent_line2) {
-                    last_line2 = line2buf;
-                    have_last2 = true;
-                }
-                if (report_line2) {
-                    dbg.print(.serial, "bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
-                }
-            } else |err| {
-                // Unconditional: a frame that did not reach the panel is an
-                // operational fault, not diagnostic chatter, and suppressing
-                // it because `serial` happens to be switched off would hide
-                // the single most useful line in the log.
-                std.debug.print("bluray: failed to send display frame: {}\n", .{err});
-            }
-        }
+        // Hand the freshly built frame to `senderLoop`, which owns the port
+        // and decides how -- or whether -- to get it onto the wire (one frame
+        // per send, line 1 preferred over line 2, full redraw vs. column diff;
+        // see that function's own doc). Publishing is a spin-locked copy of
+        // two small buffers, never a write to the panel, so this loop is never
+        // blocked by a serial round trip -- which is the whole point of the
+        // split: this loop can always tell the sender what *should* be shown
+        // right now, even while the sender is still busy getting the last
+        // thing it was told out the door.
+        draw_cell.publish(&linebuf, &line2buf);
+        // A one-shot flag, not folded into the published frame: `draw_cell`
+        // is "latest wins" (see its own doc), so a boundary flagged on one
+        // publish could be silently superseded by a later one before the
+        // sender ever looks. `cue_boundary` only means "this pass changed
+        // `seen_cue_span`" -- whatever content the sender eventually reads
+        // already reflects the post-boundary state regardless of which
+        // publish it came from, so it does not matter that the flag and the
+        // frame that originally set it may not arrive together.
+        if (cue_boundary) cue_boundary_pending.store(true, .release);
 
         // Sleep until the next moment something on the display is due to
         // change: the next playback tick, the next real-time second, or the
@@ -621,31 +479,24 @@ pub fn runBlurayClocks(
         // stutter, since evenly spaced steps are the whole of what makes a
         // character-cell marquee look smooth.
         //
-        // Scheduled from a *fresh* clock read, not the frame's `now_ms`.
-        // `now_ms` was captured once at the top of the pass deliberately, so
-        // everything the frame's *content* depends on (the clock string, the
-        // cue lookup, the scroll window) agrees on one instant -- but real
-        // time keeps moving after that, most of all across
-        // `sendUnitDisplayCmd` above, which blocks writing the frame and then
-        // waits for the panel's reply (`protocol.send`, up to
-        // `protocol.timeout_ms` = 2 s). Scheduling the *next* wake from the
-        // stale, pre-send `now_ms` ignored however long that wait actually
-        // took, so the very next deadline could already be in the past by the
-        // time it was computed -- `sleep_ms` below would go negative, the
-        // loop would skip straight to another pass with no sleep at all, and
-        // that pass would report itself late by roughly the round trip it
-        // never accounted for. This was the dominant source of the "Display
-        // pass N ms late" reports, including with no marquee running: every
-        // pass that actually sent a frame mis-scheduled the one after it.
-        const sched_ms = time.nowMillis(io);
-        var wake_ms = sched_ms + DISPLAY_IDLE_SLICE_MS;
-        if (snap.nextTickMs(sched_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
+        // Scheduled from `now_ms`, the single clock reading this whole pass
+        // already agreed on. That is only safe because this loop no longer
+        // performs the one operation that used to make it stale by the time
+        // scheduling ran: the blocking write-and-wait-for-reply now lives on
+        // `senderLoop`, on its own thread, so nothing between capturing
+        // `now_ms` above and reading it again here can take a meaningfully
+        // different amount of time pass to pass. Before the split, this
+        // reused the frame's `now_ms` even though a serial round trip could
+        // land in between, which was the dominant source of the "Display pass
+        // N ms late" reports -- see the split's own rationale on `senderLoop`.
+        var wake_ms = now_ms + DISPLAY_IDLE_SLICE_MS;
+        if (snap.nextTickMs(now_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
         // The displayed second flips on a local-time boundary. Offsets are
         // whole minutes, so that is also a UTC second boundary.
-        const next_second_ms = (@divFloor(sched_ms, 1000) + 1) * 1000;
+        const next_second_ms = (@divFloor(now_ms, 1000) + 1) * 1000;
         wake_ms = @min(wake_ms, next_second_ms);
         if (may_scroll) {
-            if (scroller.nextStepMs(line2, str_utils.maxchars, sched_ms)) |step_ms| {
+            if (scroller.nextStepMs(line2, str_utils.maxchars, now_ms)) |step_ms| {
                 wake_ms = @min(wake_ms, step_ms);
             }
         }
@@ -655,9 +506,9 @@ pub fn runBlurayClocks(
         // appears is worse than one that appears a little late.
         if (cue_list) |list| {
             if (snap.positionIsLive()) {
-                const position_ms = snap.playTimeMillis(sched_ms);
+                const position_ms = snap.playTimeMillis(now_ms);
                 if (list.nextBoundaryMs(position_ms)) |boundary_ms| {
-                    wake_ms = @min(wake_ms, sched_ms + (boundary_ms - position_ms));
+                    wake_ms = @min(wake_ms, now_ms + (boundary_ms - position_ms));
                 }
             }
         }
@@ -1130,6 +981,258 @@ const SnapshotCell = struct {
         return self.value;
     }
 };
+
+/// Hands the collator's (`runBlurayClocks`) freshly built frame to
+/// `senderLoop`. A spin lock, for the same reason as `SnapshotCell`: the
+/// critical section is a copy of two small fixed buffers, and
+/// `std.Thread.Mutex` does not exist in 0.16.
+///
+/// Deliberately "latest wins," not a queue: the sender only ever cares what
+/// should be on screen *right now*. A publish the sender has not yet picked
+/// up is simply overwritten by the next one rather than queued behind it --
+/// nothing is lost by that, since an intermediate scroll-step frame the
+/// sender never saw was already superseded by the one it does see.
+const DrawCell = struct {
+    guard: std.atomic.Value(bool) = .init(false),
+    /// Whether the collator has published anything yet -- `senderLoop` has
+    /// nothing to send before the first pass runs.
+    have: bool = false,
+    line1: [maxbufsz]u8 = undefined,
+    line2: [maxbufsz]u8 = undefined,
+
+    const Frame = struct { line1: [maxbufsz]u8, line2: [maxbufsz]u8 };
+
+    fn acquire(self: *DrawCell) void {
+        while (self.guard.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *DrawCell) void {
+        self.guard.store(false, .release);
+    }
+
+    fn publish(self: *DrawCell, line1: *const [maxbufsz]u8, line2: *const [maxbufsz]u8) void {
+        self.acquire();
+        defer self.release();
+        self.line1 = line1.*;
+        self.line2 = line2.*;
+        self.have = true;
+    }
+
+    /// The most recently published frame, or null before the collator has
+    /// published anything at all.
+    fn read(self: *DrawCell) ?Frame {
+        self.acquire();
+        defer self.release();
+        if (!self.have) return null;
+        return .{ .line1 = self.line1, .line2 = self.line2 };
+    }
+};
+
+/// How often `senderLoop` checks `DrawCell` for fresh content when it has
+/// nothing outstanding. Not a pacing mechanism -- `protocol.send` already
+/// paces the wire by waiting for the panel's reply -- just how quickly a
+/// freshly published frame is noticed while the sender is idle. Small enough
+/// that a tick or scroll step is picked up as soon as whatever send was
+/// already in flight completes; the panel's own round trip, not this, is what
+/// actually bounds latency.
+const SENDER_IDLE_SLICE_MS: i64 = 10;
+
+/// Owns the serial port and turns whatever the collator (`runBlurayClocks`)
+/// last published into frames on the wire.
+///
+/// Split out from the collator so the two are never coupled by a blocking
+/// call. Before this split, one thread did both jobs: build the draw buffers,
+/// diff them, and send -- all in the same pass. The diffing itself was always
+/// correct and immediate (a fresh `now_ms` and a `memcmp`, every pass), but it
+/// could not *run* while that same thread was blocked inside `protocol.send`
+/// waiting for the panel's reply. A line-2 scroll-step send starting shortly
+/// before a real-time tick came due would still be in flight when it did, so
+/// the tick was not even looked at until the pass after -- by which point a
+/// second real second had often already ticked over. That produced the clock
+/// visibly skipping a second while the marquee was scrolling. A round-trip
+/// estimate was tried first, predicting whether a line-2 send would still be
+/// outstanding by the next tick and skipping it if so -- a real improvement,
+/// but only probabilistic: it depended on the estimate being right.
+///
+/// This is the structural fix instead: the collator never touches the port,
+/// so it is never blocked and always holds the true current state; this
+/// thread continuously sends whatever `draw.read()` says is *latest*, gated
+/// only by however long the panel actually takes to answer. Because it always
+/// re-reads fresh after every send completes, a tick that landed mid-send is
+/// simply reflected the moment it checks again -- no prediction needed.
+///
+/// Owns every piece of "what has the panel actually been sent" bookkeeping --
+/// `last_line1`/`last_line2`/`have_last1`/`have_last2`, the redraw-reason
+/// timers (`FORCE_REFRESH_MS`, `ENTRY_FULL_REDRAW_MS`) -- since it is the only
+/// thread that knows what actually went out. The collator does not, and must
+/// not: it only knows what *should* be shown.
+///
+/// One frame per send, and line 1 preferred over line 2 when both are due --
+/// unchanged from the single-thread version, and for the same reason: nothing
+/// renders until a frame's CRC arrives, so a frame carrying both lines costs
+/// roughly 31 ms against 18 ms for one alone, and two frames back to back with
+/// no gap is what makes the panel drop the second one (no flow control, small
+/// input buffer). Deferring line 2 to the next send costs it at most one
+/// `SENDER_IDLE_SLICE_MS` of latency and cannot starve, since line 1 changes
+/// only a couple of times a second.
+fn senderLoop(
+    io: Io,
+    allocator: std.mem.Allocator,
+    port: anytype,
+    draw: *DrawCell,
+    cue_boundary_pending: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+) void {
+    var cmd_parts = std.ArrayList(u8).empty;
+    defer cmd_parts.deinit(allocator);
+
+    // Last content actually put on the wire, so only a line that changed is
+    // re-clocked out -- see the equivalent comment this replaced in
+    // `runBlurayClocks` for the full rationale. A flag per line: the two are
+    // sent in separate passes, so a single shared flag would mark one line's
+    // record valid on the strength of the *other* line having gone out.
+    var last_line1: [maxbufsz]u8 = undefined;
+    var last_line2: [maxbufsz]u8 = undefined;
+    var have_last1 = false;
+    var have_last2 = false;
+    // See `FORCE_REFRESH_MS`.
+    var last_refresh_ms: i64 = 0;
+    // See `ENTRY_FULL_REDRAW_MS`. This thread's own start is mode entry, so
+    // there is no need for the lazy "set from the first pass" `?i64` the
+    // collator used to need before it had a `now_ms` to seed from.
+    const entry_ms = time.nowMillis(io);
+    // For "log only on change" -- see `RedrawReason`.
+    var seen_redraw_reason: ?RedrawReason = null;
+
+    while (!stop.load(.acquire)) {
+        const frame = draw.read() orelse {
+            io.sleep(.fromMilliseconds(SENDER_IDLE_SLICE_MS), .awake) catch return;
+            continue;
+        };
+        const linebuf = frame.line1;
+        const line2buf = frame.line2;
+
+        const now_ms = time.nowMillis(io);
+        // One-shot: `swap` both reads and clears it, so a boundary flagged
+        // between this check and the last cannot be lost or double-counted.
+        const cue_boundary = cue_boundary_pending.swap(false, .acq_rel);
+
+        cmd_parts.clearRetainingCapacity();
+        const line1_changed = !have_last1 or !std.mem.eql(u8, &linebuf, &last_line1);
+        // Whether the *content* changed, kept separate from whether it gets
+        // sent: a periodic refresh re-sends identical content, and reporting
+        // that as a line-2 update every few seconds would bury the
+        // transitions actually worth reading in the log.
+        const line2_changed = !have_last2 or !std.mem.eql(u8, &line2buf, &last_line2);
+
+        // A full redraw of *both* lines, periodically and whenever what is on
+        // the panel is unknown -- entering Blu-ray mode, or after a failed
+        // send. Not optional once line updates are incremental: a column diff
+        // rewrites only the columns that moved, so nothing in the steady
+        // state ever repaints the rest of a line the panel lost to a dropped
+        // frame or a glitch on the wire.
+        const in_entry_window = now_ms - entry_ms < ENTRY_FULL_REDRAW_MS;
+
+        const redraw_reason: ?RedrawReason = if (!have_last1 or !have_last2)
+            .missing_record
+        else if (in_entry_window)
+            .entry_window
+        else if (cue_boundary)
+            .cue_boundary
+        else if (now_ms - last_refresh_ms >= FORCE_REFRESH_MS)
+            .periodic
+        else
+            null;
+        const full_redraw = redraw_reason != null;
+
+        if (redraw_reason != seen_redraw_reason) {
+            seen_redraw_reason = redraw_reason;
+            if (redraw_reason) |reason| {
+                dbg.print(.redraw, "bluray: full redraw -> {s}\n", .{@tagName(reason)});
+            }
+        }
+
+        // Which lines this send actually carried, so the records are updated
+        // for exactly those and no others.
+        var sent_line1 = false;
+        var sent_line2 = false;
+
+        // An allocator failure building the command string (a handful of
+        // bytes) is exceedingly unlikely, but is skipped rather than crashing
+        // this thread: `continue` re-reads `draw` next iteration, so a
+        // transient hiccup just costs one send's worth of latency, same as
+        // any other skipped pass.
+        if (full_redraw) {
+            last_refresh_ms = now_ms;
+            protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf) catch |err| {
+                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                continue;
+            };
+            protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf) catch |err| {
+                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                continue;
+            };
+            sent_line1 = true;
+            sent_line2 = true;
+        } else if (line1_changed) {
+            // Send only the columns that moved -- see `appendChangedColsToCmdList`.
+            protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf) catch |err| {
+                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                continue;
+            };
+            sent_line1 = true;
+        } else if (line2_changed) {
+            // Line 2 yields to line 1 -- see this function's own doc.
+            protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf) catch |err| {
+                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                continue;
+            };
+            sent_line2 = true;
+        }
+
+        if (cmd_parts.items.len > 0) {
+            // Logged on every attempt, not just failures -- this is the one
+            // point that can confirm or rule out the send path itself when the
+            // panel and the `cue -> ...`/`line2 source -> ...` logs disagree
+            // about what should be on screen.
+            const report_line2 = sent_line2 and line2_changed and dbg.enabled(.serial);
+            var readable: std.ArrayList(u8) = .empty;
+            defer readable.deinit(allocator);
+            if (report_line2) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
+
+            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
+                if (sent_line1) {
+                    last_line1 = linebuf;
+                    have_last1 = true;
+                }
+                if (sent_line2) {
+                    last_line2 = line2buf;
+                    have_last2 = true;
+                }
+                if (report_line2) {
+                    dbg.print(.serial, "bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+                }
+            } else |err| {
+                // Unconditional: a frame that did not reach the panel is an
+                // operational fault, not diagnostic chatter, and suppressing
+                // it because `serial` happens to be switched off would hide
+                // the single most useful line in the log.
+                std.debug.print("bluray: failed to send display frame: {}\n", .{err});
+            }
+        } else {
+            // Nothing changed, so nothing to send -- wait a slice before
+            // checking `draw` again rather than busy-looping. When something
+            // *was* sent, loop straight back around instead: `protocol.send`
+            // already paced the wire by waiting for the reply, and checking
+            // immediately is what lets a tick that landed mid-send be picked
+            // up the instant this thread is free, rather than up to another
+            // `SENDER_IDLE_SLICE_MS` late.
+            io.sleep(.fromMilliseconds(SENDER_IDLE_SLICE_MS), .awake) catch return;
+        }
+    }
+}
 
 /// Poll the player on its own thread, publishing each result for the display.
 ///
