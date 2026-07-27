@@ -7,7 +7,7 @@ set -e
 
 # Build the project first
 echo "Building the project..."
-zig build -Doptimize=ReleaseSafe
+zig build
 
 # Check if the binary exists
 if [ ! -f "./zig-out/bin/zig_vorne_m1000" ]; then

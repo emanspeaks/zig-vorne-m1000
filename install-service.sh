@@ -9,7 +9,7 @@ echo "Installing Zig Vorne M1000 as a system service..."
 
 # Build the project first
 echo "Building the project..."
-zig build
+zig build -Doptimize=ReleaseSafe
 
 # Check if the binary exists
 if [ ! -f "./zig-out/bin/zig_vorne_m1000" ]; then
