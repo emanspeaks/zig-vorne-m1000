@@ -185,6 +185,10 @@ pub fn runBlurayClocks(
     var name_buf: [cues.max_name_len]u8 = undefined;
     var name_len: usize = 0;
     var seen_generation: u64 = 0;
+    // The real-time second this collator last actually built into `linebuf`,
+    // so a pass that jumps by more than one can be told apart from ordinary
+    // per-second advance -- see the check where `clock_second` is computed.
+    var seen_clock_second: ?i64 = null;
     // For "log only on change" below -- see `Line2Source`.
     var seen_line2_source: ?Line2Source = null;
     // A cue's [start_ms, end_ms) span is unique within a well-formed file, so
@@ -300,7 +304,29 @@ pub fn runBlurayClocks(
         // it out here would mean parsing `/etc/localtime` on a loop that has
         // deadlines to meet.
         const local_ms = now_ms + @as(i64, zone.load().offset_sec) * std.time.ms_per_s;
-        const clock_str = time.formatClock(@divFloor(local_ms, std.time.ms_per_s), &clock_buf) catch unreachable;
+        const clock_second = @divFloor(local_ms, std.time.ms_per_s);
+        // A jump of more than one second between consecutive passes means
+        // this collator itself skipped a real-time second -- something
+        // stalled it (OS scheduling, a starved thread) for over a second
+        // between wakes, distinct from and in addition to `DEADLINE_SLACK_MS`'s
+        // generic lateness report: that one says "this pass started late" in
+        // milliseconds, which is easy to skim past; this says, in exactly the
+        // terms someone watching the panel would use, "the displayed second
+        // itself skipped." Unconditional, like `senderLoop`'s "serial comm
+        // slow" -- and deliberately the complementary half of that message:
+        // together they cover every place a skipped second visible on the
+        // panel could actually originate, and say which one it was rather
+        // than leaving it to be inferred.
+        if (seen_clock_second) |prev| {
+            if (clock_second - prev > 1) {
+                std.debug.print(
+                    "bluray: real-time clock skipped {d} second(s) in the render loop itself ({d} -> {d}) -- this is the collator, not serial comm\n",
+                    .{ clock_second - prev - 1, prev, clock_second },
+                );
+            }
+        }
+        seen_clock_second = clock_second;
+        const clock_str = time.formatClock(clock_second, &clock_buf) catch unreachable;
         // The extra `-| 1` reserves the column right after the clock for
         // SUNCHAR below, the same way space for the play time is already
         // reserved -- otherwise an unrealistically long play time could
