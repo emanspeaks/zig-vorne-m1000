@@ -266,6 +266,67 @@ pub fn appendStrToCmdList(
     try cmd_parts.appendSlice(allocator, line_cmd);
 }
 
+/// Append only the columns that actually differ between `prev` and `next`.
+///
+/// A full 20-column line is about 35 bytes on the wire once framed, or 18 ms at
+/// 19200 baud; a one-character correction is about 17 bytes, or 9 ms. Nothing
+/// renders until the CRC terminating the frame arrives, so that difference is
+/// latency between the moment a clock ticks and the moment the panel shows it
+/// -- and, worse, latency that *varies* with how much of the line happened to
+/// change. A ticking clock usually alters one or two digits, so redrawing the
+/// whole line to move a seconds digit is both slower and less even than it
+/// needs to be. `clocks.zig` has always rewritten just the seconds digit for
+/// this reason (`unitUpdateChar`); this is the same idea, worked out from the
+/// content rather than from hardcoded column numbers, so it also covers the
+/// playback clock, a minute or hour rollover, and a changed transport glyph
+/// without any of them being special-cased.
+///
+/// One escape and one contiguous span, from the first differing column to the
+/// last, rather than a separate escape per differing run: two escapes cost more
+/// than the handful of unchanged columns between two nearby edits, and the
+/// common case (a clock tick) is a single run anyway.
+///
+/// Columns, not bytes, throughout -- a DLE-escaped glyph is two bytes in one
+/// column, so the column a `C` escape names and the byte offset of its text are
+/// different numbers whenever the line holds one.
+///
+/// Falls back to a whole-line write when the two differ in width, since there
+/// is then no column-for-column correspondence to diff. Appends nothing at all
+/// when they are identical.
+pub fn appendChangedColsToCmdList(
+    allocator: std.mem.Allocator,
+    cmd_parts: *std.ArrayList(u8),
+    line: u8,
+    prev: []const u8,
+    next: []const u8,
+) !void {
+    const prev_cols = (str_utils.strlensz(prev) catch unreachable)[0];
+    const next_cols = (str_utils.strlensz(next) catch unreachable)[0];
+    if (prev_cols != next_cols) {
+        return appendStrToCmdList(allocator, cmd_parts, line, 1, next);
+    }
+
+    var first: ?usize = null;
+    var last: usize = 0;
+    var col: usize = 0;
+    while (col < next_cols) : (col += 1) {
+        const pa = str_utils.idxChar2Str(prev, col) catch unreachable;
+        const pb = str_utils.idxChar2Str(prev, col + 1) catch unreachable;
+        const na = str_utils.idxChar2Str(next, col) catch unreachable;
+        const nb = str_utils.idxChar2Str(next, col + 1) catch unreachable;
+        if (!std.mem.eql(u8, prev[pa..pb], next[na..nb])) {
+            if (first == null) first = col;
+            last = col;
+        }
+    }
+
+    const from = first orelse return;
+    const start = str_utils.idxChar2Str(next, from) catch unreachable;
+    const end = str_utils.idxChar2Str(next, last + 1) catch unreachable;
+    // Columns are 1-based in the escape sequence.
+    try appendStrToCmdList(allocator, cmd_parts, line, @intCast(from + 1), next[start..end]);
+}
+
 // Update a single character at specified line and column
 pub fn unitUpdateChar(
     buf: []u8,
@@ -290,6 +351,72 @@ pub fn sendUnitUpdateChar(
 
     // Send the command using unitDisplayCmd
     try sendUnitDisplayCmd(allocator, port, address, update_cmd);
+}
+
+test "appendChangedColsToCmdList sends only the digits a clock tick moved" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    // The overwhelmingly common case: one seconds digit. Redrawing the line
+    // would be 20 columns of payload; this is one.
+    try appendChangedColsToCmdList(testing.allocator, &parts, 1, "20:37:13", "20:37:14");
+    try testing.expectEqualStrings(ESC ++ "1;8C4", parts.items);
+}
+
+test "appendChangedColsToCmdList spans from the first change to the last" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    // A minute rollover moves several digits at once, and the span covers them
+    // in one escape rather than one escape per run.
+    try appendChangedColsToCmdList(testing.allocator, &parts, 1, "20:37:59", "20:38:00");
+    try testing.expectEqualStrings(ESC ++ "1;5C8:00", parts.items);
+}
+
+test "appendChangedColsToCmdList appends nothing when the line is unchanged" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    try appendChangedColsToCmdList(testing.allocator, &parts, 1, "20:37:13", "20:37:13");
+    try testing.expectEqual(@as(usize, 0), parts.items.len);
+}
+
+test "appendChangedColsToCmdList redraws the whole line when the width changes" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    // No column-for-column correspondence to diff against, so this must not
+    // try to compute a span.
+    try appendChangedColsToCmdList(testing.allocator, &parts, 2, "59:59", "1:00:00");
+    try testing.expectEqualStrings(ESC ++ "2;1C1:00:00", parts.items);
+}
+
+test "appendChangedColsToCmdList counts a DLE pair as one column" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    // "\x10P" and "\x10Q" are one column each (the transport glyph, as line 1
+    // carries at its right-hand end). The change is in the last column, column
+    // 3 -- not column 4, which is where a byte count would put it, and not a
+    // slice that splits the pair.
+    try appendChangedColsToCmdList(testing.allocator, &parts, 1, "AB\x10P", "AB\x10Q");
+    try testing.expectEqualStrings(ESC ++ "1;3C\x10Q", parts.items);
+}
+
+test "appendChangedColsToCmdList offsets correctly past an earlier DLE pair" {
+    const testing = std.testing;
+    var parts = std.ArrayList(u8).empty;
+    defer parts.deinit(testing.allocator);
+
+    // The DLE pair sits in column 1, so the changed 'C' is column 3 even
+    // though it is byte 3 -- and the payload must not re-send the pair.
+    try appendChangedColsToCmdList(testing.allocator, &parts, 1, "\x10PBC", "\x10PBD");
+    try testing.expectEqualStrings(ESC ++ "1;3CD", parts.items);
 }
 
 // Calculate 8-bit checksum (two's complement) and append as uppercase hex

@@ -23,6 +23,17 @@ pub const STOPCHAR = protocol.DLE ++ "G"; // ■
 /// other DLE-escaped glyphs on this panel: 0x40 + the code, so 0x4F = 'O'.
 pub const SUNCHAR = protocol.DLE ++ "O"; // ☼
 
+/// Prefixed to the play time while the phase lock has not converged, so the
+/// panel reads `@0:00:00` rather than `0:00:00`.
+///
+/// Until the lock reaches `.locked` the displayed second is extrapolated from
+/// an anchor whose phase is not yet trusted -- or, before there is an anchor at
+/// all, from the raw last-polled value carried forward. Either can be up to a
+/// second out. It is deliberately still shown and still advancing (stalling the
+/// clock would be worse), but it should not read as authoritative while it is
+/// being guessed at.
+pub const LOCK_HUNTING_CHAR = "@";
+
 /// How often the selected cue file is checked for edits. One `stat` per second
 /// is nothing next to the HTTP polling already going on, and it makes the file
 /// editable while a disc is running.
@@ -108,15 +119,22 @@ pub fn runBlurayClocks(
     // unchanged, so skipping an unchanged line halves the time between the
     // tick and the display catching up with it.
     //
-    // One flag covers both records because both are assigned together, on the
-    // single frame's success, and never independently.
+    // A flag per line, because the two are now sent in separate passes and so
+    // are recorded independently. A single shared flag would mark one line's
+    // record valid on the strength of the *other* line having gone out, and
+    // the comparison would then be reading `undefined`.
     var last_line1: [maxbufsz]u8 = undefined;
     var last_line2: [maxbufsz]u8 = undefined;
-    var have_last = false;
+    var have_last1 = false;
+    var have_last2 = false;
     // See `FORCE_REFRESH_MS`.
     var last_refresh_ms: i64 = 0;
 
     var playtime_buf: [maxbufsz]u8 = undefined;
+    // Holds the play time with `LOCK_HUNTING_CHAR` prefixed. Separate from
+    // `playtime_buf` because the unmarked string is the source it is built
+    // from, so they cannot share storage.
+    var playtime_marked_buf: [maxbufsz]u8 = undefined;
     var clock_buf: [maxbufsz]u8 = undefined;
     var linebuf: [maxbufsz]u8 = undefined;
     var line2buf: [maxbufsz]u8 = undefined;
@@ -198,7 +216,19 @@ pub fn runBlurayClocks(
         const snap = cell.read();
         playtime = snap.playTimeSeconds(now_ms);
         const playtime_hms = time.timedeltaToHms(playtime);
-        const playtime_str = time.formatHms(playtime_hms, &playtime_buf) catch unreachable;
+        const playtime_hms_str = time.formatHms(playtime_hms, &playtime_buf) catch unreachable;
+        // Mark the play time while the lock is still hunting -- see
+        // `LOCK_HUNTING_CHAR`. This lengthens the string by one column, which
+        // the clock's own budget below already accounts for by measuring
+        // `playtime_str` rather than assuming a width.
+        const playtime_str = if (snap.locked)
+            playtime_hms_str
+        else
+            std.fmt.bufPrint(
+                &playtime_marked_buf,
+                LOCK_HUNTING_CHAR ++ "{s}",
+                .{playtime_hms_str},
+            ) catch unreachable;
         const runstatus_str = switch (snap.run_status) {
             .Stopped => STOPCHAR,
             .Playing => PLAYCHAR,
@@ -355,48 +385,77 @@ pub fn runBlurayClocks(
         const line2_cols = (str_utils.strlensz(line2_window) catch unreachable)[0];
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_cols, str_utils.maxchars), null);
 
-        // Both lines go out in ONE frame, not two back-to-back ones.
+        // ONE frame per pass, and line 1 wins when both are due.
         //
-        // They were split apart earlier today on the theory that line 2's
-        // ~17 ms of serial time sitting in front of line 1's was what made the
-        // real-time clock advance unevenly during a marquee sweep. That
-        // reasoning does not hold up: in a combined frame line 1's escape
-        // sequence is written *first*, so its bytes still reach the wire
-        // first, and splitting saves it nothing. What splitting did change is
-        // that the panel started receiving two separate SPP frames with no gap
-        // between them, and it has no flow control and a small input buffer --
-        // bytes arriving while it is still parsing and rendering the previous
-        // frame have nowhere to go. That lines up exactly with the observed
-        // regression: line 1 (first frame) always updated, line 2 (second
-        // frame) was silently dropped precisely when both changed in the same
-        // pass, which is every cue transition and 2 of every 5 scroll steps.
-        // One frame per pass is also what this code did before today, when
-        // this transition worked.
+        // The panel cannot act on a frame until the CRC terminating it has
+        // arrived and checked out, so *everything in a frame renders when the
+        // frame ends* -- line 1's bytes being written first buys it nothing.
+        // A frame carrying both lines is roughly 60 bytes against 35, which at
+        // 19200 baud is about 31 ms against 18 ms before anything appears. So
+        // whenever a scroll step landed in the same pass as a clock tick, that
+        // tick reached the panel ~13 ms later than a tick that travelled
+        // alone. Line 1 changes on two unrelated schedules (the real-time
+        // second and the playback tick) and line 2 steps every 400 ms while
+        // scrolling, so those collisions are frequent and irregularly spaced
+        // -- which is precisely the erratic clock advance, and precisely why
+        // splitting the frames appeared to cure it.
+        //
+        // Splitting is not the answer, though: two frames back to back with no
+        // gap is what made the panel drop line 2 (no flow control, small input
+        // buffer, bytes arriving while it is still parsing the previous
+        // frame). Deferring line 2 to the *next* pass instead gets both: line
+        // 1 always travels alone and always takes the same 18 ms, so the clock
+        // is even, and no two frames are ever emitted back to back. Line 2
+        // pays at most one pass of latency -- `DISPLAY_IDLE_SLICE_MS`, 25 ms,
+        // invisible on a scroll step -- and cannot starve, since line 1
+        // changes only a couple of times a second out of ~40 passes.
         //
         // `sendUnitDisplayCmd` failing (a short, failed, or timed-out serial
         // write -- see `SerialPort.write`) is logged and skipped rather than
         // propagated, so a transient hiccup does not take the display service
-        // down. Both records are updated together and only on success, so a
-        // failure is never recorded as "shown": the same content is retried on
-        // the very next pass. Assigning both is right even though only the
-        // changed lines were appended -- an unchanged line is being assigned
-        // the value it already holds.
+        // down. A record is updated only when its own line was actually in a
+        // frame that sent successfully, so nothing is ever recorded as "shown"
+        // without having been sent: it is simply retried on the next pass.
         cmd_parts.clearRetainingCapacity();
-        const line1_changed = !have_last or !std.mem.eql(u8, &linebuf, &last_line1);
+        const line1_changed = !have_last1 or !std.mem.eql(u8, &linebuf, &last_line1);
         // Whether the *content* changed, kept separate from whether it gets
         // sent: a periodic refresh re-sends identical content, and reporting
         // that as a line-2 update every few seconds would bury the
         // transitions actually worth reading in the log.
-        const line2_changed = !have_last or !std.mem.eql(u8, &line2buf, &last_line2);
+        const line2_changed = !have_last2 or !std.mem.eql(u8, &line2buf, &last_line2);
 
+        // The forced refresh covers line 2 only. Line 1 needs no such net: it
+        // changes at least once a second on its own, so a frame the panel
+        // missed is overwritten by the next tick regardless.
         const forced = now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
-        if (forced) last_refresh_ms = now_ms;
 
-        if (line1_changed or forced) {
-            try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+        const send_line1 = line1_changed;
+        const send_line2 = (line2_changed or forced) and !send_line1;
+        if (send_line2) last_refresh_ms = now_ms;
+
+        // Send only the columns that moved, not the whole line. A seconds
+        // digit is one column; redrawing all 20 to move it doubles the wire
+        // time before anything renders (nothing renders until the frame's CRC
+        // arrives) and makes that time vary with how much of the line changed.
+        // This is the same trick `clocks.zig` has always used for its seconds
+        // digit, generalised so the playback clock, rollovers and the
+        // transport glyph all benefit without being special-cased.
+        if (send_line1) {
+            if (have_last1) {
+                try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf);
+            } else {
+                try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+            }
         }
-        if (line2_changed or forced) {
-            try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
+        if (send_line2) {
+            // A forced refresh deliberately rewrites the whole line: its
+            // entire purpose is to restore a line whose content has *not*
+            // changed, which is exactly what a diff would append nothing for.
+            if (line2_changed and have_last2) {
+                try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf);
+            } else {
+                try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
+            }
         }
 
         if (cmd_parts.items.len > 0) {
@@ -404,19 +463,27 @@ pub fn runBlurayClocks(
             // point that can confirm or rule out the send path itself when the
             // panel and the `cue -> ...`/`line2 source -> ...` logs disagree
             // about what should be on screen.
+            // Only worth reporting when line 2's content actually changed --
+            // a periodic refresh of identical bytes is not an update.
+            const report_line2 = send_line2 and line2_changed;
             var readable: std.ArrayList(u8) = .empty;
             defer readable.deinit(allocator);
-            if (line2_changed) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
+            if (report_line2) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
 
             if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
-                last_line1 = linebuf;
-                last_line2 = line2buf;
-                have_last = true;
-                if (line2_changed) {
+                if (send_line1) {
+                    last_line1 = linebuf;
+                    have_last1 = true;
+                }
+                if (send_line2) {
+                    last_line2 = line2buf;
+                    have_last2 = true;
+                }
+                if (report_line2) {
                     std.debug.print("bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
                 }
             } else |err| {
-                if (line2_changed) {
+                if (report_line2) {
                     std.debug.print("bluray: sending line 2: \"{s}\" send status: {}\n", .{ readable.items, err });
                 } else {
                     std.debug.print("bluray: failed to send display frame: {}\n", .{err});
@@ -633,6 +700,13 @@ pub const Snapshot = struct {
     has_anchor: bool = false,
     anchor_ms: i64 = 0,
     anchor_sec: u32 = 0,
+    /// Whether the lock's phase estimate is tight enough to trust, as opposed
+    /// to merely having an anchor to extrapolate from. Deliberately distinct
+    /// from `has_anchor`: the display keeps running off a free-wheeling anchor
+    /// while the estimate re-tightens, and this is what says so on the panel
+    /// (see `LOCK_HUNTING_CHAR`) rather than silently showing a time that may
+    /// be up to a second out.
+    locked: bool = false,
     /// When the player last answered. Requests fail while it is busy -- trick
     /// play especially -- and the poller then backs off, so a snapshot can be
     /// seconds old without anything looking wrong about it.
@@ -683,8 +757,26 @@ pub const Snapshot = struct {
     /// regression-testing -- can be exercised with concrete numbers regardless
     /// of whatever the live value is currently tuned to.
     fn playTimeMillisLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) i64 {
-        if (self.run_status != .Playing or !self.has_anchor) {
+        // Not playing: the counter is not moving, so the last reported value
+        // *is* the position. Freezing here is correct.
+        if (self.run_status != .Playing) {
             return @as(i64, self.play_time_seconds) * std.time.ms_per_s;
+        }
+        // Playing but hunting: extrapolate from the sample rather than sitting
+        // on it. Freezing here was wrong -- the player is still counting, so
+        // the position only lurched forward when a poll landed, roughly once a
+        // second, and sat stale in between. Cues keyed off it fired a beat
+        // late and in visible steps until the lock acquired, which reads as
+        // line 2 lagging the picture "until the PLL stops hunting".
+        //
+        // The counter reached `play_time_seconds` somewhere in
+        // `(sampled_ms - 1s, sampled_ms]`, so its midpoint is `sampled_ms -
+        // 500` -- the same convention `phase_lock.rebase` uses when it seeds
+        // an anchor from a single sample. Using it here too means the estimate
+        // does not visibly jump at the moment the lock acquires.
+        if (!self.has_anchor) {
+            return @as(i64, self.play_time_seconds) * std.time.ms_per_s +
+                (now_ms - (self.sampled_ms - 500)) + lead_ms;
         }
         return @as(i64, self.anchor_sec) * std.time.ms_per_s + (now_ms - self.anchor_ms) + lead_ms;
     }
@@ -711,8 +803,18 @@ pub const Snapshot = struct {
     /// find nothing has actually changed yet (or the reverse: change without a
     /// wake to redraw it).
     fn nextTickMsLeadBy(self: Snapshot, now_ms: i64, lead_ms: i64) ?i64 {
-        if (self.run_status != .Playing or !self.has_anchor) return null;
-        const effective_anchor_ms = self.anchor_ms - lead_ms;
+        if (self.run_status != .Playing) return null;
+        // While hunting, the same pseudo-anchor `playTimeMillisLeadBy` uses.
+        // It has to be the same one: this schedules the wake, that computes
+        // the value being woken up to show, and if they disagree the loop
+        // either wakes to find nothing changed or changes with no wake to
+        // redraw it. Returning null here (as this did) meant no tick wake at
+        // all while hunting, leaving line 1's play time to be picked up
+        // whenever the idle slice next came round -- up to
+        // `DISPLAY_IDLE_SLICE_MS` late, and unevenly, which is the same
+        // erratic advance in a different guise.
+        const anchor_ms = if (self.has_anchor) self.anchor_ms else self.sampled_ms - 500;
+        const effective_anchor_ms = anchor_ms - lead_ms;
         return effective_anchor_ms + (@divFloor(now_ms - effective_anchor_ms, 1000) + 1) * 1000;
     }
 };
@@ -1193,6 +1295,7 @@ pub const BlurayPlayer = struct {
             .run_status = self.state.run_status,
             .play_time_seconds = self.state.play_time_seconds,
             .has_anchor = self.lock.hasAnchor(),
+            .locked = self.lock.isLocked(),
             .sampled_ms = self.last_update_time,
             .anchor_ms = self.lock.anchor_ms,
             .anchor_sec = self.lock.anchor_sec,
