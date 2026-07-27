@@ -26,9 +26,10 @@
     // Full, un-diffed redraws of both lines, and why one was triggered.
     "redraw": false,
 
-    // Per-phase timing breakdown of a collator pass and a sender send. Very
-    // dense (up to ~40 lines/sec while scrolling) -- turn on only while
-    // actively chasing a "where did the time go" question.
+    // Per-send timing breakdown on the sender thread: command-build time vs.
+    // the panel's actual reply time. Turn on while chasing a slow-reply
+    // question; the unconditional "serial comm slow" warning covers the
+    // normal case of just wanting to know if/when it happens.
     "timing": false,
 
     // Blu-ray player status polling, and the display-lead setting.

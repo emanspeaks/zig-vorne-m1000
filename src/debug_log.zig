@@ -50,14 +50,16 @@ pub const Category = enum {
     /// seeing on its own, without the per-pass "line2 source" and "late pass"
     /// chatter `display` also carries.
     redraw,
-    /// Per-phase wall-clock breakdown of a Blu-ray collator pass and a
-    /// sender send, one line each -- how long building line 1 took, cue
-    /// lookup, building line 2, publishing to the sender; and, on the sender
-    /// side, how long building the command string took versus the panel's
-    /// actual reply time. Split out from `display` because this is meant for
-    /// actively chasing a "where did the time go" question, not left on: at
-    /// collator rate (up to ~40 passes/sec while scrolling) it is far too
-    /// dense to read alongside anything else.
+    /// Per-send wall-clock breakdown on the Blu-ray sender thread: how long
+    /// building the command string took versus the panel's actual reply time,
+    /// plus which lines and whether it was a full redraw. There used to be a
+    /// collator-side equivalent too, but at millisecond resolution every
+    /// phase there reads as 0-1 ms -- pure arithmetic and a `memcmp`, correctly
+    /// too fast for this resolution to distinguish -- so it never said
+    /// anything code inspection didn't already establish, and was removed.
+    /// `senderLoop`'s own unconditional "serial comm slow" warning (not
+    /// gated behind this category) is the one to watch for an actual anomaly;
+    /// this is for watching the normal range while chasing one down.
     timing,
     /// Blu-ray player status polling and the display-lead setting.
     bluray,

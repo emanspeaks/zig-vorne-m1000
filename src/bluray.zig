@@ -310,15 +310,6 @@ pub fn runBlurayClocks(
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
 
-        // Per-phase timing, for chasing a "where did the time go" question --
-        // see `.timing`'s own doc. `enabled` is checked once and the reads
-        // gated behind it, rather than reading unconditionally: `nowMillis`
-        // is cheap but not free, and this collator runs up to ~40 passes/sec
-        // while scrolling, so an unconditional extra clock read four times a
-        // pass is not something to pay when nobody is looking at it.
-        const timing_on = dbg.enabled(.timing);
-        const t_line1_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
-
         // Collect a cue file the cue thread has finished parsing. One atomic
         // load on almost every pass; the pointer swap and the arena free only
         // happen when the selection changes or the file is edited.
@@ -434,11 +425,6 @@ pub fn runBlurayClocks(
             );
         }
 
-        // Covers cue-cell collection, the selected-name re-read, and the
-        // whole cue-lookup/line2-source decision above -- everything between
-        // line 1 being finished and the marquee/line2 buffer work starting.
-        const t_line2_source_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
-
         const line2_window = if (may_scroll)
             scroller.window(line2, str_utils.maxchars, now_ms)
         else blk: {
@@ -465,8 +451,6 @@ pub fn runBlurayClocks(
         const line2_cols = (str_utils.strlensz(line2_window) catch unreachable)[0];
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_cols, str_utils.maxchars), null);
 
-        const t_line2_build_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
-
         // Hand the freshly built frame to `senderLoop`, which owns the port
         // and decides how -- or whether -- to get it onto the wire (one frame
         // per send, line 1 preferred over line 2, full redraw vs. column diff;
@@ -486,20 +470,6 @@ pub fn runBlurayClocks(
         // publish it came from, so it does not matter that the flag and the
         // frame that originally set it may not arrive together.
         if (cue_boundary) cue_boundary_pending.store(true, .release);
-
-        if (timing_on) {
-            const t_publish_ms = time.nowMillis(io);
-            dbg.print(.timing,
-                "bluray collator: line1={d}ms cue+src={d}ms line2buf={d}ms publish={d}ms total={d}ms\n",
-                .{
-                    t_line1_ms - now_ms,
-                    t_line2_source_ms - t_line1_ms,
-                    t_line2_build_ms - t_line2_source_ms,
-                    t_publish_ms - t_line2_build_ms,
-                    t_publish_ms - now_ms,
-                },
-            );
-        }
 
         // Sleep until the next moment something on the display is due to
         // change: the next playback tick, the next real-time second, or the
@@ -1332,10 +1302,23 @@ fn senderLoop(
                             "bluray: serial comm slow: panel took {d} ms to reply (usually ~{d} ms), {d} so far -- this is the wire/panel, not the render loop\n",
                             .{ send_wait_ms, send_ewma_ms, slow_sends },
                         );
+                    } else {
+                        // Fed from *ordinary* confirmed sends only -- flagged
+                        // ones excluded, not just timeouts (see
+                        // `send_ewma_ms`'s own doc for the timeout half of
+                        // this). A cluster of consecutive slow replies would
+                        // otherwise drag the baseline up after the first one,
+                        // raising the very threshold meant to catch the rest
+                        // of the cluster -- observed on hardware as a 96 ms
+                        // reply warning, immediately followed by a 108 ms
+                        // reply that stayed silent because the first spike had
+                        // already pushed the average (and so the threshold)
+                        // up enough to swallow the second. Keeping the
+                        // baseline anchored to genuinely normal sends means
+                        // every send in a slow stretch gets compared against
+                        // the same "normal" figure, not against each other.
+                        send_ewma_ms = @divFloor(send_ewma_ms * 3 + send_wait_ms, 4);
                     }
-                    // Updated from confirmed sends only -- see `send_ewma_ms`'s
-                    // own doc for why a timeout must not feed this average.
-                    send_ewma_ms = @divFloor(send_ewma_ms * 3 + send_wait_ms, 4);
                 } else {
                     // Unconditional, like the write-failure branch below: an
                     // unconfirmed frame is exactly the situation
