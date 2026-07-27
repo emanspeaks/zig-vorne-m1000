@@ -131,6 +131,25 @@ const Line2Source = enum {
     nothing_selected,
 };
 
+/// Why a pass redraws both lines whole rather than diffing columns.
+///
+/// Named explicitly, rather than folded straight into a bool, so the reason
+/// can be logged on change -- the same "log on change" discipline
+/// `seen_line2_source` already uses below. Without this, "why did the panel
+/// just repaint whole" was invisible in the log; only the fact that a frame
+/// went out was.
+const RedrawReason = enum {
+    /// Nothing has ever been sent, or the last send's line wasn't recorded --
+    /// there is no known-good record to diff against.
+    missing_record,
+    /// Still inside `ENTRY_FULL_REDRAW_MS` of entering the mode -- see its doc.
+    entry_window,
+    /// A cue's start or end marker was crossed this pass -- see `cue_boundary`.
+    cue_boundary,
+    /// `FORCE_REFRESH_MS` has elapsed since the last full redraw.
+    periodic,
+};
+
 pub fn runBlurayClocks(
     io: Io,
     allocator: std.mem.Allocator,
@@ -189,6 +208,8 @@ pub fn runBlurayClocks(
     var seen_generation: u64 = 0;
     // For "log only on change" below -- see `Line2Source`.
     var seen_line2_source: ?Line2Source = null;
+    // For "log only on change" below -- see `RedrawReason`.
+    var seen_redraw_reason: ?RedrawReason = null;
     // A cue's [start_ms, end_ms) span is unique within a well-formed file, so
     // it stands in for cue identity: `line2_source` alone stays `.cue` across
     // every cue in a file, which hid exactly the transition worth seeing when
@@ -504,8 +525,29 @@ pub fn runBlurayClocks(
         // frame" gap (above) is least affordable: it is the one instant
         // someone is actually looking, so a dropped frame there should not
         // wait for `FORCE_REFRESH_MS` to self-heal.
-        const full_redraw = in_entry_window or !have_last1 or !have_last2 or
-            cue_boundary or now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
+        //
+        // Priority matters only for the log line below (a pass can satisfy
+        // several of these at once, e.g. entering the mode right as a cue
+        // starts) -- every branch produces the identical `full_redraw = true`
+        // either way.
+        const redraw_reason: ?RedrawReason = if (!have_last1 or !have_last2)
+            .missing_record
+        else if (in_entry_window)
+            .entry_window
+        else if (cue_boundary)
+            .cue_boundary
+        else if (now_ms - last_refresh_ms >= FORCE_REFRESH_MS)
+            .periodic
+        else
+            null;
+        const full_redraw = redraw_reason != null;
+
+        if (redraw_reason != seen_redraw_reason) {
+            seen_redraw_reason = redraw_reason;
+            if (redraw_reason) |reason| {
+                dbg.print(.display, "bluray: full redraw -> {s}\n", .{@tagName(reason)});
+            }
+        }
 
         // Which lines this pass actually put in the frame, so the records are
         // updated for exactly those and no others.
@@ -578,14 +620,32 @@ pub fn runBlurayClocks(
         // lateness this loop exists to avoid, and for the scroll is visible as
         // stutter, since evenly spaced steps are the whole of what makes a
         // character-cell marquee look smooth.
-        var wake_ms = now_ms + DISPLAY_IDLE_SLICE_MS;
-        if (snap.nextTickMs(now_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
+        //
+        // Scheduled from a *fresh* clock read, not the frame's `now_ms`.
+        // `now_ms` was captured once at the top of the pass deliberately, so
+        // everything the frame's *content* depends on (the clock string, the
+        // cue lookup, the scroll window) agrees on one instant -- but real
+        // time keeps moving after that, most of all across
+        // `sendUnitDisplayCmd` above, which blocks writing the frame and then
+        // waits for the panel's reply (`protocol.send`, up to
+        // `protocol.timeout_ms` = 2 s). Scheduling the *next* wake from the
+        // stale, pre-send `now_ms` ignored however long that wait actually
+        // took, so the very next deadline could already be in the past by the
+        // time it was computed -- `sleep_ms` below would go negative, the
+        // loop would skip straight to another pass with no sleep at all, and
+        // that pass would report itself late by roughly the round trip it
+        // never accounted for. This was the dominant source of the "Display
+        // pass N ms late" reports, including with no marquee running: every
+        // pass that actually sent a frame mis-scheduled the one after it.
+        const sched_ms = time.nowMillis(io);
+        var wake_ms = sched_ms + DISPLAY_IDLE_SLICE_MS;
+        if (snap.nextTickMs(sched_ms)) |tick_ms| wake_ms = @min(wake_ms, tick_ms);
         // The displayed second flips on a local-time boundary. Offsets are
         // whole minutes, so that is also a UTC second boundary.
-        const next_second_ms = (@divFloor(now_ms, 1000) + 1) * 1000;
+        const next_second_ms = (@divFloor(sched_ms, 1000) + 1) * 1000;
         wake_ms = @min(wake_ms, next_second_ms);
         if (may_scroll) {
-            if (scroller.nextStepMs(line2, str_utils.maxchars, now_ms)) |step_ms| {
+            if (scroller.nextStepMs(line2, str_utils.maxchars, sched_ms)) |step_ms| {
                 wake_ms = @min(wake_ms, step_ms);
             }
         }
@@ -595,9 +655,9 @@ pub fn runBlurayClocks(
         // appears is worse than one that appears a little late.
         if (cue_list) |list| {
             if (snap.positionIsLive()) {
-                const position_ms = snap.playTimeMillis(now_ms);
+                const position_ms = snap.playTimeMillis(sched_ms);
                 if (list.nextBoundaryMs(position_ms)) |boundary_ms| {
-                    wake_ms = @min(wake_ms, now_ms + (boundary_ms - position_ms));
+                    wake_ms = @min(wake_ms, sched_ms + (boundary_ms - position_ms));
                 }
             }
         }
