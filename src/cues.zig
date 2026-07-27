@@ -73,7 +73,7 @@ pub fn configureDirPath(io: Io) void {
     // dropdown and looks exactly like a bug.
     if (vorne_config.cuesDir()) |configured| {
         const trimmed = parseDirPathConfig(configured) orelse {
-            std.debug.print(
+            std.log.warn(
                 "Config cues_dir is empty or longer than {d}, using default cue directory: {s}\n",
                 .{ max_dir_path_len, default_dir_path },
             );
@@ -81,7 +81,7 @@ pub fn configureDirPath(io: Io) void {
         };
         @memcpy(active_dir_path_buf[0..trimmed.len], trimmed);
         active_dir_path = active_dir_path_buf[0..trimmed.len];
-        std.debug.print("Using cue directory: {s}\n", .{active_dir_path});
+        std.log.info("Using cue directory: {s}\n", .{active_dir_path});
         return;
     }
 
@@ -97,11 +97,11 @@ pub fn configureDirPath(io: Io) void {
             // log always states, without ambiguity, which directory is
             // actually in effect: the single most useful fact when cue files
             // that should be there are not showing.
-            std.debug.print("Using default cue directory: {s}\n", .{default_dir_path});
+            std.log.info("Using default cue directory: {s}\n", .{default_dir_path});
             return;
         },
         else => {
-            std.debug.print(
+            std.log.warn(
                 "Error reading {s}: {}, using default cue directory: {s}\n",
                 .{ dir_path_config_path, err, default_dir_path },
             );
@@ -111,7 +111,7 @@ pub fn configureDirPath(io: Io) void {
     defer std.heap.page_allocator.free(raw);
 
     const trimmed = parseDirPathConfig(raw) orelse {
-        std.debug.print(
+        std.log.warn(
             "{s} is empty or too long (max {d}), using default cue directory\n",
             .{ dir_path_config_path, max_dir_path_len },
         );
@@ -120,7 +120,7 @@ pub fn configureDirPath(io: Io) void {
 
     @memcpy(active_dir_path_buf[0..trimmed.len], trimmed);
     active_dir_path = active_dir_path_buf[0..trimmed.len];
-    std.debug.print(
+    std.log.info(
         "Using cue directory: {s} (from deprecated {s}; move it to \"cues_dir\" in {s})\n",
         .{ active_dir_path, dir_path_config_path, vorne_config.path },
     );

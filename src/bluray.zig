@@ -160,7 +160,7 @@ pub fn runBlurayClocks(
     cue_state: *cues.State,
     resync_requested: *std.atomic.Value(bool),
 ) !void {
-    std.debug.print("Starting Blu-Ray run mode...\n", .{});
+    std.log.info("Starting Blu-Ray run mode...\n", .{});
 
     var playtime_buf: [maxbufsz]u8 = undefined;
     // Holds the play time with `LOCK_HUNTING_CHAR` prefixed. Separate from
@@ -241,13 +241,13 @@ pub fn runBlurayClocks(
     while (true) {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
-            std.debug.print("Blu-Ray display received shutdown signal, exiting gracefully...\n", .{});
+            std.log.info("Blu-Ray display received shutdown signal, exiting gracefully...\n", .{});
             return;
         }
 
         // Check for mode change
         if (mode.load(.acquire) != .Bluray) {
-            std.debug.print("Mode changed, exiting bluray mode...\n", .{});
+            std.log.info("Mode changed, exiting bluray mode...\n", .{});
             return;
         }
 
@@ -257,7 +257,7 @@ pub fn runBlurayClocks(
         // from scratch because the "what is on the panel" records
         // start empty. Checked without consuming -- `main` clears it.
         if (mode_mod.reinitPending()) {
-            std.debug.print("Re-init requested, exiting bluray mode...\n", .{});
+            std.log.info("Re-init requested, exiting bluray mode...\n", .{});
             return;
         }
 
@@ -319,7 +319,7 @@ pub fn runBlurayClocks(
         // than leaving it to be inferred.
         if (seen_clock_second) |prev| {
             if (clock_second - prev > 1) {
-                std.debug.print(
+                std.log.warn(
                     "bluray: real-time clock skipped {d} second(s) in the render loop itself ({d} -> {d}) -- this is the collator, not serial comm\n",
                     .{ clock_second - prev - 1, prev, clock_second },
                 );
@@ -543,10 +543,14 @@ pub fn runBlurayClocks(
         // scheduled for. Every wake exists because something was due on screen
         // then, and there is no catching up afterwards -- a late pass is a
         // frame shown late, so it is a defect worth seeing in the log rather
-        // than something to absorb quietly.
+        // than something to absorb quietly. Unconditional (`std.log`, not
+        // `dbg.print`/`.display`): this can only mean the collator itself
+        // stalled -- nothing it does can block since the sender split (see
+        // `senderLoop`'s own doc) -- which is exactly the kind of fault a
+        // debug category being off must not be able to hide.
         if (due_ms != 0 and now_ms - due_ms > DEADLINE_SLACK_MS) {
             late_frames += 1;
-            dbg.print(.display, 
+            std.log.warn(
                 "Display pass {d} ms late (deadline {d}, {d} so far)\n",
                 .{ now_ms - due_ms, due_ms, late_frames },
             );
@@ -624,11 +628,11 @@ pub fn configureDisplayLead(io: Io) void {
         .limited(64),
     ) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("No {s}, display_lead_ms stays {d}\n", .{ display_lead_config_path, display_lead_ms.load(.monotonic) });
+            std.log.info("No {s}, display_lead_ms stays {d}\n", .{ display_lead_config_path, display_lead_ms.load(.monotonic) });
             return;
         },
         else => {
-            std.debug.print(
+            std.log.warn(
                 "Error reading {s}: {}, display_lead_ms stays {d}\n",
                 .{ display_lead_config_path, err, display_lead_ms.load(.monotonic) },
             );
@@ -638,14 +642,14 @@ pub fn configureDisplayLead(io: Io) void {
     defer std.heap.page_allocator.free(raw);
 
     const parsed = parseDisplayLeadConfig(raw) orelse {
-        std.debug.print(
+        std.log.warn(
             "{s} does not contain a plain integer, display_lead_ms stays {d}\n",
             .{ display_lead_config_path, display_lead_ms.load(.monotonic) },
         );
         return;
     };
     display_lead_ms.store(parsed, .release);
-    std.debug.print("Using display_lead_ms = {d} ms\n", .{parsed});
+    std.log.info("Using display_lead_ms = {d} ms\n", .{parsed});
 }
 
 /// Write `value` to `display_lead_config_path` so it survives a restart.
@@ -668,7 +672,7 @@ fn persistDisplayLeadTo(io: Io, path: []const u8, value: i64) void {
     const text = std.fmt.bufPrint(&text_buf, "{d}\n", .{value}) catch unreachable;
 
     const file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
-        std.debug.print("Failed to open {s} for writing: {}\n", .{ path, err });
+        std.log.warn("Failed to open {s} for writing: {}\n", .{ path, err });
         return;
     };
     defer file.close(io);
@@ -676,11 +680,11 @@ fn persistDisplayLeadTo(io: Io, path: []const u8, value: i64) void {
     var write_buf: [64]u8 = undefined;
     var writer = file.writer(io, &write_buf);
     writer.interface.writeAll(text) catch |err| {
-        std.debug.print("Failed to write {s}: {}\n", .{ path, err });
+        std.log.warn("Failed to write {s}: {}\n", .{ path, err });
         return;
     };
     writer.interface.flush() catch |err| {
-        std.debug.print("Failed to flush {s}: {}\n", .{ path, err });
+        std.log.warn("Failed to flush {s}: {}\n", .{ path, err });
     };
 }
 
@@ -692,7 +696,7 @@ fn persistDisplayLeadTo(io: Io, path: []const u8, value: i64) void {
 pub fn setDisplayLead(io: Io, value: i64) void {
     display_lead_ms.store(value, .release);
     persistDisplayLead(io, value);
-    std.debug.print("display_lead_ms set to {d} ms (saved to {s})\n", .{ value, display_lead_config_path });
+    std.log.info("display_lead_ms set to {d} ms (saved to {s})\n", .{ value, display_lead_config_path });
 }
 
 /// Everything the display needs to know about the player, in a form it can
@@ -1248,11 +1252,11 @@ fn senderLoop(
         if (full_redraw) {
             last_refresh_ms = now_ms;
             protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf) catch |err| {
-                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                std.log.err("bluray: failed to build display frame: {}\n", .{err});
                 continue;
             };
             protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf) catch |err| {
-                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                std.log.err("bluray: failed to build display frame: {}\n", .{err});
                 continue;
             };
             sent_line1 = true;
@@ -1260,14 +1264,14 @@ fn senderLoop(
         } else if (line1_changed) {
             // Send only the columns that moved -- see `appendChangedColsToCmdList`.
             protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf) catch |err| {
-                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                std.log.err("bluray: failed to build display frame: {}\n", .{err});
                 continue;
             };
             sent_line1 = true;
         } else if (line2_changed) {
             // Line 2 yields to line 1 -- see this function's own doc.
             protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf) catch |err| {
-                std.debug.print("bluray: failed to build display frame: {}\n", .{err});
+                std.log.err("bluray: failed to build display frame: {}\n", .{err});
                 continue;
             };
             sent_line2 = true;
@@ -1347,7 +1351,7 @@ fn senderLoop(
                         send_wait_ms > SEND_SLOW_ABSOLUTE_MS)
                     {
                         slow_sends += 1;
-                        std.debug.print(
+                        std.log.warn(
                             "bluray: serial comm slow: panel took {d} ms to reply (usually ~{d} ms), {d} so far -- this is the wire/panel, not the render loop\n",
                             .{ send_wait_ms, send_ewma_ms, slow_sends },
                         );
@@ -1376,14 +1380,14 @@ fn senderLoop(
                     // The record is deliberately left untouched -- see above
                     // -- so the very next pass retries against last known-good
                     // content rather than compounding the gap.
-                    std.debug.print("bluray: display did not confirm frame (no reply within {d} ms)\n", .{protocol.timeout_ms});
+                    std.log.warn("bluray: display did not confirm frame (no reply within {d} ms)\n", .{protocol.timeout_ms});
                 }
             } else |err| {
                 // Unconditional: a frame that did not reach the panel is an
                 // operational fault, not diagnostic chatter, and suppressing
                 // it because `serial` happens to be switched off would hide
                 // the single most useful line in the log.
-                std.debug.print("bluray: failed to send display frame: {}\n", .{err});
+                std.log.err("bluray: failed to send display frame: {}\n", .{err});
             }
         } else {
             // Nothing changed, so nothing to send -- wait a slice before

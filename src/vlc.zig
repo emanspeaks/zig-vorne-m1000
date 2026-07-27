@@ -70,13 +70,13 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
 
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
-            std.debug.print("VLC display received shutdown signal, exiting gracefully...\n", .{});
+            std.log.info("VLC display received shutdown signal, exiting gracefully...\n", .{});
             return;
         }
 
         // Check for mode change
         if (mode.load(.acquire) != .Vlc) {
-            std.debug.print("Mode changed, exiting vlc mode...\n", .{});
+            std.log.info("Mode changed, exiting vlc mode...\n", .{});
             return;
         }
 
@@ -86,7 +86,7 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
         // from scratch because the "what is on the panel" records
         // start empty. Checked without consuming -- `main` clears it.
         if (mode_mod.reinitPending()) {
-            std.debug.print("Re-init requested, exiting vlc mode...\n", .{});
+            std.log.info("Re-init requested, exiting vlc mode...\n", .{});
             return;
         }
 
@@ -99,7 +99,7 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
 
         // Update VLC state
         player.updateState() catch |err| {
-            std.debug.print("Failed to update VLC state: {}\n", .{err});
+            std.log.err("Failed to update VLC state: {}\n", .{err});
         };
 
         // Interpolate play time if playing
@@ -231,13 +231,13 @@ pub const VlcPlayer = struct {
             if (result) |incoming| {
                 const bytes_read = incoming.data.len;
                 const message = self.allocator.dupe(u8, incoming.data) catch {
-                    std.debug.print("VLC: Failed to allocate memory for message\n", .{});
+                    std.log.err("VLC: Failed to allocate memory for message\n", .{});
                     continue;
                 };
 
                 // Parse server_timestamp to compare
                 var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
-                    std.debug.print("VLC: JSON parse error\n", .{});
+                    std.log.warn("VLC: JSON parse error\n", .{});
                     self.allocator.free(message);
                     continue;
                 };
@@ -266,7 +266,7 @@ pub const VlcPlayer = struct {
                     break;
                 },
                 else => {
-                    std.debug.print("VLC: Socket error: {}\n", .{err});
+                    std.log.err("VLC: Socket error: {}\n", .{err});
                     if (latest_message) |msg| self.allocator.free(msg);
                     return err;
                 },
@@ -281,7 +281,7 @@ pub const VlcPlayer = struct {
 
             // Parse and process the latest message
             var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
-                std.debug.print("VLC: JSON parse error\n", .{});
+                std.log.warn("VLC: JSON parse error\n", .{});
                 return;
             };
             defer json.deinit();
@@ -374,13 +374,13 @@ pub const VlcPlayer = struct {
 
         // Parse the new JSON format from C server: {"server_timestamp":<ms>,"server_id":"...","vlc_data":{...}}
         var json = std.json.parseFromSlice(std.json.Value, self.allocator, message, .{}) catch {
-            std.debug.print("VLC: JSON parse error\n", .{});
+            std.log.warn("VLC: JSON parse error\n", .{});
             return;
         };
         defer json.deinit();
 
         if (json.value != .object) {
-            std.debug.print("VLC: Root is not an object\n", .{});
+            std.log.warn("VLC: Root is not an object\n", .{});
             return;
         }
 
@@ -388,12 +388,12 @@ pub const VlcPlayer = struct {
 
         // Get the vlc_data object
         const vlc_data = obj.get("vlc_data") orelse {
-            std.debug.print("VLC: No vlc_data found in message\n", .{});
+            std.log.warn("VLC: No vlc_data found in message\n", .{});
             return;
         };
 
         if (vlc_data != .object) {
-            std.debug.print("VLC: vlc_data is not an object\n", .{});
+            std.log.warn("VLC: vlc_data is not an object\n", .{});
             return;
         }
 

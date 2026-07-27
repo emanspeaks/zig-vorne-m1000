@@ -16,6 +16,21 @@ const vorne_config = @import("vorne_config.zig");
 const mode_mod = @import("mode.zig");
 const Mode = mode_mod.Mode;
 
+/// Routes every `std.log.err`/`.warn`/`.info`/`.debug` call in this codebase
+/// through `debug_log.logFn` -- timestamped, colored by severity, and never
+/// gated by `vorne_config.jsonc`'s `debug` categories (that gating is a
+/// separate, config-file-driven mechanism; see `debug_log.zig`'s "Operational
+/// logging" section for why the two don't share one implementation).
+/// `log_level = .debug` disables `std.log`'s own comptime level filtering --
+/// which defaults to hiding `.debug` in release builds -- so every call
+/// actually reaches `logFn` and the decision of what to show is `logFn`'s
+/// alone to make. `std_options` must be declared in the root source file,
+/// which is this one.
+pub const std_options: std.Options = .{
+    .logFn = dbg.logFn,
+    .log_level = .debug,
+};
+
 
 /// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
 /// `Io` implementation that all blocking I/O (files, sockets, sleeping) now
@@ -53,10 +68,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const ttydev = "/dev/ttyUSB0";
-    std.debug.print("Opening {s}...\n", .{ttydev});
+    std.log.info("Opening {s}...\n", .{ttydev});
     const port = serial.SerialPort.open(io, ttydev, allocator) catch |err| return err;
     defer port.close(allocator);
-    std.debug.print("Serial port opened and configured successfully.\n", .{});
+    std.log.info("Serial port opened and configured successfully.\n", .{});
 
     protocol.sendUnitFlushCmd(allocator, port, 1) catch |err| return err;
     _ = protocol.sendUnitDisplayCmd(allocator, port, 1, protocol.ESC ++ "E") catch |err| return err;
@@ -94,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
-            std.debug.print("Main loop received shutdown signal, exiting gracefully...\n", .{});
+            std.log.info("Main loop received shutdown signal, exiting gracefully...\n", .{});
             return;
         }
 
@@ -105,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
         // cannot be serviced twice, and -- since the flag is what made the
         // mode loop return -- leaving it set would spin this loop.
         if (mode_mod.takeReinitRequest()) {
-            std.debug.print("Re-initializing display\n", .{});
+            std.log.info("Re-initializing display\n", .{});
         }
 
         // Put the panel into a known state on every mode entry: geometry,
@@ -123,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
         // Logged, not propagated: failing to init is not a reason to take the
         // service down, and the next mode change gets another attempt.
         protocol.sendUnitDefaultInitCmd(allocator, port, 1) catch |err| {
-            std.debug.print("Failed to initialize display on mode entry: {}\n", .{err});
+            std.log.err("Failed to initialize display on mode entry: {}\n", .{err});
         };
 
         // No explicit wait here for the mode's first frame to be safe to send:
@@ -156,7 +171,7 @@ fn startHttpServer(
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("HTTP server listening on port 8080\n", .{});
+    std.log.info("HTTP server listening on port 8080\n", .{});
 
     while (true) {
         const stream = try listener.accept(io);
@@ -284,7 +299,7 @@ fn handleConnection(
             // to the running mode loop, which stops so the dispatch loop can
             // init and repaint on the display thread.
             mode_mod.requestReinit();
-            std.debug.print("Display re-init requested from the web page\n", .{});
+            std.log.info("Display re-init requested from the web page\n", .{});
         }
 
         // Redirect back to main page
@@ -357,7 +372,7 @@ fn handleConnection(
                 if (value.len == 0) {
                     cue_state.clear();
                 } else if (!cue_state.select(value)) {
-                    std.debug.print("Rejected cue file selection: {s}\n", .{value});
+                    std.log.warn("Rejected cue file selection: {s}\n", .{value});
                 }
             } else if (std.mem.eql(u8, key, "arm")) {
                 cue_state.setArmed(std.mem.eql(u8, value, "on"));
@@ -389,7 +404,7 @@ fn handleConnection(
                 // bluray_display_lead_ms.txt so it survives a restart too.
                 bluray.setDisplayLead(io, value);
             } else {
-                std.debug.print("Rejected display lead value: {s}\n", .{raw_value});
+                std.log.warn("Rejected display lead value: {s}\n", .{raw_value});
             }
         }
 

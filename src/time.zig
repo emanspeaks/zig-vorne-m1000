@@ -69,10 +69,10 @@ pub fn getTimezoneInfo(io: Io) zoneinfo {
             return zi;
         } else {
             // Fallback to hardcoded mapping if TZif parsing fails
-            std.debug.print("TZif parsing failed, using UTC\n", .{});
+            std.log.warn("TZif parsing failed, using UTC\n", .{});
         }
     } else |err| {
-        std.debug.print("Failed to open /etc/localtime: {}, using UTC\n", .{err});
+        std.log.warn("Failed to open /etc/localtime: {}, using UTC\n", .{err});
     }
 
     return zoneinfo{ .offset_sec = 0, .is_dst = 0 };
@@ -144,11 +144,11 @@ fn parseTZifFile(io: Io, file: Io.File) ?zoneinfo {
                     const buf_offset = @max(0, types_offset + (type_count * 6) - 1024);
 
                     file_reader.seekTo(buf_offset) catch |err| {
-                        std.debug.print("Failed to seek to data: {}\n", .{err});
+                        std.log.warn("Failed to seek to data: {}\n", .{err});
                         return null;
                     };
                     _ = file_reader.interface.readSliceShort(&buf) catch |err| {
-                        std.debug.print("Failed to read data: {}\n", .{err});
+                        std.log.warn("Failed to read data: {}\n", .{err});
                         return null;
                     };
 
@@ -180,20 +180,20 @@ fn parseTZifFile(io: Io, file: Io.File) ?zoneinfo {
                             // return offset_seconds;
                             return zoneinfo{ .offset_sec = offset_seconds, .is_dst = if (is_dst) 1 else 0 };
                         } else {
-                            std.debug.print("Invalid offset {} seconds, using UTC\n", .{offset_seconds});
+                            std.log.warn("Invalid offset {} seconds, using UTC\n", .{offset_seconds});
                         }
                     } else {
-                        std.debug.print("Invalid type_idx {}, using UTC\n", .{current_type_idx});
+                        std.log.warn("Invalid type_idx {}, using UTC\n", .{current_type_idx});
                     }
                 }
             } else {
-                std.debug.print("Not a valid TZif file, using UTC\n", .{});
+                std.log.warn("Not a valid TZif file, using UTC\n", .{});
             }
         } else |err| {
-            std.debug.print("Failed to read timezone file: {}\n", .{err});
+            std.log.warn("Failed to read timezone file: {}\n", .{err});
         }
     } else |err| {
-        std.debug.print("Failed to seek timezone file: {}\n", .{err});
+        std.log.warn("Failed to seek timezone file: {}\n", .{err});
     }
 
     return null;

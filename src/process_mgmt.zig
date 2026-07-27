@@ -76,7 +76,7 @@ pub fn checkExistingInstance(io: Io, allocator: std.mem.Allocator) !void {
             // Send SIGTERM to existing process
             const term_result = std.os.linux.kill(@intCast(existing_pid), .TERM);
             if (term_result != 0) {
-                std.debug.print("Failed to send signal to existing instance\n", .{});
+                std.log.err("Failed to send signal to existing instance\n", .{});
                 return;
             }
 
@@ -91,7 +91,7 @@ pub fn checkExistingInstance(io: Io, allocator: std.mem.Allocator) !void {
             }
 
             if (isProcessRunning(existing_pid)) {
-                std.debug.print("Existing instance did not terminate, sending SIGKILL...\n", .{});
+                std.log.warn("Existing instance did not terminate, sending SIGKILL...\n", .{});
                 _ = std.os.linux.kill(@intCast(existing_pid), .KILL);
                 try io.sleep(.fromMilliseconds(500), .awake);
             }

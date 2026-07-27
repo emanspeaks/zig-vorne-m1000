@@ -48,14 +48,14 @@ pub fn loadBlurayKey(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
     const raw = Io.Dir.readFileAlloc(.cwd(), io, bluray_key_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => return null, // Expected when running unauthenticated
         else => {
-            std.debug.print("Error reading Blu-ray key file: {}, skipping\n", .{err});
+            std.log.warn("Error reading Blu-ray key file: {}, skipping\n", .{err});
             return null;
         },
     };
 
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len != bluray_key_len) {
-        std.debug.print(
+        std.log.warn(
             "Blu-ray key must be {d} characters, got {d}; ignoring\n",
             .{ bluray_key_len, trimmed.len },
         );
@@ -88,7 +88,7 @@ pub fn loadBlurayIp(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
             return null;
         },
         else => {
-            std.debug.print("Error reading IP file: {}, skipping\n", .{err});
+            std.log.warn("Error reading IP file: {}, skipping\n", .{err});
             return null;
         },
     };
@@ -102,20 +102,20 @@ pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
             return null;
         },
         else => {
-            std.debug.print("Error reading JSON file: {}, skipping\n", .{err});
+            std.log.warn("Error reading JSON file: {}, skipping\n", .{err});
             return null;
         },
     };
     defer allocator.free(contents);
 
     var cleaned_contents = jsonc.strip(allocator, contents) catch |err| {
-        std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
+        std.log.warn("Error cleaning JSONC content: {}, skipping\n", .{err});
         return null;
     };
     defer cleaned_contents.deinit(allocator);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, cleaned_contents.items, .{}) catch |err| {
-        std.debug.print("Error parsing JSONC: {}, skipping\n", .{err});
+        std.log.warn("Error parsing JSONC: {}, skipping\n", .{err});
         return null;
     };
     defer parsed.deinit();
@@ -159,7 +159,7 @@ pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
     }
 
     // Fallback if JSONC is malformed
-    std.debug.print("Invalid JSONC format, skipping\n", .{});
+    std.log.warn("Invalid JSONC format, skipping\n", .{});
     return null;
 }
 
@@ -171,20 +171,20 @@ pub fn loadCountdownConfig(io: Io, allocator: std.mem.Allocator) ?CountdownConfi
             return null;
         },
         else => {
-            std.debug.print("Error reading JSON file: {}, skipping\n", .{err});
+            std.log.warn("Error reading JSON file: {}, skipping\n", .{err});
             return null;
         },
     };
     defer allocator.free(contents);
 
     var cleaned_contents = jsonc.strip(allocator, contents) catch |err| {
-        std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
+        std.log.warn("Error cleaning JSONC content: {}, skipping\n", .{err});
         return null;
     };
     defer cleaned_contents.deinit(allocator);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, cleaned_contents.items, .{}) catch |err| {
-        std.debug.print("Error parsing JSONC: {}, skipping\n", .{err});
+        std.log.warn("Error parsing JSONC: {}, skipping\n", .{err});
         return null;
     };
     defer parsed.deinit();
@@ -227,6 +227,6 @@ pub fn loadCountdownConfig(io: Io, allocator: std.mem.Allocator) ?CountdownConfi
     }
 
     // Fallback if JSONC is malformed
-    std.debug.print("Invalid JSONC format, skipping\n", .{});
+    std.log.warn("Invalid JSONC format, skipping\n", .{});
     return null;
 }

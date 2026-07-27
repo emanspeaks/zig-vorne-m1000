@@ -48,7 +48,7 @@ const Setting = struct {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed.len > max_value_len) {
-            std.debug.print(
+            std.log.warn(
                 "Config \"{s}\" is longer than {d} characters, ignoring\n",
                 .{ key, max_value_len },
             );
@@ -93,30 +93,30 @@ pub fn load(io: Io, allocator: std.mem.Allocator) void {
 
     const contents = Io.Dir.readFileAlloc(.cwd(), io, path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("No {s}; using defaults, debug logging off\n", .{path});
+            std.log.info("No {s}; using defaults, debug logging off\n", .{path});
             return;
         },
         else => {
-            std.debug.print("Error reading {s}: {}; using defaults\n", .{ path, err });
+            std.log.warn("Error reading {s}: {}; using defaults\n", .{ path, err });
             return;
         },
     };
     defer allocator.free(contents);
 
     var cleaned = jsonc.strip(allocator, contents) catch |err| {
-        std.debug.print("Error cleaning {s}: {}; using defaults\n", .{ path, err });
+        std.log.warn("Error cleaning {s}: {}; using defaults\n", .{ path, err });
         return;
     };
     defer cleaned.deinit(allocator);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, cleaned.items, .{}) catch |err| {
-        std.debug.print("Error parsing {s}: {}; using defaults\n", .{ path, err });
+        std.log.warn("Error parsing {s}: {}; using defaults\n", .{ path, err });
         return;
     };
     defer parsed.deinit();
 
     if (parsed.value != .object) {
-        std.debug.print("{s} is not a JSON object; using defaults\n", .{path});
+        std.log.warn("{s} is not a JSON object; using defaults\n", .{path});
         return;
     }
     const root = parsed.value.object;
@@ -129,10 +129,10 @@ pub fn load(io: Io, allocator: std.mem.Allocator) void {
         if (debug_value == .object) {
             dbg.setMask(dbg.maskFrom(debug_value.object));
         } else {
-            std.debug.print("\"debug\" in {s} is not an object; debug logging off\n", .{path});
+            std.log.warn("\"debug\" in {s} is not an object; debug logging off\n", .{path});
         }
     } else {
-        std.debug.print("No \"debug\" object in {s}; debug logging off\n", .{path});
+        std.log.info("No \"debug\" object in {s}; debug logging off\n", .{path});
     }
     dbg.reportEnabled();
 
@@ -142,7 +142,7 @@ pub fn load(io: Io, allocator: std.mem.Allocator) void {
 fn applyString(root: std.json.ObjectMap, key: []const u8, setting: *Setting) void {
     const value = root.get(key) orelse return;
     if (value != .string) {
-        std.debug.print("Config \"{s}\" must be a string, ignoring\n", .{key});
+        std.log.warn("Config \"{s}\" must be a string, ignoring\n", .{key});
         return;
     }
     setting.set(key, value.string);
@@ -153,9 +153,9 @@ fn reportPaths() void {
     // dropdown and a fallback line 2, which looks exactly like a bug. Saying
     // what was actually read costs three lines at startup and removes the
     // single most common false alarm.
-    if (cuesDir()) |v| std.debug.print("Config: cues_dir = {s}\n", .{v});
-    if (blurayIp()) |v| std.debug.print("Config: bluray_ip = {s}\n", .{v});
-    if (line2ConfigPath()) |v| std.debug.print("Config: line2_config = {s}\n", .{v});
+    if (cuesDir()) |v| std.log.info("Config: cues_dir = {s}\n", .{v});
+    if (blurayIp()) |v| std.log.info("Config: bluray_ip = {s}\n", .{v});
+    if (line2ConfigPath()) |v| std.log.info("Config: line2_config = {s}\n", .{v});
 }
 
 // ---------------------------------------------------------------------------

@@ -41,13 +41,13 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
     while (true) {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
-            std.debug.print("Clock display received shutdown signal, exiting gracefully...\n", .{});
+            std.log.info("Clock display received shutdown signal, exiting gracefully...\n", .{});
             return;
         }
 
         // Check for mode change
         if (mode.load(.acquire) != .Clocks) {
-            std.debug.print("Mode changed, exiting clocks mode...\n", .{});
+            std.log.info("Mode changed, exiting clocks mode...\n", .{});
             return;
         }
 
@@ -57,7 +57,7 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
         // from scratch because the "what is on the panel" records
         // start empty. Checked without consuming -- `main` clears it.
         if (mode_mod.reinitPending()) {
-            std.debug.print("Re-init requested, exiting clocks mode...\n", .{});
+            std.log.info("Re-init requested, exiting clocks mode...\n", .{});
             return;
         }
 

@@ -160,6 +160,96 @@ pub fn setClockIo(io: Io) void {
     clock_io = io;
 }
 
+// ---------------------------------------------------------------------------
+// Operational logging -- `std.log`, always on, colored by severity.
+// ---------------------------------------------------------------------------
+//
+// `print`/`Category` above is deliberately config-gated: it is for the
+// high-volume diagnostic chatter (per-poll PLL numbers, per-frame serial
+// detail) that would drown out everything else if left on by default.
+// Operational messages are the opposite in kind, not just in volume: a
+// rejected input, a frame the panel never confirmed, a slow reply, a mode
+// starting or stopping. These must survive regardless of what the config
+// says -- a category left off, or a typo in the config file, must never be
+// able to hide an actual fault -- so they go through `std.log` instead,
+// wired up in `main.zig`'s `std_options`, and this module supplies the
+// `logFn` for it: a timestamp (the same format `printStamp` uses, so the two
+// kinds of line still sort and scan together) plus a color by severity, so
+// an error or a warning stands out from the untinted category output around
+// it rather than reading identically to a routine line.
+//
+// `std.log`'s own scope-level filtering (`log_scope_levels`) is
+// comptime-only, so it cannot express the *runtime*, config-file-driven
+// gating `Category` needs -- that is the reason these stay two separate
+// mechanisms rather than one, not an oversight. Nothing in this codebase
+// calls `std.log.scoped(...)`; every call site here uses the default scope
+// (`std.log.err`/`.warn`/`.info`/`.debug`), so `logFn` below never needs to
+// consult `Category` at all.
+
+/// ANSI SGR codes for `logFn`'s level tag -- the same red/yellow/green/magenta
+/// palette `std.log.defaultLog` itself uses, so this reads the same as Zig's
+/// own default logger would if it had a timestamp and unconditional output.
+/// Raw escape sequences rather than going through `std.Io.Terminal` (how
+/// `defaultLog` gets its color): this project's only real deployment target
+/// is a Pi viewed through a terminal or `journalctl -f` -- see CLAUDE.md --
+/// so there is no Windows-console compatibility to account for, since the
+/// service itself never actually runs there.
+fn levelColor(level: std.log.Level) []const u8 {
+    return switch (level) {
+        .err => "\x1b[1;31m",
+        .warn => "\x1b[1;33m",
+        .info => "\x1b[1;32m",
+        .debug => "\x1b[1;35m",
+    };
+}
+
+const color_reset = "\x1b[0m";
+
+fn levelTag(level: std.log.Level) []const u8 {
+    return switch (level) {
+        .err => "ERROR",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DEBUG",
+    };
+}
+
+/// `std.Options.logFn`, wired up from `main.zig`. See this section's own doc
+/// for why this exists alongside, rather than instead of, `print`/`Category`.
+pub fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    printOpStamp(level);
+    std.debug.print(format, args);
+    // Message strings throughout this codebase already end in their own
+    // `\n` (unlike `std.log.defaultLog`, which appends one) -- kept that way
+    // rather than editing every call site, so the reset code prints after
+    // the newline. A zero-width escape at the start of the next line is
+    // invisible; it just guarantees color never bleeds into whatever prints
+    // after it, including a category line this interleaves with.
+    std.debug.print(color_reset, .{});
+}
+
+/// Timestamp + colored level tag -- the operational-logging equivalent of
+/// `printStamp`, sharing its "no clock yet" fallback for the same reason:
+/// this can be reached before `vorne_config.load` has run, since a problem
+/// loading the config is itself one of the things logged through here.
+fn printOpStamp(level: std.log.Level) void {
+    const color = levelColor(level);
+    const tag = levelTag(level);
+    const io = clock_io orelse {
+        std.debug.print("{s}[--:--:--.--- UTC {s}] ", .{ color, tag });
+        return;
+    };
+    const ms: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+    var buf: [16]u8 = undefined;
+    std.debug.print("{s}[{s} UTC {s}] ", .{ color, formatStamp(&buf, ms), tag });
+}
+
 /// Build the mask from a parsed `debug` object.
 ///
 /// Split out from `configure` so the mapping itself -- which is the part with
@@ -172,7 +262,7 @@ pub fn maskFrom(obj: std.json.ObjectMap) u32 {
         const cat = std.meta.stringToEnum(Category, key) orelse {
             // Worth saying out loud: a typo here is otherwise indistinguishable
             // from the category simply having nothing to report.
-            std.debug.print("Unknown debug category \"{s}\" in {s}, ignoring\n", .{ key, config_path });
+            std.log.warn("Unknown debug category \"{s}\" in {s}, ignoring\n", .{ key, config_path });
             continue;
         };
         // Anything that is not `true` leaves it off, including a non-boolean.
@@ -186,14 +276,21 @@ pub fn maskFrom(obj: std.json.ObjectMap) u32 {
 pub fn reportEnabled() void {
     const mask = enabled_mask.load(.acquire);
     if (mask == 0) {
-        std.debug.print("Debug logging: all categories off\n", .{});
+        std.log.info("Debug logging: all categories off\n", .{});
         return;
     }
-    std.debug.print("Debug logging on for:", .{});
+    // Built into a buffer and logged as one line, not one `std.log` call per
+    // category: unlike `std.debug.print`, each `std.log` call gets its own
+    // timestamp and color prefix, so calling it once per category name would
+    // scatter one summary across a dozen separately-stamped lines instead of
+    // reading as the single line it is.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("Debug logging on for:") catch {};
     for (std.enums.values(Category)) |cat| {
-        if (mask & bit(cat) != 0) std.debug.print(" {s}", .{@tagName(cat)});
+        if (mask & bit(cat) != 0) w.print(" {s}", .{@tagName(cat)}) catch {};
     }
-    std.debug.print("\n", .{});
+    std.log.info("{s}\n", .{w.buffered()});
 }
 
 /// Set the mask directly. For tests and for any future live reload.

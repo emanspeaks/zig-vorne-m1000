@@ -9,11 +9,11 @@ pub const SerialPort = struct {
     pub fn open(io: Io, path: []const u8, allocator: std.mem.Allocator) !*SerialPort {
         const file = Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => {
-                std.debug.print("Device {s} not found.\n", .{path});
+                std.log.err("Device {s} not found.\n", .{path});
                 return err;
             },
             error.AccessDenied => {
-                std.debug.print("Permission denied accessing {s}. Make sure you're in the dialout or plugdev group.\n", .{path});
+                std.log.err("Permission denied accessing {s}. Make sure you're in the dialout or plugdev group.\n", .{path});
                 return err;
             },
             else => return err,
@@ -66,7 +66,7 @@ pub const SerialPort = struct {
             return error.SetAttrFailed;
         }
 
-        std.debug.print("Serial port configured: 19200 8N1 raw mode\n", .{});
+        std.log.info("Serial port configured: 19200 8N1 raw mode\n", .{});
     }
 
     /// How long a single write attempt may wait for the port to be writable
