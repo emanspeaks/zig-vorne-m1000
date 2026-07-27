@@ -113,6 +113,26 @@ pub const SerialPort = struct {
         }
     }
 
+    /// Block until everything written has actually been clocked out of the port.
+    ///
+    /// `write` returns as soon as the bytes are in the kernel's output buffer,
+    /// which at 19200 baud is long before they are on the wire -- a 40 byte
+    /// frame is still ~21 ms from being delivered. That is normally fine and
+    /// deliberately so: the render loop must not block waiting on the wire.
+    ///
+    /// It is *not* fine when the next thing sent depends on the panel having
+    /// finished acting on the last thing. The panel has no flow control and a
+    /// small input buffer, so bytes that arrive while it is busy are simply
+    /// dropped -- and the initialisation sequence, which clears the screen and
+    /// sets the display window, is the slowest thing it is ever asked to do.
+    /// Sending a frame straight after it means that frame lands in the middle
+    /// of that work and is lost.
+    pub fn drain(self: *SerialPort) void {
+        // Failure here is not actionable -- the bytes are already queued and
+        // will still go out; we simply did not get to wait for them.
+        _ = linux.tcdrain(self.fd);
+    }
+
     pub fn read(self: *SerialPort, buffer: []u8) usize {
         return linux.read(self.fd, buffer.ptr, buffer.len);
     }

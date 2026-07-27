@@ -16,6 +16,18 @@ const vorne_config = @import("vorne_config.zig");
 const mode_mod = @import("mode.zig");
 const Mode = mode_mod.Mode;
 
+/// How long to let the panel digest the initialisation sequence before a mode
+/// loop is allowed to draw.
+///
+/// `SerialPort.drain` covers the wire time exactly, but not the panel's own
+/// processing of a screen clear and a window-geometry change, which nothing on
+/// this side can observe -- the unit's replies are drained without being read,
+/// so there is no acknowledgement to wait for. This is therefore an estimate,
+/// chosen generously because it is paid only on a mode change: a hand-driven,
+/// rare event where a few tens of milliseconds cost nothing and a dropped
+/// first frame costs a visibly blank display until the next periodic refresh.
+const INIT_SETTLE_MS = 50;
+
 /// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
 /// `Io` implementation that all blocking I/O (files, sockets, sleeping) now
 /// goes through, along with the command-line arguments.
@@ -124,6 +136,24 @@ pub fn main(init: std.process.Init) !void {
         protocol.sendUnitDefaultInitCmd(allocator, port, 1) catch |err| {
             std.debug.print("Failed to initialize display on mode entry: {}\n", .{err});
         };
+
+        // Wait for the init to actually land before letting a mode loop draw.
+        //
+        // Without this the mode's first frame -- which *is* a full redraw,
+        // since its "what is on the panel" records start empty -- was issued
+        // immediately after the init and simply lost: the panel has no flow
+        // control and a small input buffer, and clearing the screen and
+        // setting the display window is the slowest thing it does. The frame
+        // arrived mid-clear and went nowhere, so the panel stayed blank until
+        // the next periodic full refresh seconds later, which looked exactly
+        // like the mode entry not redrawing at all.
+        //
+        // `drain` blocks until the bytes have left the port; the settle wait
+        // then covers the panel's own processing, which nothing on this side
+        // can observe. This costs a few tens of milliseconds on a mode change,
+        // which happens by hand, and buys the first frame actually appearing.
+        port.drain();
+        try io.sleep(.fromMilliseconds(INIT_SETTLE_MS), .awake);
 
         if (current_mode == .Clocks) {
             try clocks.runClocks(io, allocator, port, &mode);
