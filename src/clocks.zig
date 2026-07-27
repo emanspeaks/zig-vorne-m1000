@@ -21,6 +21,23 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
     var line2_config: ?config.CountdownConfig = null;
 
     last_full_update_utc = 0; // force full update on first run
+
+    // Line 1 is only ever fully redrawn on the first pass and then again on a
+    // 10-second boundary -- every pass in between sends just the seconds
+    // digit. That is fine once the panel and this loop agree on what line 1
+    // says, but a dropped frame is exactly how they stop agreeing. `protocol.send`
+    // waits for the panel's reply before returning, which is a much stronger
+    // guarantee than a fixed delay -- but it is still evidence of "the panel
+    // answered something", not proof the frame it just received rendered
+    // correctly. If the very first full frame is lost anyway, line 1 stayed
+    // blank for up to 10 seconds, since nothing else was due to trigger a full
+    // resend. Repeating the full draw for a few seconds right after entry,
+    // instead of just once, means a single dropped frame self-heals on the
+    // very next pass -- half a second later -- rather than on the next
+    // 10-second boundary. Cheap insurance behind a real mechanism, not a
+    // substitute for one.
+    const entry_full_redraw_s: i64 = 3;
+    var entry_utc_timestamp: ?i64 = null;
     while (true) {
         // Check for shutdown signal
         if (process_mgmt.shouldShutdown()) {
@@ -56,8 +73,12 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
         const timestamp = now.local;
         const seconds = @mod(timestamp, 60);
 
-        // Check if we need a full update (every 10 seconds, first time, or timestamp changed)
-        if (last_full_update_utc == 0 or (@mod(seconds, 10) == 0 and utc_timestamp != last_full_update_utc)) {
+        if (entry_utc_timestamp == null) entry_utc_timestamp = utc_timestamp;
+        const in_entry_window = utc_timestamp - entry_utc_timestamp.? < entry_full_redraw_s;
+
+        // Check if we need a full update (every 10 seconds, first time, still
+        // within the just-entered-this-mode window, or timestamp changed)
+        if (last_full_update_utc == 0 or in_entry_window or (@mod(seconds, 10) == 0 and utc_timestamp != last_full_update_utc)) {
             const display_str = time.formatRandyTimestamp(timestamp, &line1_buf, &clock.zi) catch unreachable;
             const time_cmd_str = std.fmt.bufPrint(&msg1_buf, "{s}{s}", .{ protocol.ESC ++ "C", display_str }) catch unreachable;
             try cmd_parts.appendSlice(allocator, time_cmd_str);

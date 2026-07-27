@@ -4,6 +4,7 @@ const linux = std.os.linux;
 
 pub const SerialPort = struct {
     fd: linux.fd_t,
+    io: Io,
 
     pub fn open(io: Io, path: []const u8, allocator: std.mem.Allocator) !*SerialPort {
         const file = Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
@@ -20,7 +21,7 @@ pub const SerialPort = struct {
         // std.debug.print("Serial port opened successfully, fd: {}\n", .{file.handle});
 
         var self = try allocator.create(SerialPort);
-        self.* = SerialPort{ .fd = file.handle };
+        self.* = SerialPort{ .fd = file.handle, .io = io };
 
         try self.configure();
         // std.debug.print("Serial port configured successfully\n", .{});
@@ -90,6 +91,12 @@ pub const SerialPort = struct {
     /// caller that only ever issued one call and ignored the count (as this
     /// used to) would have no way to notice a display command that was only
     /// partially sent.
+    ///
+    /// A pure writer: it does not pace itself against the panel or wait for a
+    /// reply. That waiting lives one layer up, in `protocol.send` -- see its
+    /// doc for why waiting for the reply, rather than any fixed delay, is what
+    /// actually keeps successive commands from landing on the panel while it
+    /// is still busy with the last one.
     pub fn write(self: *SerialPort, data: []const u8) error{ WriteFailed, WriteTimeout }!void {
         var remaining = data;
         while (remaining.len > 0) {
@@ -111,26 +118,6 @@ pub const SerialPort = struct {
             if (signed <= 0) return error.WriteFailed;
             remaining = remaining[@intCast(signed)..];
         }
-    }
-
-    /// Block until everything written has actually been clocked out of the port.
-    ///
-    /// `write` returns as soon as the bytes are in the kernel's output buffer,
-    /// which at 19200 baud is long before they are on the wire -- a 40 byte
-    /// frame is still ~21 ms from being delivered. That is normally fine and
-    /// deliberately so: the render loop must not block waiting on the wire.
-    ///
-    /// It is *not* fine when the next thing sent depends on the panel having
-    /// finished acting on the last thing. The panel has no flow control and a
-    /// small input buffer, so bytes that arrive while it is busy are simply
-    /// dropped -- and the initialisation sequence, which clears the screen and
-    /// sets the display window, is the slowest thing it is ever asked to do.
-    /// Sending a frame straight after it means that frame lands in the middle
-    /// of that work and is lost.
-    pub fn drain(self: *SerialPort) void {
-        // Failure here is not actionable -- the bytes are already queued and
-        // will still go out; we simply did not get to wait for them.
-        _ = linux.tcdrain(self.fd);
     }
 
     pub fn read(self: *SerialPort, buffer: []u8) usize {

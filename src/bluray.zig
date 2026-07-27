@@ -91,6 +91,24 @@ const DISPLAY_IDLE_SLICE_MS: i64 = 25;
 /// rewrites itself every second holds only while it is written whole.
 const FORCE_REFRESH_MS: i64 = 3000;
 
+/// How long after entering Blu-ray mode to keep forcing a full redraw on
+/// every pass, rather than trusting `have_last1`/`have_last2` after the very
+/// first one.
+///
+/// The first pass's full redraw is sent right behind the mode-entry init.
+/// `protocol.send` waits for the panel's reply before either call returns,
+/// which is a much stronger guarantee than a fixed delay -- but it is still
+/// evidence the panel answered *something*, not proof the frame it just
+/// received rendered correctly. If that one frame is lost anyway,
+/// `have_last1`/`have_last2` are still marked true, since the write itself
+/// succeeded, and every following pass reverts to an incremental diff against
+/// a record of content the panel never actually showed -- so the panel can
+/// stay blank for the full `FORCE_REFRESH_MS` before anything forces a
+/// resend. Repeating the full redraw for a few seconds right after entry
+/// means a lost frame self-heals on the very next
+/// pass instead.
+const ENTRY_FULL_REDRAW_MS: i64 = 3000;
+
 /// Why line 2 currently holds whatever it holds. Logged only when it changes
 /// (`runBlurayClocks`'s `seen_line2_source`), the same "log on change, not
 /// every frame" discipline as the rest of this file's diagnostics -- this one
@@ -143,6 +161,8 @@ pub fn runBlurayClocks(
     var have_last2 = false;
     // See `FORCE_REFRESH_MS`.
     var last_refresh_ms: i64 = 0;
+    // See `ENTRY_FULL_REDRAW_MS`. Set from the first pass's `now_ms`.
+    var entry_ms: ?i64 = null;
 
     var playtime_buf: [maxbufsz]u8 = undefined;
     // Holds the play time with `LOCK_HUNTING_CHAR` prefixed. Separate from
@@ -463,7 +483,10 @@ pub fn runBlurayClocks(
         // reasoning that line 1 rewrites itself every second anyway; that is
         // true only while line 1 is written whole, and stopped being true the
         // moment the diff was introduced.
-        const full_redraw = !have_last1 or !have_last2 or
+        if (entry_ms == null) entry_ms = now_ms;
+        const in_entry_window = now_ms - entry_ms.? < ENTRY_FULL_REDRAW_MS;
+
+        const full_redraw = in_entry_window or !have_last1 or !have_last2 or
             now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
 
         // Which lines this pass actually put in the frame, so the records are

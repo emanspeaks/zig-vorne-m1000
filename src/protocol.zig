@@ -28,25 +28,38 @@ pub const group_crc16 = SOH ++ "u";
 
 pub const timeout_ms: u32 = 2000;
 
-/// Discard whatever the unit has sent back, without blocking.
+/// Send a command and wait for the panel's reply, up to `timeout_ms`.
 ///
-/// Nothing in this program interprets the reply, so waiting for one only adds
-/// latency to the render loop. Draining keeps the tty input buffer from filling
-/// up (there is no hardware flow control configured, so unread bytes are simply
-/// dropped by the kernel).
-fn drainInput(port: *serial.SerialPort) void {
-    var buffer: [128]u8 = undefined;
-    while (true) {
-        const received = port.readWithTimeout(&buffer, 0) catch return;
-        // A short read means the buffer is empty; an oversized value means the
-        // underlying read() returned an error code rather than a length.
-        if (received == 0 or received > buffer.len) return;
-    }
-}
-
+/// This is the pacing mechanism between commands, and deliberately not a
+/// fixed delay. The panel has no flow control and a small input buffer, so a
+/// command that arrives while it is still busy with the last one is simply
+/// dropped rather than queued -- and its reply is the one signal available
+/// that it has finished and is ready for another. Waiting for that reply,
+/// rather than guessing a fixed gap, means a command the panel answers
+/// quickly is not held up for no reason, and a command that takes longer
+/// (the initialisation sequence, which clears the screen and sets the display
+/// window, most of all) is not raced.
+///
+/// Nothing here interprets the reply's *content* -- only its arrival matters.
+/// `timeout_ms` (2 s) bounds the wait for the case where the panel does not
+/// answer at all, so a disconnected or wedged unit cannot hang this call
+/// forever; on that path a diagnostic is worth logging; `try port.write`
+/// still propagates a genuine write failure (a short or failed send, or the
+/// port itself timing out -- see `SerialPort.write`), which is a different
+/// and more serious condition than the unit simply not replying.
 pub fn send(port: *serial.SerialPort, msg: []const u8) !void {
     try port.write(msg);
-    drainInput(port);
+
+    var buffer: [128]u8 = undefined;
+    const received = port.readWithTimeout(&buffer, timeout_ms) catch |err| switch (err) {
+        error.PollError => {
+            dbg.print(.serial, "Error polling for a reply.\n", .{});
+            return;
+        },
+    };
+    if (received == 0) {
+        dbg.print(.serial, "No response after {d} ms.\n", .{timeout_ms});
+    }
 }
 
 pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, allocator: std.mem.Allocator) !void {
