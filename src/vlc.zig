@@ -1,4 +1,5 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
 const Io = std.Io;
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
@@ -30,15 +31,21 @@ fn isVlcDebugEnabled() bool {
     return std.mem.eql(u8, value, "1");
 }
 
-// Debug print function that only prints if DEBUG_VLC=1
+/// Print if VLC diagnostics are switched on, by either mechanism.
+///
+/// `debug.vlc` in the config file is the general one and matches every other
+/// category in this program; `DEBUG_VLC=1` predates it and is kept working
+/// rather than quietly removed, since it costs one call to honour it and
+/// anything already relying on it would otherwise go silent with no error to
+/// explain why.
 fn debugPrint(comptime fmt: []const u8, args: anytype) void {
-    if (isVlcDebugEnabled()) {
+    if (dbg.enabled(.vlc) or isVlcDebugEnabled()) {
         std.debug.print(fmt, args);
     }
 }
 
 pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
-    std.debug.print("Starting VLC run mode...\n", .{});
+    dbg.print(.vlc, "Starting VLC run mode...\n", .{});
 
     // Build the command string dynamically
     var cmd_parts = std.ArrayList(u8).empty;
@@ -298,7 +305,7 @@ pub const VlcPlayer = struct {
 
     /// Connect to multicast group
     fn connectMulticast(self: *Self) !void {
-        std.debug.print("Creating UDP socket for VLC status multicast...\n", .{});
+        dbg.print(.vlc, "Creating UDP socket for VLC status multicast...\n", .{});
 
         // `IpAddress.bind` would create and bind the socket in one step, but it
         // offers no way to set SO_REUSEADDR/SO_REUSEPORT, which must be applied
@@ -312,7 +319,7 @@ pub const VlcPlayer = struct {
         };
         errdefer _ = linux.close(sock_fd);
 
-        std.debug.print("VLC: Socket created successfully\n", .{});
+        dbg.print(.vlc, "VLC: Socket created successfully\n", .{});
 
         // Allow multiple sockets to bind to the same port
         try std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -333,7 +340,7 @@ pub const VlcPlayer = struct {
         const sock: Io.net.Socket = .{ .handle = sock_fd, .address = bind_address };
         self.socket = sock;
 
-        std.debug.print("VLC: Bound to 0.0.0.0:{}\n", .{Self.MULTICAST_PORT});
+        dbg.print(.vlc, "VLC: Bound to 0.0.0.0:{}\n", .{Self.MULTICAST_PORT});
 
         // Join the multicast group using raw socket options
         const multicast_addr: Io.net.IpAddress = try .parse(Self.MULTICAST_ADDR, Self.MULTICAST_PORT);
@@ -347,7 +354,7 @@ pub const VlcPlayer = struct {
 
         try std.posix.setsockopt(sock.handle, std.posix.IPPROTO.IP, std.os.linux.IP.ADD_MEMBERSHIP, &mreq);
 
-        std.debug.print("VLC: Joined multicast group {s}\n", .{Self.MULTICAST_ADDR});
+        dbg.print(.vlc, "VLC: Joined multicast group {s}\n", .{Self.MULTICAST_ADDR});
     }
 
     /// Parse JSON message from VLC extension

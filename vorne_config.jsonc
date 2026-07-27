@@ -1,0 +1,41 @@
+// file location: /home/emanspeaks/vorne_config.jsonc
+{
+  "cues_dir": "/home/emanspeaks/bluray_cues",
+  "bluray_ip": "192.168.0.0",
+  "line2_config": "/home/emanspeaks/line2_config.jsonc",
+  "debug": {
+    // Phase-lock estimation and per-poll timing: "pll:" and "phase_lock:".
+    // By far the highest volume -- one or two lines every second while
+    // playing. Turn on to watch the lock acquire, drift, or lose sync.
+    // Logged from the polling thread, so it does not delay the display.
+    "pll": true,
+
+    // Every frame written to the panel and whether the write succeeded.
+    // Turn on to confirm what was actually sent when the panel and the
+    // cue logs disagree about what should be on screen.
+    "serial": false,
+
+    // Cue file lifecycle: which file is selected, when it loads or fails to
+    // parse, and which cue is due. Start here when cues do not appear.
+    "cues": true,
+
+    // Render-loop decisions: why line 2 holds what it holds, and passes that
+    // started late.
+    "display": true,
+
+    // Blu-ray player status polling, and the display-lead setting.
+    "bluray": true,
+
+    // VLC multicast receiver.
+    "vlc": false,
+
+    // Config file loading.
+    "config": true,
+
+    // PID file and signal handling.
+    "process": true,
+
+    // /etc/localtime parsing and UTC-offset selection.
+    "timezone": true,
+  },
+}

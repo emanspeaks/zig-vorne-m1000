@@ -10,6 +10,8 @@ const bluray = @import("bluray.zig");
 const vlc = @import("vlc.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const cues = @import("cues.zig");
+const dbg = @import("debug_log.zig");
+const vorne_config = @import("vorne_config.zig");
 const Mode = @import("mode.zig").Mode;
 
 /// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
@@ -18,6 +20,13 @@ const Mode = @import("mode.zig").Mode;
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     const io = init.io;
+
+    // The one config file: which diagnostic categories are on, plus the cue
+    // directory, player IP and line2_config location. First thing, so that
+    // everything below can log through it, and well before any thread exists
+    // -- these are read once and thereafter immutable, which is what lets the
+    // rest of the program read them with no synchronization.
+    vorne_config.load(io, allocator);
 
     // Make the environment available for the DEBUG_VLC check
     vlc.setEnviron(init.minimal.environ);
@@ -506,4 +515,35 @@ test "writeHtmlEscaped neutralizes markup in file names" {
     defer body.deinit();
     try writeHtmlEscaped(&body.writer, "a<b>&\"c\".vtt");
     try std.testing.expectEqualStrings("a&lt;b&gt;&amp;&quot;c&quot;.vtt", body.written());
+}
+
+// Pull every module's `test` blocks into the test binary.
+//
+// `zig build test` builds a single test executable rooted at this file, and
+// Zig only collects `test` blocks from files that are analyzed *in test
+// mode*. Importing a module for its functions -- as the top of this file does
+// -- is not enough: without the references below, the 100+ tests in these
+// modules are silently never built or run, and `zig build test` reports
+// success having executed almost nothing. That failure mode is particularly
+// nasty because it looks exactly like a green suite.
+test {
+    _ = @import("bluray.zig");
+    _ = @import("clocks.zig");
+    _ = @import("config.zig");
+    _ = @import("cues.zig");
+    _ = @import("debug_log.zig");
+    _ = @import("frame_timer.zig");
+    _ = @import("jsonc.zig");
+    _ = @import("marquee.zig");
+    _ = @import("mode.zig");
+    _ = @import("phase_lock.zig");
+    _ = @import("process_mgmt.zig");
+    _ = @import("protocol.zig");
+    _ = @import("serial.zig");
+    _ = @import("str_utils.zig");
+    _ = @import("time.zig");
+    _ = @import("vlc.zig");
+    _ = @import("vorne_charset.zig");
+    _ = @import("vorne_config.zig");
+    _ = @import("webvtt.zig");
 }

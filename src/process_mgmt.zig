@@ -1,4 +1,5 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
 const Io = std.Io;
 
 const PID_FILE_PATH = "/tmp/zig_vorne_m1000.pid";
@@ -70,7 +71,7 @@ pub fn setup() !void {
 pub fn checkExistingInstance(io: Io, allocator: std.mem.Allocator) !void {
     if (readPidFile(io, allocator)) |existing_pid| {
         if (isProcessRunning(existing_pid)) {
-            std.debug.print("Found existing instance (PID: {d}), sending termination signal...\n", .{existing_pid});
+            dbg.print(.process, "Found existing instance (PID: {d}), sending termination signal...\n", .{existing_pid});
 
             // Send SIGTERM to existing process
             const term_result = std.os.linux.kill(@intCast(existing_pid), .TERM);
@@ -84,7 +85,7 @@ pub fn checkExistingInstance(io: Io, allocator: std.mem.Allocator) !void {
             while (attempts < 50) : (attempts += 1) {
                 try io.sleep(.fromMilliseconds(100), .awake);
                 if (!isProcessRunning(existing_pid)) {
-                    std.debug.print("Existing instance terminated successfully.\n", .{});
+                    dbg.print(.process, "Existing instance terminated successfully.\n", .{});
                     break;
                 }
             }
@@ -95,7 +96,7 @@ pub fn checkExistingInstance(io: Io, allocator: std.mem.Allocator) !void {
                 try io.sleep(.fromMilliseconds(500), .awake);
             }
         } else {
-            std.debug.print("Stale PID file found, removing...\n", .{});
+            dbg.print(.process, "Stale PID file found, removing...\n", .{});
         }
         removePidFile(io);
     }

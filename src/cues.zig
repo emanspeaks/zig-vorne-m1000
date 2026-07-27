@@ -11,6 +11,8 @@
 //! wrong in a way nobody can correct, cues start when told to.
 
 const std = @import("std");
+const dbg = @import("debug_log.zig");
+const vorne_config = @import("vorne_config.zig");
 const Io = std.Io;
 const webvtt = @import("webvtt.zig");
 
@@ -64,6 +66,25 @@ fn parseDirPathConfig(raw: []const u8) ?[]const u8 {
 /// no synchronization on `active_dir_path`, by design: this is meant to run
 /// once while still single-threaded, not to be re-read live.
 pub fn configureDirPath(io: Io) void {
+    // `cues_dir` in vorne_config.jsonc is the setting. The old
+    // `bluray_cues_dir.txt` is still honoured when that key is absent, so an
+    // existing deployment keeps working across the upgrade instead of silently
+    // reverting to the default directory -- which presents as an empty
+    // dropdown and looks exactly like a bug.
+    if (vorne_config.cuesDir()) |configured| {
+        const trimmed = parseDirPathConfig(configured) orelse {
+            std.debug.print(
+                "Config cues_dir is empty or longer than {d}, using default cue directory: {s}\n",
+                .{ max_dir_path_len, default_dir_path },
+            );
+            return;
+        };
+        @memcpy(active_dir_path_buf[0..trimmed.len], trimmed);
+        active_dir_path = active_dir_path_buf[0..trimmed.len];
+        std.debug.print("Using cue directory: {s}\n", .{active_dir_path});
+        return;
+    }
+
     const raw = Io.Dir.readFileAlloc(
         .cwd(),
         io,
@@ -72,11 +93,11 @@ pub fn configureDirPath(io: Io) void {
         .limited(max_dir_path_len + 16),
     ) catch |err| switch (err) {
         error.FileNotFound => {
-            // Expected when no override is set up. Logged unconditionally --
-            // not just on override -- so a startup log always states, without
-            // ambiguity, which directory is actually in effect: the single most
-            // useful fact when cue files that should be there are not showing.
-            std.debug.print("No {s}, using default cue directory: {s}\n", .{ dir_path_config_path, default_dir_path });
+            // Logged unconditionally -- not just on override -- so a startup
+            // log always states, without ambiguity, which directory is
+            // actually in effect: the single most useful fact when cue files
+            // that should be there are not showing.
+            std.debug.print("Using default cue directory: {s}\n", .{default_dir_path});
             return;
         },
         else => {
@@ -99,7 +120,10 @@ pub fn configureDirPath(io: Io) void {
 
     @memcpy(active_dir_path_buf[0..trimmed.len], trimmed);
     active_dir_path = active_dir_path_buf[0..trimmed.len];
-    std.debug.print("Using cue directory: {s}\n", .{active_dir_path});
+    std.debug.print(
+        "Using cue directory: {s} (from deprecated {s}; move it to \"cues_dir\" in {s})\n",
+        .{ active_dir_path, dir_path_config_path, vorne_config.path },
+    );
 }
 
 pub const extension = ".vtt";

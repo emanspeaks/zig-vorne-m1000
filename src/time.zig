@@ -1,4 +1,5 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
 const Io = std.Io;
 
 // 0.16 removed `std.time.timestamp` and friends; wall-clock readings now come
@@ -463,13 +464,13 @@ test "ymdhmsToTimestamp" {
     defer threaded.deinit();
 
     const utc_timestamp = nowSeconds(threaded.io());
-    std.debug.print("Current UTC timestamp: {}\n", .{utc_timestamp});
+    dbg.print(.timezone, "Current UTC timestamp: {}\n", .{utc_timestamp});
     const ymdhms = timestampToYmdhms(utc_timestamp);
     var buf: [20]u8 = undefined;
     const formatted = try formatYmdhms(ymdhms, &buf);
-    std.debug.print("Formatted: {s}\n", .{formatted});
+    dbg.print(.timezone, "Formatted: {s}\n", .{formatted});
     const new_timestamp = ymdhmsToTimestamp(ymdhms);
-    std.debug.print("Converted timestamp: {}\n", .{new_timestamp});
+    dbg.print(.timezone, "Converted timestamp: {}\n", .{new_timestamp});
     try std.testing.expectEqual(utc_timestamp, new_timestamp);
 }
 

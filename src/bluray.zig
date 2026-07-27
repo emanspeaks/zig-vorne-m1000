@@ -11,6 +11,7 @@ const Mode = @import("mode.zig").Mode;
 const cues = @import("cues.zig");
 const webvtt = @import("webvtt.zig");
 const vorne_charset = @import("vorne_charset.zig");
+const dbg = @import("debug_log.zig");
 const Marquee = @import("marquee.zig").Marquee;
 
 const Writer = std.Io.Writer;
@@ -65,7 +66,9 @@ const DEADLINE_SLACK_MS: i64 = 12;
 /// step, a cue boundary, a mode change.
 const DISPLAY_IDLE_SLICE_MS: i64 = 25;
 
-/// How often both lines are re-sent even though nothing about them changed.
+/// How often both lines are redrawn in full even though nothing changed.
+///
+/// Two things make this necessary, and either alone would be enough.
 ///
 /// Redraw suppression (see `last_line1`/`last_line2`) assumes a byte written to
 /// the port is a byte the panel rendered. Nothing in this protocol guarantees
@@ -73,8 +76,18 @@ const DISPLAY_IDLE_SLICE_MS: i64 = 25;
 /// being inspected, so a frame the panel misses is indistinguishable from one it
 /// drew. Suppression then makes that permanent -- the content has not changed,
 /// so it is never sent again, and the line stays stale until something unrelated
-/// alters it. A periodic unconditional redraw bounds how long that can last, at
-/// a cost of one extra frame every interval.
+/// alters it.
+///
+/// Incremental column updates (`protocol.appendChangedColsToCmdList`) make it
+/// sharper still: in the steady state *only the columns that moved* are ever
+/// transmitted, so nothing repaints the rest of the line. Anything the panel
+/// loses -- a dropped frame, arriving here from another display mode, a glitch
+/// on the wire -- stays lost. Observed on hardware as a blank line with only
+/// the seconds digits ticking, those being the only columns still being sent.
+///
+/// So this redraw covers *both* lines, in full, bypassing the diff. Scoping it
+/// to line 2 alone (an earlier version did) is wrong: the reasoning that line 1
+/// rewrites itself every second holds only while it is written whole.
 const FORCE_REFRESH_MS: i64 = 3000;
 
 /// Why line 2 currently holds whatever it holds. Logged only when it changes
@@ -265,9 +278,9 @@ pub fn runBlurayClocks(
             // Only fires on an actual transition (cueLoop publishes on load or
             // clear, not every pass), so this is safe at render-loop rate.
             if (cue_list) |list| {
-                std.debug.print("bluray: display picked up {d} cues\n", .{list.cues.len});
+                dbg.print(.cues, "bluray: display picked up {d} cues\n", .{list.cues.len});
             } else {
-                std.debug.print("bluray: display cleared its cue list\n", .{});
+                dbg.print(.cues, "bluray: display cleared its cue list\n", .{});
             }
         }
 
@@ -278,7 +291,7 @@ pub fn runBlurayClocks(
             seen_generation = generation;
             name_len = 0;
             if (cue_state.currentName(&name_buf)) |name| name_len = name.len;
-            std.debug.print("bluray: cue selection generation -> {d}, name='{s}'\n", .{
+            dbg.print(.cues, "bluray: cue selection generation -> {d}, name='{s}'\n", .{
                 generation, name_buf[0..name_len],
             });
         }
@@ -329,7 +342,7 @@ pub fn runBlurayClocks(
                 var readable: std.ArrayList(u8) = .empty;
                 defer readable.deinit(allocator);
                 vorne_charset.decodeToUtf8(allocator, &readable, cue.text) catch {};
-                std.debug.print(
+                dbg.print(.cues, 
                     "bluray: cue -> [{d}..{d}) scroll={} {d} bytes, {d} cols: \"{s}\"\n",
                     .{ cue.start_ms, cue.end_ms, cue.scroll, cue.text.len, cols, readable.items },
                 );
@@ -353,7 +366,7 @@ pub fn runBlurayClocks(
 
         if (seen_line2_source == null or line2_source != seen_line2_source.?) {
             seen_line2_source = line2_source;
-            std.debug.print(
+            dbg.print(.display, 
                 "bluray: line2 source -> {s} (armed={}, live={}, name='{s}', has_cue_list={})\n",
                 .{ @tagName(line2_source), cue_state.isArmed(), snap.positionIsLive(), name_buf[0..name_len], cue_list != null },
             );
@@ -424,38 +437,49 @@ pub fn runBlurayClocks(
         // transitions actually worth reading in the log.
         const line2_changed = !have_last2 or !std.mem.eql(u8, &line2buf, &last_line2);
 
-        // The forced refresh covers line 2 only. Line 1 needs no such net: it
-        // changes at least once a second on its own, so a frame the panel
-        // missed is overwritten by the next tick regardless.
-        const forced = now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
+        // A full redraw of *both* lines, periodically and whenever what is on
+        // the panel is unknown -- entering Blu-ray mode, or after a failed
+        // send.
+        //
+        // This is not optional once line updates are incremental. A column
+        // diff rewrites only the columns that moved, so nothing in the steady
+        // state ever repaints the rest of the line: whatever the panel lost --
+        // a dropped frame, a mode switch arriving from another display mode, a
+        // glitch on the wire -- stays lost forever. The symptom is stark and
+        // was seen on hardware: a blank line with only the seconds digits
+        // ticking, because those were the only columns anything was still
+        // sending. An earlier version scoped this refresh to line 2 alone,
+        // reasoning that line 1 rewrites itself every second anyway; that is
+        // true only while line 1 is written whole, and stopped being true the
+        // moment the diff was introduced.
+        const full_redraw = !have_last1 or !have_last2 or
+            now_ms - last_refresh_ms >= FORCE_REFRESH_MS;
 
-        const send_line1 = line1_changed;
-        const send_line2 = (line2_changed or forced) and !send_line1;
-        if (send_line2) last_refresh_ms = now_ms;
+        // Which lines this pass actually put in the frame, so the records are
+        // updated for exactly those and no others.
+        var sent_line1 = false;
+        var sent_line2 = false;
 
-        // Send only the columns that moved, not the whole line. A seconds
-        // digit is one column; redrawing all 20 to move it doubles the wire
-        // time before anything renders (nothing renders until the frame's CRC
-        // arrives) and makes that time vary with how much of the line changed.
-        // This is the same trick `clocks.zig` has always used for its seconds
-        // digit, generalised so the playback clock, rollovers and the
-        // transport glyph all benefit without being special-cased.
-        if (send_line1) {
-            if (have_last1) {
-                try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf);
-            } else {
-                try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
-            }
-        }
-        if (send_line2) {
-            // A forced refresh deliberately rewrites the whole line: its
-            // entire purpose is to restore a line whose content has *not*
-            // changed, which is exactly what a diff would append nothing for.
-            if (line2_changed and have_last2) {
-                try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf);
-            } else {
-                try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
-            }
+        if (full_redraw) {
+            last_refresh_ms = now_ms;
+            try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
+            try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &line2buf);
+            sent_line1 = true;
+            sent_line2 = true;
+        } else if (line1_changed) {
+            // Send only the columns that moved. A seconds digit is one column;
+            // redrawing all 20 to move it doubles the wire time before
+            // anything renders (nothing renders until the frame's CRC arrives)
+            // and makes that time vary with how much of the line changed. Same
+            // trick `clocks.zig` has always used for its seconds digit,
+            // generalised so the playback clock, rollovers and the transport
+            // glyph all benefit without being special-cased.
+            try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 1, &last_line1, &linebuf);
+            sent_line1 = true;
+        } else if (line2_changed) {
+            // Line 2 yields to line 1 -- see the frame-arbitration note above.
+            try protocol.appendChangedColsToCmdList(allocator, &cmd_parts, 2, &last_line2, &line2buf);
+            sent_line2 = true;
         }
 
         if (cmd_parts.items.len > 0) {
@@ -465,29 +489,33 @@ pub fn runBlurayClocks(
             // about what should be on screen.
             // Only worth reporting when line 2's content actually changed --
             // a periodic refresh of identical bytes is not an update.
-            const report_line2 = send_line2 and line2_changed;
+            // `dbg.print` only skips the *writing*; its arguments are
+            // evaluated regardless. Decoding the line back to UTF-8 allocates,
+            // so it is gated on the category being on rather than done every
+            // time line 2 changes and thrown away.
+            const report_line2 = sent_line2 and line2_changed and dbg.enabled(.serial);
             var readable: std.ArrayList(u8) = .empty;
             defer readable.deinit(allocator);
             if (report_line2) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
 
             if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
-                if (send_line1) {
+                if (sent_line1) {
                     last_line1 = linebuf;
                     have_last1 = true;
                 }
-                if (send_line2) {
+                if (sent_line2) {
                     last_line2 = line2buf;
                     have_last2 = true;
                 }
                 if (report_line2) {
-                    std.debug.print("bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+                    dbg.print(.serial, "bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
                 }
             } else |err| {
-                if (report_line2) {
-                    std.debug.print("bluray: sending line 2: \"{s}\" send status: {}\n", .{ readable.items, err });
-                } else {
-                    std.debug.print("bluray: failed to send display frame: {}\n", .{err});
-                }
+                // Unconditional: a frame that did not reach the panel is an
+                // operational fault, not diagnostic chatter, and suppressing
+                // it because `serial` happens to be switched off would hide
+                // the single most useful line in the log.
+                std.debug.print("bluray: failed to send display frame: {}\n", .{err});
             }
         }
 
@@ -529,7 +557,7 @@ pub fn runBlurayClocks(
         // than something to absorb quietly.
         if (due_ms != 0 and now_ms - due_ms > DEADLINE_SLACK_MS) {
             late_frames += 1;
-            std.debug.print(
+            dbg.print(.display, 
                 "Display pass {d} ms late (deadline {d}, {d} so far)\n",
                 .{ now_ms - due_ms, due_ms, late_frames },
             );
@@ -903,11 +931,11 @@ fn cueLoop(
             name_len = 0;
             if (cue_state.currentName(&name_buf)) |name| {
                 name_len = name.len;
-                std.debug.print("cueLoop: selection -> '{s}' (directory: {s})\n", .{ name, cues.dirPath() });
+                dbg.print(.cues, "cueLoop: selection -> '{s}' (directory: {s})\n", .{ name, cues.dirPath() });
             } else {
                 // Selection cleared: blank the line rather than leaving the
                 // previous file's cues running.
-                std.debug.print("cueLoop: selection cleared\n", .{});
+                dbg.print(.cues, "cueLoop: selection cleared\n", .{});
                 cell.publish(null);
             }
         }
@@ -924,7 +952,7 @@ fn cueLoop(
                 const stale = if (loaded_print) |previous| !previous.eql(current) else true;
                 if (stale) {
                     if (cues.load(io, allocator, name)) |fresh| {
-                        std.debug.print(
+                        dbg.print(.cues, 
                             "cueLoop: loaded '{s}': {d} cues, title '{s}'\n",
                             .{ name, fresh.cues.len, fresh.title },
                         );
@@ -933,7 +961,7 @@ fn cueLoop(
                         // Keep whatever is already on screen: a briefly broken
                         // file is normal while editing, and blanking line 2
                         // mid-movie over a typo is worse than stale cues.
-                        std.debug.print("Failed to load cue file {s}: {}\n", .{ name, err });
+                        dbg.print(.cues, "Failed to load cue file {s}: {}\n", .{ name, err });
                     }
                     // Recorded either way, so a file that fails to parse is not
                     // re-read every second until it is saved again.
@@ -944,7 +972,7 @@ fn cueLoop(
                 // that simply is not there, produced no output at all -- the
                 // exact "nothing happens, nothing loads, nothing logs" report
                 // this is here to stop from recurring undiagnosed.
-                std.debug.print(
+                dbg.print(.cues, 
                     "cueLoop: cannot stat '{s}' in {s} (missing, permissions, or directory mismatch)\n",
                     .{ name, cues.dirPath() },
                 );
@@ -1010,7 +1038,7 @@ fn pollLoop(
         // atomically, so a request cannot be lost or double-fired between the
         // check and the reset.
         if (resync_requested.swap(false, .acq_rel)) {
-            std.debug.print("pollLoop: forced PLL resync requested from the web page\n", .{});
+            dbg.print(.pll, "pollLoop: forced PLL resync requested from the web page\n", .{});
             player.lock.forceResync(time.nowMillis(io));
         }
 
@@ -1115,17 +1143,17 @@ const LockObservable = struct {
     /// sample that simply agreed with the accumulated estimate.
     fn logChangesFrom(self: LockObservable, before: LockObservable, kind: PollKind) void {
         if (!before.have_anchor and self.have_anchor) {
-            std.debug.print("phase_lock: anchor acquired -> sec={d} at ms={d} (+-{d}ms, kind={s})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind) });
+            dbg.print(.pll, "phase_lock: anchor acquired -> sec={d} at ms={d} (+-{d}ms, kind={s})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind) });
         } else if (before.have_anchor and !self.have_anchor) {
-            std.debug.print("phase_lock: anchor cleared (kind={s})\n", .{@tagName(kind)});
+            dbg.print(.pll, "phase_lock: anchor cleared (kind={s})\n", .{@tagName(kind)});
         } else if (self.have_anchor and (self.anchor_ms != before.anchor_ms or self.anchor_sec != before.anchor_sec)) {
-            std.debug.print("phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, kind={s}, locked={})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind), self.locked });
+            dbg.print(.pll, "phase_lock: anchor -> sec={d} at ms={d} (+-{d}ms, kind={s}, locked={})\n", .{ self.anchor_sec, self.anchor_ms, self.anchor_err_ms, @tagName(kind), self.locked });
         }
 
         if (!before.locked and self.locked) {
-            std.debug.print("phase_lock: locked (+-{d}ms, kind={s})\n", .{ self.anchor_err_ms, @tagName(kind) });
+            dbg.print(.pll, "phase_lock: locked (+-{d}ms, kind={s})\n", .{ self.anchor_err_ms, @tagName(kind) });
         } else if (before.locked and !self.locked) {
-            std.debug.print("phase_lock: lost lock, re-acquiring (kind={s})\n", .{@tagName(kind)});
+            dbg.print(.pll, "phase_lock: lost lock, re-acquiring (kind={s})\n", .{@tagName(kind)});
         }
 
         // Interval tightening: same anchor, narrower error bound. Not itself
@@ -1135,7 +1163,7 @@ const LockObservable = struct {
             self.anchor_ms == before.anchor_ms and self.anchor_sec == before.anchor_sec and
             self.anchor_err_ms != before.anchor_err_ms)
         {
-            std.debug.print("phase_lock: estimate tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
+            dbg.print(.pll, "phase_lock: estimate tightened +-{d}ms -> +-{d}ms\n", .{ before.anchor_err_ms, self.anchor_err_ms });
         }
     }
 };
@@ -1226,7 +1254,7 @@ pub const BlurayPlayer = struct {
         const prev_sample_ms = self.last_update_time;
 
         self.getStatus(kind) catch |err| {
-            std.debug.print("Failed to get Blu-ray status: {}\n", .{err});
+            dbg.print(.bluray, "Failed to get Blu-ray status: {}\n", .{err});
             self.lock.retryAfterError(now);
             return;
         };
@@ -1250,14 +1278,14 @@ pub const BlurayPlayer = struct {
             // error, or an unparseable response. Previously silent, which made
             // "the PLL is not updating" indistinguishable from "everything
             // agrees" in the log.
-            std.debug.print("pll: {s} no sample (player off or CGI error)\n", .{@tagName(kind)});
+            dbg.print(.pll, "pll: {s} no sample (player off or CGI error)\n", .{@tagName(kind)});
             return;
         }
 
         const sample_ms = self.last_update_time;
         const reported = self.state.play_time_seconds;
         if (self.state.run_status != .Playing) {
-            std.debug.print("pll: {s} reported={d} status={s} rtt={d}ms\n", .{
+            dbg.print(.pll, "pll: {s} reported={d} status={s} rtt={d}ms\n", .{
                 @tagName(kind), reported, @tagName(self.state.run_status), self.last_rtt_ms,
             });
         } else if (before.have_anchor) {
@@ -1270,13 +1298,13 @@ pub const BlurayPlayer = struct {
             const predicted = before.predictAt(sample_ms);
             const drift = @as(i64, reported) - @as(i64, predicted);
             const into_ms = @mod(sample_ms - before.anchor_ms, 1000);
-            std.debug.print("pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}\n", .{
+            dbg.print(.pll, "pll: {s} reported={d} predicted={d} drift={d} into={d}ms anchor=+-{d}ms rtt={d}ms {s}\n", .{
                 @tagName(kind),   reported,                                  predicted,
                 drift,            into_ms,                                   after.anchor_err_ms,
                 self.last_rtt_ms, if (after.locked) "locked" else "hunting",
             });
         } else {
-            std.debug.print("pll: {s} reported={d} (no anchor yet) rtt={d}ms\n", .{
+            dbg.print(.pll, "pll: {s} reported={d} (no anchor yet) rtt={d}ms\n", .{
                 @tagName(kind), reported, self.last_rtt_ms,
             });
         }
@@ -1619,13 +1647,26 @@ test "nextTickMs is the instant the display must be redrawn" {
     paused.run_status = .Paused;
     try std.testing.expectEqual(@as(?i64, null), paused.nextTickMs(50_500));
 
-    // An unlocked snapshot cannot predict an edge either.
+    // An unlocked snapshot still predicts an edge, from the pseudo-anchor at
+    // `sampled_ms - 500`. Returning null here (as this once did) meant no tick
+    // wake at all while the lock hunted, so line 1's play time was picked up
+    // whenever the idle slice next came round -- late, and unevenly. The edge
+    // has to be predicted from the same pseudo-anchor `playTimeMillis` uses,
+    // or the loop wakes to find nothing changed, or changes with no wake.
     var unlocked = snap;
     unlocked.has_anchor = false;
-    try std.testing.expectEqual(@as(?i64, null), unlocked.nextTickMs(50_500));
+    unlocked.sampled_ms = 50_500; // counter reached its value around 50_000
+    try std.testing.expectEqual(@as(?i64, 51_000), unlocked.nextTickMs(50_500));
+    try std.testing.expectEqual(@as(?i64, 51_000), unlocked.nextTickMs(50_999));
+    try std.testing.expectEqual(@as(?i64, 52_000), unlocked.nextTickMs(51_000));
+
+    // Still nothing to wake for when the counter is not advancing at all.
+    var unlocked_paused = unlocked;
+    unlocked_paused.run_status = .Paused;
+    try std.testing.expectEqual(@as(?i64, null), unlocked_paused.nextTickMs(50_500));
 }
 
-test "an unlocked or paused snapshot falls back to the last reported second" {
+test "a paused snapshot holds, an unlocked playing one keeps advancing" {
     const paused: Snapshot = .{
         .run_status = .Paused,
         .play_time_seconds = 1234,
@@ -1637,12 +1678,26 @@ test "an unlocked or paused snapshot falls back to the last reported second" {
     try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(50_000));
     try std.testing.expectEqual(@as(u32, 1234), paused.playTimeSeconds(999_000));
 
+    // A *playing* player with no anchor yet is a different case, and freezing
+    // it (which this once did) is wrong: the counter is still running, so the
+    // position only lurched forward when a poll landed, roughly once a second,
+    // and sat stale in between. Cues keyed off it fired late and in visible
+    // steps until the lock acquired. It extrapolates from the pseudo-anchor at
+    // `sampled_ms - 500` instead -- the midpoint of the second the sample could
+    // have been taken in, matching `phase_lock.rebase`, so the value does not
+    // jump when the lock finally acquires.
     const searching: Snapshot = .{
         .run_status = .Playing,
         .play_time_seconds = 77,
         .has_anchor = false,
+        .sampled_ms = 100_500,
     };
-    try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(123_456));
+    // At the pseudo-anchor itself, still the reported second.
+    try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(100_000));
+    try std.testing.expectEqual(@as(u32, 77), searching.playTimeSeconds(100_999));
+    // And it advances from there rather than sitting at 77 forever.
+    try std.testing.expectEqual(@as(u32, 78), searching.playTimeSeconds(101_000));
+    try std.testing.expectEqual(@as(u32, 87), searching.playTimeSeconds(110_000));
 }
 
 test "parseDisplayLeadConfig accepts signed integers and rejects garbage" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
 const serial = @import("serial.zig");
 const str_utils = @import("str_utils.zig");
 const vorne_charset = @import("vorne_charset.zig");
@@ -54,17 +55,17 @@ pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, alloc
     // Print hex representation to see actual bytes. A successful write() now
     // always means the whole message went out -- see its own doc -- so the
     // count is just msg.len, not something read back from the write itself.
-    std.debug.print("Sent {d} bytes to address {d}: ", .{ msg.len, address });
+    dbg.print(.serial, "Sent {d} bytes to address {d}: ", .{ msg.len, address });
 
     for (msg) |byte| {
-        std.debug.print("{X:0>2} ", .{byte});
+        dbg.print(.serial, "{X:0>2} ", .{byte});
     }
-    std.debug.print("\n", .{});
+    dbg.print(.serial, "\n", .{});
 
     // Also print string with escaped characters shown
     const escaped_msg = try formatWithControlChars(allocator, msg);
     defer allocator.free(escaped_msg);
-    std.debug.print("Message: {s}\n", .{escaped_msg});
+    dbg.print(.serial, "Message: {s}\n", .{escaped_msg});
 
     var buffer: [128]u8 = undefined;
     const received = port.readWithTimeout(&buffer, timeout_ms) catch |err| switch (err) {
@@ -76,10 +77,10 @@ pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, alloc
 
     if (received > 0) {
         const recvbuf = try formatWithControlChars(allocator, buffer[0..received]);
-        std.debug.print("Received {d} bytes: {s}\n", .{ received, recvbuf });
+        dbg.print(.serial, "Received {d} bytes: {s}\n", .{ received, recvbuf });
     } else {
         const timeout_seconds: f64 = @as(f64, @floatFromInt(timeout_ms)) / 1000.0;
-        std.debug.print("No response (timeout after {d:.3} seconds).\n", .{timeout_seconds});
+        dbg.print(.serial, "No response (timeout after {d:.3} seconds).\n", .{timeout_seconds});
     }
 }
 

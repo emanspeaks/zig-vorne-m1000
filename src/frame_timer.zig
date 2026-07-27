@@ -1,4 +1,5 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
 const Io = std.Io;
 
 pub const FrameTimer = struct {
@@ -57,7 +58,7 @@ pub const FrameTimer = struct {
             if (overrun_ns > self.max_overrun_ns) {
                 const overrun_ms: f64 = @as(f64, @floatFromInt(overrun_ns)) / 1_000_000.0;
                 const target_ms: f64 = @as(f64, @floatFromInt(self.target_frame_duration_ns)) / 1_000_000.0;
-                std.debug.print("Frame overrun: {d:.1}ms (target: {d:.1}ms) - frame {}\n", .{ overrun_ms, target_ms, self.frame_count });
+                dbg.print(.display, "Frame overrun: {d:.1}ms (target: {d:.1}ms) - frame {}\n", .{ overrun_ms, target_ms, self.frame_count });
             }
 
             // Skip sleep - start next frame immediately to prevent cascade delays
@@ -82,7 +83,7 @@ pub const FrameTimer = struct {
         const interval_frames = self.stats_interval;
         const overrun_rate: f64 = @as(f64, @floatFromInt(self.overrun_count)) / @as(f64, @floatFromInt(interval_frames)) * 100.0;
         const max_overrun_ms: f64 = @as(f64, @floatFromInt(self.max_overrun_ns_recorded)) / 1_000_000.0;
-        std.debug.print("Frame stats (last {} frames): {}/{} overruns ({d:.1}%), max: {d:.1}ms\n", .{ interval_frames, self.overrun_count, interval_frames, overrun_rate, max_overrun_ms });
+        dbg.print(.display, "Frame stats (last {} frames): {}/{} overruns ({d:.1}%), max: {d:.1}ms\n", .{ interval_frames, self.overrun_count, interval_frames, overrun_rate, max_overrun_ms });
     }
 
     /// Get current frame rate performance info for the current interval

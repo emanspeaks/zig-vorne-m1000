@@ -1,4 +1,7 @@
 const std = @import("std");
+const dbg = @import("debug_log.zig");
+const jsonc = @import("jsonc.zig");
+const vorne_config = @import("vorne_config.zig");
 const Io = std.Io;
 const time = @import("time.zig");
 const str_utils = @import("str_utils.zig");
@@ -21,7 +24,17 @@ pub const BlurayConfig = struct {
 const bluray_cfg_path = "/home/emanspeaks/bluray_config.jsonc";
 const bluray_ip_path = "/home/emanspeaks/bluray_ip.txt";
 const bluray_key_path = "/home/emanspeaks/bluray_key.txt";
-const countdown_cfg_path = "/home/emanspeaks/line2_config.jsonc";
+const countdown_cfg_default_path = "/home/emanspeaks/line2_config.jsonc";
+
+/// Where `line2_config.jsonc` lives.
+///
+/// Only its *location* is configurable from vorne_config.jsonc. The file
+/// itself stays separate and keeps being re-read while running: its contents
+/// are display copy meant to be edited live, unlike the wiring settings, which
+/// are read once at startup.
+fn countdownCfgPath() []const u8 {
+    return vorne_config.line2ConfigPath() orelse countdown_cfg_default_path;
+}
 
 /// Length of the Panasonic control-API secret key.
 pub const bluray_key_len = 32;
@@ -59,12 +72,19 @@ pub fn loadBlurayKey(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
     return key;
 }
 
+/// The player's IP address, or null when none is configured.
+///
+/// `bluray_ip` in vorne_config.jsonc is the setting; `bluray_ip.txt` is still
+/// honoured when that key is absent, so an existing deployment keeps polling
+/// across the upgrade rather than silently losing its player. Caller owns the
+/// returned buffer either way.
 pub fn loadBlurayIp(io: Io, allocator: std.mem.Allocator) ?[]const u8 {
-    // Try to read the IP address from the text file
-    // Caller owns the returned buffer.
+    if (vorne_config.blurayIp()) |configured| {
+        return allocator.dupe(u8, configured) catch null;
+    }
     return Io.Dir.readFileAlloc(.cwd(), io, bluray_ip_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("bluray_ip.txt not found, skipping\n", .{});
+            dbg.print(.config, "No bluray_ip configured (no \"bluray_ip\" in {s}, no {s})\n", .{ vorne_config.path, bluray_ip_path });
             return null;
         },
         else => {
@@ -78,7 +98,7 @@ pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
     // Try to read the JSON file
     const contents = Io.Dir.readFileAlloc(.cwd(), io, bluray_cfg_path, allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("bluray_config.jsonc not found, skipping\n", .{});
+            dbg.print(.config, "bluray_config.jsonc not found, skipping\n", .{});
             return null;
         },
         else => {
@@ -88,79 +108,12 @@ pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
     };
     defer allocator.free(contents);
 
-    // Preprocess JSONC content to remove comments first, then trailing commas
-    var comment_free = std.ArrayList(u8).empty;
-    defer comment_free.deinit(allocator);
-
-    // First pass: remove comments
-    var i: usize = 0;
-    while (i < contents.len) {
-        const char = contents[i];
-
-        // Handle comments
-        if (char == '/') {
-            if (i + 1 < contents.len) {
-                if (contents[i + 1] == '/') {
-                    // Line comment - skip until end of line
-                    i += 2;
-                    while (i < contents.len and contents[i] != '\n' and contents[i] != '\r') {
-                        i += 1;
-                    }
-                    continue;
-                } else if (contents[i + 1] == '*') {
-                    // Block comment - skip until */
-                    i += 2;
-                    while (i + 1 < contents.len) {
-                        if (contents[i] == '*' and contents[i + 1] == '/') {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        comment_free.append(allocator, char) catch |err| {
-            std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
-            return null;
-        };
-        i += 1;
-    }
-
-    // Second pass: remove trailing commas
-    var cleaned_contents = std.ArrayList(u8).empty;
+    var cleaned_contents = jsonc.strip(allocator, contents) catch |err| {
+        std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
+        return null;
+    };
     defer cleaned_contents.deinit(allocator);
 
-    i = 0;
-    while (i < comment_free.items.len) {
-        const char = comment_free.items[i];
-
-        // Handle trailing commas
-        if (char == ',') {
-            // Look ahead to see if this is a trailing comma
-            var j = i + 1;
-
-            // Skip whitespace
-            while (j < comment_free.items.len and (comment_free.items[j] == ' ' or comment_free.items[j] == '\t' or comment_free.items[j] == '\n' or comment_free.items[j] == '\r')) {
-                j += 1;
-            }
-
-            // If we find a closing brace or bracket, it's a trailing comma
-            if (j < comment_free.items.len and (comment_free.items[j] == '}' or comment_free.items[j] == ']')) {
-                // Skip the trailing comma
-                i += 1;
-                continue;
-            }
-        }
-
-        cleaned_contents.append(allocator, char) catch |err| {
-            std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
-            return null;
-        };
-        i += 1;
-    }
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, cleaned_contents.items, .{}) catch |err| {
         std.debug.print("Error parsing JSONC: {}, skipping\n", .{err});
         return null;
@@ -212,9 +165,9 @@ pub fn loadBlurayConfig(io: Io, allocator: std.mem.Allocator) ?BlurayConfig {
 
 pub fn loadCountdownConfig(io: Io, allocator: std.mem.Allocator) ?CountdownConfig {
     // Try to read the JSON file
-    const contents = Io.Dir.readFileAlloc(.cwd(), io, countdown_cfg_path, allocator, max_config_bytes) catch |err| switch (err) {
+    const contents = Io.Dir.readFileAlloc(.cwd(), io, countdownCfgPath(), allocator, max_config_bytes) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("line2_config.jsonc not found, skipping\n", .{});
+            dbg.print(.config, "line2_config.jsonc not found, skipping\n", .{});
             return null;
         },
         else => {
@@ -224,79 +177,12 @@ pub fn loadCountdownConfig(io: Io, allocator: std.mem.Allocator) ?CountdownConfi
     };
     defer allocator.free(contents);
 
-    // Preprocess JSONC content to remove comments first, then trailing commas
-    var comment_free = std.ArrayList(u8).empty;
-    defer comment_free.deinit(allocator);
-
-    // First pass: remove comments
-    var i: usize = 0;
-    while (i < contents.len) {
-        const char = contents[i];
-
-        // Handle comments
-        if (char == '/') {
-            if (i + 1 < contents.len) {
-                if (contents[i + 1] == '/') {
-                    // Line comment - skip until end of line
-                    i += 2;
-                    while (i < contents.len and contents[i] != '\n' and contents[i] != '\r') {
-                        i += 1;
-                    }
-                    continue;
-                } else if (contents[i + 1] == '*') {
-                    // Block comment - skip until */
-                    i += 2;
-                    while (i + 1 < contents.len) {
-                        if (contents[i] == '*' and contents[i + 1] == '/') {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        comment_free.append(allocator, char) catch |err| {
-            std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
-            return null;
-        };
-        i += 1;
-    }
-
-    // Second pass: remove trailing commas
-    var cleaned_contents = std.ArrayList(u8).empty;
+    var cleaned_contents = jsonc.strip(allocator, contents) catch |err| {
+        std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
+        return null;
+    };
     defer cleaned_contents.deinit(allocator);
 
-    i = 0;
-    while (i < comment_free.items.len) {
-        const char = comment_free.items[i];
-
-        // Handle trailing commas
-        if (char == ',') {
-            // Look ahead to see if this is a trailing comma
-            var j = i + 1;
-
-            // Skip whitespace
-            while (j < comment_free.items.len and (comment_free.items[j] == ' ' or comment_free.items[j] == '\t' or comment_free.items[j] == '\n' or comment_free.items[j] == '\r')) {
-                j += 1;
-            }
-
-            // If we find a closing brace or bracket, it's a trailing comma
-            if (j < comment_free.items.len and (comment_free.items[j] == '}' or comment_free.items[j] == ']')) {
-                // Skip the trailing comma
-                i += 1;
-                continue;
-            }
-        }
-
-        cleaned_contents.append(allocator, char) catch |err| {
-            std.debug.print("Error cleaning JSONC content: {}, skipping\n", .{err});
-            return null;
-        };
-        i += 1;
-    }
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, cleaned_contents.items, .{}) catch |err| {
         std.debug.print("Error parsing JSONC: {}, skipping\n", .{err});
         return null;

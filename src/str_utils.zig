@@ -179,13 +179,14 @@ test "truncating to a column boundary never leaves a dangling DLE" {
     // The bug, stated directly: a byte cut ends on a DLE with nothing after it.
     try testing.expectEqual(@as(u8, DLE), text[0..maxchars][maxchars - 1]);
 
-    // The fix: cut at the byte where column 20 starts, keeping the pair whole.
+    // The fix: cut where column 20 *starts*, which is past the pair -- the
+    // glyph is column 19, the twentieth, so it fits and is kept whole. 21
+    // bytes for 20 columns, exactly the byte/column divergence at issue.
     const cut = try idxChar2Str(text, maxchars);
-    try testing.expectEqual(@as(usize, 19), cut);
-    try testing.expectEqualStrings("0123456789ABCDEFGHI", text[0..cut]);
-    // 19 columns, not 20 -- the DLE glyph did not fit, so it is left out
-    // entirely rather than half-included.
-    try testing.expectEqual(@as(usize, 19), (try strlensz(text[0..cut]))[0]);
+    try testing.expectEqual(@as(usize, 21), cut);
+    try testing.expectEqualStrings("0123456789ABCDEFGHI" ++ "\x10P", text[0..cut]);
+    try testing.expectEqual(@as(usize, 20), (try strlensz(text[0..cut]))[0]);
+    // The decisive property: the kept text does not end on an orphaned DLE.
     try testing.expect(text[0..cut][cut - 1] != DLE);
 }
 
