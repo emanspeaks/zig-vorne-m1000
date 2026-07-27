@@ -131,7 +131,7 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 1, 1, &linebuf);
         const cmd1_slice = try cmd_parts.toOwnedSlice(allocator);
         defer allocator.free(cmd1_slice);
-        protocol.sendUnitDisplayCmd(allocator, port, 1, cmd1_slice) catch |err| return err;
+        _ = protocol.sendUnitDisplayCmd(allocator, port, 1, cmd1_slice) catch |err| return err;
 
         // Display time on second line
         try str_utils.clearVorneLineBuf(&linebuf);
@@ -141,7 +141,7 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
         try protocol.appendStrToCmdList(allocator, &cmd_parts, 2, 1, &linebuf);
         const cmd2_slice = try cmd_parts.toOwnedSlice(allocator);
         defer allocator.free(cmd2_slice);
-        protocol.sendUnitDisplayCmd(allocator, port, 1, cmd2_slice) catch |err| return err;
+        _ = protocol.sendUnitDisplayCmd(allocator, port, 1, cmd2_slice) catch |err| return err;
 
         // Handle frame timing and sleep
         try timer.frameEnd();

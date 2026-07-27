@@ -50,6 +50,15 @@ pub const Category = enum {
     /// seeing on its own, without the per-pass "line2 source" and "late pass"
     /// chatter `display` also carries.
     redraw,
+    /// Per-phase wall-clock breakdown of a Blu-ray collator pass and a
+    /// sender send, one line each -- how long building line 1 took, cue
+    /// lookup, building line 2, publishing to the sender; and, on the sender
+    /// side, how long building the command string took versus the panel's
+    /// actual reply time. Split out from `display` because this is meant for
+    /// actively chasing a "where did the time go" question, not left on: at
+    /// collator rate (up to ~40 passes/sec while scrolling) it is far too
+    /// dense to read alongside anything else.
+    timing,
     /// Blu-ray player status polling and the display-lead setting.
     bluray,
     /// VLC multicast receiver.

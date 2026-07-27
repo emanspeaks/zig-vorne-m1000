@@ -23,6 +23,14 @@
     // started late.
     "display": true,
 
+    // Full, un-diffed redraws of both lines, and why one was triggered.
+    "redraw": false,
+
+    // Per-phase timing breakdown of a collator pass and a sender send. Very
+    // dense (up to ~40 lines/sec while scrolling) -- turn on only while
+    // actively chasing a "where did the time go" question.
+    "timing": false,
+
     // Blu-ray player status polling, and the display-lead setting.
     "bluray": true,
 

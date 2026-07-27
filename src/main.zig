@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Serial port opened and configured successfully.\n", .{});
 
     protocol.sendUnitFlushCmd(allocator, port, 1) catch |err| return err;
-    protocol.sendUnitDisplayCmd(allocator, port, 1, protocol.ESC ++ "E") catch |err| return err;
+    _ = protocol.sendUnitDisplayCmd(allocator, port, 1, protocol.ESC ++ "E") catch |err| return err;
     try io.sleep(.fromSeconds(1), .awake);
 
     var mode = std.atomic.Value(Mode).init(.Clocks);

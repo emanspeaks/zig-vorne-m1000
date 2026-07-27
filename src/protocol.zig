@@ -28,7 +28,8 @@ pub const group_crc16 = SOH ++ "u";
 
 pub const timeout_ms: u32 = 2000;
 
-/// Send a command and wait for the panel's reply, up to `timeout_ms`.
+/// Send a command and wait for the panel's reply, up to `timeout_ms`. Returns
+/// whether a reply actually arrived.
 ///
 /// This is the pacing mechanism between commands, and deliberately not a
 /// fixed delay. The panel has no flow control and a small input buffer, so a
@@ -47,19 +48,39 @@ pub const timeout_ms: u32 = 2000;
 /// still propagates a genuine write failure (a short or failed send, or the
 /// port itself timing out -- see `SerialPort.write`), which is a different
 /// and more serious condition than the unit simply not replying.
-pub fn send(port: *serial.SerialPort, msg: []const u8) !void {
+///
+/// The `bool` -- not folded into an error -- is what lets a timeout stay a
+/// non-fatal outcome for most callers (they simply discard it, unchanged from
+/// when this returned `!void`) while still letting a caller that keeps a
+/// "what has the panel actually been shown" record, like `bluray.zig`'s
+/// `senderLoop`, tell a confirmed send apart from an unconfirmed one. Before
+/// this returned the distinction, *every* successful call to `port.write`
+/// looked identical to a caller regardless of whether the panel ever actually
+/// answered -- so a frame the panel silently dropped (no flow control, small
+/// input buffer -- see "Pacing commands to the panel" in CLAUDE.md) was
+/// recorded as having landed. The next pass then diffed against that false
+/// record and sent only the columns *it* believed had changed, permanently
+/// leaving whatever the panel actually still showed stuck until the next
+/// periodic full redraw. On hardware this presented as a clock digit frozen
+/// mid-rollover -- e.g. the tens digit stuck at "3" while the ones digit kept
+/// advancing (39, then a display stuck on "31" instead of 40/41) -- which
+/// reads exactly like a bug in the column-diffing itself, but the diffing was
+/// always correct; it was being fed a premise that wasn't true.
+pub fn send(port: *serial.SerialPort, msg: []const u8) !bool {
     try port.write(msg);
 
     var buffer: [128]u8 = undefined;
     const received = port.readWithTimeout(&buffer, timeout_ms) catch |err| switch (err) {
         error.PollError => {
             dbg.print(.serial, "Error polling for a reply.\n", .{});
-            return;
+            return false;
         },
     };
     if (received == 0) {
         dbg.print(.serial, "No response after {d} ms.\n", .{timeout_ms});
+        return false;
     }
+    return true;
 }
 
 pub fn sendVerbose(port: *serial.SerialPort, address: u8, msg: []const u8, allocator: std.mem.Allocator) !void {
@@ -141,7 +162,9 @@ pub fn sendUnitFlushCmd(
 ) !void {
     const cmd = try unitFlushCmd(allocator, address);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    // Whether the panel confirmed this one doesn't matter here -- a flush
+    // command has nothing to diff against on the next pass.
+    _ = try send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send flush command: {}\n", .{err});
     //     return err;
@@ -165,7 +188,7 @@ pub fn sendGrpFlushCmd(
 ) !void {
     const cmd = try grpFlushCmd(allocator, address);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    _ = try send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send group flush command: {}\n", .{err});
     //     return err;
@@ -183,15 +206,21 @@ pub fn unitDisplayCmd(
     return appendCrc16(allocator, cmd);
 }
 
+/// Returns whether the panel actually confirmed the frame -- see `send`'s
+/// doc. Most callers (the ones with nothing to diff against, like the
+/// startup/mode-entry init or `clocks.zig`'s fire-and-forget style) can
+/// discard it exactly as if this still returned `!void`; `bluray.zig`'s
+/// `senderLoop` is the one caller that must not, since it is the one caller
+/// that keeps a "what has the panel actually been shown" record.
 pub fn sendUnitDisplayCmd(
     allocator: std.mem.Allocator,
     port: *serial.SerialPort,
     address: u8,
     input_no_cr: []const u8,
-) !void {
+) !bool {
     const cmd = try unitDisplayCmd(allocator, address, input_no_cr);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    return send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send display command: {}\n", .{err});
     //     return err;
@@ -217,7 +246,7 @@ pub fn sendGrpDisplayCmd(
 ) !void {
     const cmd = try grpDisplayCmd(allocator, address, input_no_cr);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    _ = try send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send group display command: {}\n", .{err});
     //     return err;
@@ -238,7 +267,7 @@ pub fn sendUnitDefaultInitCmd(
 ) !void {
     const cmd = try unitDefaultInitCmd(allocator, address);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    _ = try send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send clear command: {}\n", .{err});
     //     return err;
@@ -259,7 +288,7 @@ pub fn sendGrpDefaultInitCmd(
 ) !void {
     const cmd = try grpDefaultInitCmd(allocator, address);
     defer allocator.free(cmd);
-    try send(port, cmd);
+    _ = try send(port, cmd);
     // sendVerbose(port, address, cmd, allocator) catch |err| {
     //     std.debug.print("Failed to send group clear command: {}\n", .{err});
     //     return err;
@@ -364,7 +393,7 @@ pub fn sendUnitUpdateChar(
     const update_cmd = unitUpdateChar(&cmd_buf, line, column, new_char);
 
     // Send the command using unitDisplayCmd
-    try sendUnitDisplayCmd(allocator, port, address, update_cmd);
+    _ = try sendUnitDisplayCmd(allocator, port, address, update_cmd);
 }
 
 test "appendChangedColsToCmdList sends only the digits a clock tick moved" {

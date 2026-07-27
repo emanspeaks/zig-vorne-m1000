@@ -125,7 +125,7 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
         try cmd_parts.appendSlice(allocator, msg2_str);
 
         const cmd_slice = try cmd_parts.toOwnedSlice(allocator);
-        protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_slice) catch |err| return err;
+        _ = protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_slice) catch |err| return err;
 
         // Sleep until next second
         try io.sleep(.fromMilliseconds(500), .awake);

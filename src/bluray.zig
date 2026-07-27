@@ -310,6 +310,15 @@ pub fn runBlurayClocks(
         try str_utils.copyRightJustify(&linebuf, playtime_str, @min(playtime_str.len, 20), 1);
         try str_utils.copyRightJustify(&linebuf, runstatus_str, 1, 0);
 
+        // Per-phase timing, for chasing a "where did the time go" question --
+        // see `.timing`'s own doc. `enabled` is checked once and the reads
+        // gated behind it, rather than reading unconditionally: `nowMillis`
+        // is cheap but not free, and this collator runs up to ~40 passes/sec
+        // while scrolling, so an unconditional extra clock read four times a
+        // pass is not something to pay when nobody is looking at it.
+        const timing_on = dbg.enabled(.timing);
+        const t_line1_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
+
         // Collect a cue file the cue thread has finished parsing. One atomic
         // load on almost every pass; the pointer swap and the arena free only
         // happen when the selection changes or the file is edited.
@@ -419,11 +428,16 @@ pub fn runBlurayClocks(
 
         if (seen_line2_source == null or line2_source != seen_line2_source.?) {
             seen_line2_source = line2_source;
-            dbg.print(.display, 
+            dbg.print(.display,
                 "bluray: line2 source -> {s} (armed={}, live={}, name='{s}', has_cue_list={})\n",
                 .{ @tagName(line2_source), cue_state.isArmed(), snap.positionIsLive(), name_buf[0..name_len], cue_list != null },
             );
         }
+
+        // Covers cue-cell collection, the selected-name re-read, and the
+        // whole cue-lookup/line2-source decision above -- everything between
+        // line 1 being finished and the marquee/line2 buffer work starting.
+        const t_line2_source_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
 
         const line2_window = if (may_scroll)
             scroller.window(line2, str_utils.maxchars, now_ms)
@@ -451,6 +465,8 @@ pub fn runBlurayClocks(
         const line2_cols = (str_utils.strlensz(line2_window) catch unreachable)[0];
         try str_utils.copyLeftJustify(&line2buf, line2_window, @min(line2_cols, str_utils.maxchars), null);
 
+        const t_line2_build_ms: i64 = if (timing_on) time.nowMillis(io) else 0;
+
         // Hand the freshly built frame to `senderLoop`, which owns the port
         // and decides how -- or whether -- to get it onto the wire (one frame
         // per send, line 1 preferred over line 2, full redraw vs. column diff;
@@ -470,6 +486,20 @@ pub fn runBlurayClocks(
         // publish it came from, so it does not matter that the flag and the
         // frame that originally set it may not arrive together.
         if (cue_boundary) cue_boundary_pending.store(true, .release);
+
+        if (timing_on) {
+            const t_publish_ms = time.nowMillis(io);
+            dbg.print(.timing,
+                "bluray collator: line1={d}ms cue+src={d}ms line2buf={d}ms publish={d}ms total={d}ms\n",
+                .{
+                    t_line1_ms - now_ms,
+                    t_line2_source_ms - t_line1_ms,
+                    t_line2_build_ms - t_line2_source_ms,
+                    t_publish_ms - t_line2_build_ms,
+                    t_publish_ms - now_ms,
+                },
+            );
+        }
 
         // Sleep until the next moment something on the display is due to
         // change: the next playback tick, the next real-time second, or the
@@ -1039,6 +1069,30 @@ const DrawCell = struct {
 /// actually bounds latency.
 const SENDER_IDLE_SLICE_MS: i64 = 10;
 
+/// How far above the recent-average round trip (`senderLoop`'s
+/// `send_ewma_ms`) a single confirmed send's wait for the panel's reply has
+/// to be before it is logged as slow.
+///
+/// A multiple of the *rolling* average rather than a fixed number of
+/// milliseconds, because what counts as "slow" depends on this panel and this
+/// wiring -- a deployment that normally sees 20 ms replies and one that
+/// normally sees 150 ms are both fine right up until either one roughly
+/// triples. This exists because the collator/sender split (see `senderLoop`'s
+/// own doc) moved the one thing that can genuinely stall a pass -- the
+/// blocking wait for the panel's reply -- off the collator entirely. That
+/// fixed the collator's own `DEADLINE_SLACK_MS` report being a false signal
+/// for ordinary serial latency, but it also means a slow *reply* no longer
+/// shows up anywhere unless something says so explicitly: a stall here
+/// previously surfaced as a late collator pass, which was the wrong
+/// attribution (it blamed the render loop for the wire), but at least it
+/// surfaced. This is that signal, correctly attributed.
+const SEND_SLOW_MULTIPLE: i64 = 3;
+
+/// Absolute floor added on top of `SEND_SLOW_MULTIPLE`'s comparison, so a
+/// very fast, very tight baseline (a handful of ms) doesn't make ordinary
+/// jitter look like an anomaly.
+const SEND_SLOW_MARGIN_MS: i64 = 50;
+
 /// Owns the serial port and turns whatever the collator (`runBlurayClocks`)
 /// last published into frames on the wire.
 ///
@@ -1105,6 +1159,12 @@ fn senderLoop(
     const entry_ms = time.nowMillis(io);
     // For "log only on change" -- see `RedrawReason`.
     var seen_redraw_reason: ?RedrawReason = null;
+    // Rolling average of how long a *confirmed* send's wait for the panel's
+    // reply actually takes -- see `SEND_SLOW_MULTIPLE`'s doc. Seeded with a
+    // plausible guess so the first few sends, before a real sample exists,
+    // are not compared against zero.
+    var send_ewma_ms: i64 = 150;
+    var slow_sends: u32 = 0;
 
     while (!stop.load(.acquire)) {
         const frame = draw.read() orelse {
@@ -1118,6 +1178,10 @@ fn senderLoop(
         // One-shot: `swap` both reads and clears it, so a boundary flagged
         // between this check and the last cannot be lost or double-counted.
         const cue_boundary = cue_boundary_pending.swap(false, .acq_rel);
+        // See `.timing`'s own doc. Gated behind `enabled` for the same
+        // reason as the collator's equivalent: cheap, but not free, and this
+        // loop can run every `SENDER_IDLE_SLICE_MS` even when idle.
+        const timing_on = dbg.enabled(.timing);
 
         cmd_parts.clearRetainingCapacity();
         const line1_changed = !have_last1 or !std.mem.eql(u8, &linebuf, &last_line1);
@@ -1192,6 +1256,16 @@ fn senderLoop(
             sent_line2 = true;
         }
 
+        // Covers everything above: reading `draw`, the diff, and building
+        // `cmd_parts` -- all arithmetic and `memcmp`, so this should read
+        // close to zero. Read unconditionally (not gated on `timing_on`, the
+        // way `.timing`'s own breakdown line is) since it also feeds the
+        // slow-send warning below, which has to stay on regardless of debug
+        // config -- a send only happens when there is actually something to
+        // send, so this is not the same cost as reading the clock on every
+        // idle poll.
+        const t_built_ms: i64 = time.nowMillis(io);
+
         if (cmd_parts.items.len > 0) {
             // Logged on every attempt, not just failures -- this is the one
             // point that can confirm or rule out the send path itself when the
@@ -1202,17 +1276,75 @@ fn senderLoop(
             defer readable.deinit(allocator);
             if (report_line2) vorne_charset.decodeToUtf8(allocator, &readable, &line2buf) catch {};
 
-            if (protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items)) |_| {
-                if (sent_line1) {
-                    last_line1 = linebuf;
-                    have_last1 = true;
-                }
-                if (sent_line2) {
-                    last_line2 = line2buf;
-                    have_last2 = true;
-                }
-                if (report_line2) {
-                    dbg.print(.serial, "bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+            const send_result = protocol.sendUnitDisplayCmd(allocator, port, 1, cmd_parts.items);
+            const t_sent_ms = time.nowMillis(io);
+            const send_wait_ms = t_sent_ms - t_built_ms;
+            if (timing_on) {
+                dbg.print(.timing,
+                    "bluray sender: build={d}ms send_wait={d}ms total={d}ms line1={} line2={} full={}\n",
+                    .{
+                        t_built_ms - now_ms,
+                        send_wait_ms,
+                        t_sent_ms - now_ms,
+                        sent_line1,
+                        sent_line2,
+                        full_redraw,
+                    },
+                );
+            }
+            if (send_result) |replied| {
+                if (replied) {
+                    // Only update the "what has the panel actually been
+                    // shown" record when the panel *confirmed* it -- writing
+                    // succeeding is not the same thing (see `protocol.send`'s
+                    // doc). Recording an unconfirmed frame as shown is what
+                    // produced a clock digit frozen mid-rollover on hardware:
+                    // the next pass would diff against a record that had
+                    // silently advanced past whatever the panel actually
+                    // still displayed, and send only the columns *it*
+                    // believed had changed since then -- permanently
+                    // stranding the rest.
+                    if (sent_line1) {
+                        last_line1 = linebuf;
+                        have_last1 = true;
+                    }
+                    if (sent_line2) {
+                        last_line2 = line2buf;
+                        have_last2 = true;
+                    }
+                    if (report_line2) {
+                        dbg.print(.serial, "bluray: sending line 2: \"{s}\" send status: success\n", .{readable.items});
+                    }
+                    // Unconditional (like the collator's own "Display pass
+                    // late" report), and deliberately worded to lay blame on
+                    // the wire/panel rather than the render loop: the
+                    // collator can no longer stall on this send at all (see
+                    // `senderLoop`'s own doc), so a slow reply here used to
+                    // show up nowhere except as a misattributed late collator
+                    // pass -- or, before that split existed at all, as
+                    // exactly the kind of periodic stutter a full
+                    // `FORCE_REFRESH_MS` redraw (a bigger frame, so a bigger
+                    // target for the panel to be slow answering) would
+                    // produce with no accompanying deadline warning anywhere.
+                    if (send_wait_ms > send_ewma_ms * SEND_SLOW_MULTIPLE + SEND_SLOW_MARGIN_MS) {
+                        slow_sends += 1;
+                        std.debug.print(
+                            "bluray: serial comm slow: panel took {d} ms to reply (usually ~{d} ms), {d} so far -- this is the wire/panel, not the render loop\n",
+                            .{ send_wait_ms, send_ewma_ms, slow_sends },
+                        );
+                    }
+                    // Updated from confirmed sends only -- see `send_ewma_ms`'s
+                    // own doc for why a timeout must not feed this average.
+                    send_ewma_ms = @divFloor(send_ewma_ms * 3 + send_wait_ms, 4);
+                } else {
+                    // Unconditional, like the write-failure branch below: an
+                    // unconfirmed frame is exactly the situation
+                    // `FORCE_REFRESH_MS`/`missing_record` exist to recover
+                    // from, but that recovery only works if this is visible.
+                    // The record is deliberately left untouched -- see above
+                    // -- so the very next pass retries against last known-good
+                    // content rather than compounding the gap.
+                    std.debug.print("bluray: display did not confirm frame (no reply within {d} ms)\n", .{protocol.timeout_ms});
                 }
             } else |err| {
                 // Unconditional: a frame that did not reach the panel is an
