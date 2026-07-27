@@ -107,24 +107,36 @@ var clock_io: ?Io = null;
 
 fn printStamp(cat: Category) void {
     const io = clock_io orelse {
-        // Before `configure` ran, so there is no clock to read. Still label
-        // the line, rather than dropping the prefix and producing a log whose
-        // columns do not line up.
-        std.debug.print("[--:--:--.--- {s}] ", .{@tagName(cat)});
+        // Before `vorne_config.load` ran, so there is no clock to read. Still
+        // label the line, rather than dropping the prefix and producing a log
+        // whose columns do not line up.
+        std.debug.print("[--:--:--.--- UTC {s}] ", .{@tagName(cat)});
         return;
     };
     const ms: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    const total_s = @divFloor(ms, std.time.ms_per_s);
-    // UTC, deliberately. Local time needs the offset held behind
+    // UTC, and labelled as such. Local time needs the offset held behind
     // `time.SharedZone`, which would make this depend on the display's
     // threading and on `time.zig` -- which imports this module.
-    std.debug.print("[{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} {s}] ", .{
-        @mod(@divFloor(total_s, 3600), 24),
-        @mod(@divFloor(total_s, 60), 60),
-        @mod(total_s, 60),
-        @mod(ms, std.time.ms_per_s),
-        @tagName(cat),
-    });
+    var buf: [16]u8 = undefined;
+    std.debug.print("[{s} UTC {s}] ", .{ formatStamp(&buf, ms), @tagName(cat) });
+}
+
+/// Format epoch milliseconds as `HH:MM:SS.mmm` (UTC).
+///
+/// The components are cast to unsigned before formatting, which is load
+/// bearing rather than tidiness: `@divFloor`/`@mod` on an `i64` yield `i64`,
+/// and a signed value under a width specifier is formatted with an explicit
+/// sign -- producing `[+1:+15:+56.+303]` instead of `[01:15:56.303]`. `@mod`
+/// with a positive divisor is already non-negative, so the casts cannot trap.
+fn formatStamp(buf: []u8, ms: i64) []const u8 {
+    const total_s = @divFloor(ms, std.time.ms_per_s);
+    const hours: u32 = @intCast(@mod(@divFloor(total_s, 3600), 24));
+    const minutes: u32 = @intCast(@mod(@divFloor(total_s, 60), 60));
+    const seconds: u32 = @intCast(@mod(total_s, 60));
+    const millis: u32 = @intCast(@mod(ms, std.time.ms_per_s));
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        hours, minutes, seconds, millis,
+    }) catch unreachable;
 }
 
 /// Provide the clock used to timestamp lines. Called by `vorne_config.load`.
@@ -189,6 +201,22 @@ fn maskOfJson(src: []const u8) !u32 {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, cleaned.items, .{});
     defer parsed.deinit();
     return maskFrom(parsed.value.object.get("debug").?.object);
+}
+
+test "the timestamp is zero-padded and carries no sign" {
+    var buf: [16]u8 = undefined;
+    // 01:15:56.303 UTC. The signed-integer version of this produced
+    // "+1:+15:+56.+303": every component formatted with an explicit sign and
+    // none of them zero-padded, which is unreadable and misaligns every line.
+    const ms: i64 = ((1 * 60 + 15) * 60 + 56) * 1000 + 303;
+    try testing.expectEqualStrings("01:15:56.303", formatStamp(&buf, ms));
+
+    // Midnight, and the wrap back to it, are the padding-sensitive cases.
+    try testing.expectEqualStrings("00:00:00.000", formatStamp(&buf, 0));
+    try testing.expectEqualStrings("00:00:00.007", formatStamp(&buf, 7));
+    try testing.expectEqualStrings("23:59:59.999", formatStamp(&buf, 24 * 3600 * 1000 - 1));
+    // A day later reads the same: the hour field wraps rather than growing.
+    try testing.expectEqualStrings("00:00:01.000", formatStamp(&buf, 24 * 3600 * 1000 + 1000));
 }
 
 test "only categories listed as true are enabled" {

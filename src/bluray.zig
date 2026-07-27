@@ -7,7 +7,8 @@ const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
 const phase_lock = @import("phase_lock.zig");
 const PollKind = phase_lock.PollKind;
-const Mode = @import("mode.zig").Mode;
+const mode_mod = @import("mode.zig");
+const Mode = mode_mod.Mode;
 const cues = @import("cues.zig");
 const webvtt = @import("webvtt.zig");
 const vorne_charset = @import("vorne_charset.zig");
@@ -213,6 +214,16 @@ pub fn runBlurayClocks(
         // Check for mode change
         if (mode.load(.acquire) != .Bluray) {
             std.debug.print("Mode changed, exiting bluray mode...\n", .{});
+            return;
+        }
+
+        // A re-init was requested from the web page. Stop, and let
+        // the dispatch loop in `main` service it: it owns the serial
+        // port on this thread, and re-entering this function repaints
+        // from scratch because the "what is on the panel" records
+        // start empty. Checked without consuming -- `main` clears it.
+        if (mode_mod.reinitPending()) {
+            std.debug.print("Re-init requested, exiting bluray mode...\n", .{});
             return;
         }
 

@@ -7,7 +7,8 @@ const time = @import("time.zig");
 const process_mgmt = @import("process_mgmt.zig");
 const str_utils = @import("str_utils.zig");
 const frame_timer = @import("frame_timer.zig");
-const Mode = @import("mode.zig").Mode;
+const mode_mod = @import("mode.zig");
+const Mode = mode_mod.Mode;
 
 const Writer = std.Io.Writer;
 const maxbufsz = str_utils.maxbufsz;
@@ -76,6 +77,16 @@ pub fn runVlcClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *
         // Check for mode change
         if (mode.load(.acquire) != .Vlc) {
             std.debug.print("Mode changed, exiting vlc mode...\n", .{});
+            return;
+        }
+
+        // A re-init was requested from the web page. Stop, and let
+        // the dispatch loop in `main` service it: it owns the serial
+        // port on this thread, and re-entering this function repaints
+        // from scratch because the "what is on the panel" records
+        // start empty. Checked without consuming -- `main` clears it.
+        if (mode_mod.reinitPending()) {
+            std.debug.print("Re-init requested, exiting vlc mode...\n", .{});
             return;
         }
 

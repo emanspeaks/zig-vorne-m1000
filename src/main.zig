@@ -12,7 +12,9 @@ const process_mgmt = @import("process_mgmt.zig");
 const cues = @import("cues.zig");
 const dbg = @import("debug_log.zig");
 const vorne_config = @import("vorne_config.zig");
-const Mode = @import("mode.zig").Mode;
+// Named to avoid shadowing the `mode` atomic that the loops below pass around.
+const mode_mod = @import("mode.zig");
+const Mode = mode_mod.Mode;
 
 /// In 0.16 the runtime hands `main` a `std.process.Init`, which carries the
 /// `Io` implementation that all blocking I/O (files, sockets, sleeping) now
@@ -84,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     var resync_requested = std.atomic.Value(bool).init(false);
 
     // Start HTTP server in a separate thread
-    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, port, &mode, &cue_state, &resync_requested });
+    const server_thread = try std.Thread.spawn(.{}, startHttpServer, .{ io, allocator, &mode, &cue_state, &resync_requested });
     server_thread.detach();
 
     // Main display loop
@@ -96,6 +98,33 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const current_mode = mode.load(.acquire);
+
+        // Clear any pending re-init request here, where it is about to be
+        // serviced by the init below. Consuming it with `swap` means one click
+        // cannot be serviced twice, and -- since the flag is what made the
+        // mode loop return -- leaving it set would spin this loop.
+        if (mode_mod.takeReinitRequest()) {
+            std.debug.print("Re-initializing display\n", .{});
+        }
+
+        // Put the panel into a known state on every mode entry: geometry,
+        // attributes and a clear. Each mode addresses the display differently
+        // (Blu-ray mode writes `ESC <line>;<col>C` spans, clocks mode uses
+        // `ESC C` / `ESC 2;C`), so whatever the outgoing mode left behind is
+        // not a safe starting point for the incoming one.
+        //
+        // This runs here, on the display thread, rather than in the HTTP
+        // handler that requested the switch: only one thread may write to the
+        // port, and by this point the outgoing mode's loop has returned. It is
+        // also the one place that covers every mode, including the `--bluray`
+        // and `--vlc` command-line starts, which never go through HTTP at all.
+        //
+        // Logged, not propagated: failing to init is not a reason to take the
+        // service down, and the next mode change gets another attempt.
+        protocol.sendUnitDefaultInitCmd(allocator, port, 1) catch |err| {
+            std.debug.print("Failed to initialize display on mode entry: {}\n", .{err});
+        };
+
         if (current_mode == .Clocks) {
             try clocks.runClocks(io, allocator, port, &mode);
         } else if (current_mode == .Bluray) {
@@ -109,7 +138,6 @@ pub fn main(init: std.process.Init) !void {
 fn startHttpServer(
     io: Io,
     allocator: std.mem.Allocator,
-    port: *serial.SerialPort,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
     resync_requested: *std.atomic.Value(bool),
@@ -122,7 +150,7 @@ fn startHttpServer(
 
     while (true) {
         const stream = try listener.accept(io);
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, port, mode, cue_state, resync_requested });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ io, allocator, stream, mode, cue_state, resync_requested });
         thread.detach();
     }
 }
@@ -131,7 +159,6 @@ fn handleConnection(
     io: Io,
     allocator: std.mem.Allocator,
     stream: Io.net.Stream,
-    serial_port: *serial.SerialPort,
     mode: *std.atomic.Value(Mode),
     cue_state: *cues.State,
     resync_requested: *std.atomic.Value(bool),
@@ -226,32 +253,28 @@ fn handleConnection(
         const body = request[body_start..];
 
         var action: []const u8 = "";
-        var text: []const u8 = "";
 
         // Simple form parsing
         var iter = std.mem.splitSequence(u8, body, "&");
         while (iter.next()) |pair| {
             if (std.mem.startsWith(u8, pair, "action=")) {
                 action = pair[7..];
-            } else if (std.mem.startsWith(u8, pair, "text=")) {
-                text = pair[5..];
-                // URL decode
-                text = std.mem.replaceOwned(u8, allocator, text, "+", " ") catch text;
             }
         }
 
-        if (std.mem.eql(u8, action, "display")) {
-            protocol.sendUnitDisplayCmd(allocator, serial_port, 1, text) catch |err| {
-                std.debug.print("Error sending display command: {}\n", .{err});
-            };
-            // } else if (std.mem.eql(u8, action, "flush")) {
-            //     protocol.sendUnitFlushCmd(allocator, serial_port, 1) catch |err| {
-            //         std.debug.print("Error sending flush command: {}\n", .{err});
-            //     };
-        } else if (std.mem.eql(u8, action, "init")) {
-            protocol.sendUnitDefaultInitCmd(allocator, serial_port, 1) catch |err| {
-                std.debug.print("Error sending init command: {}\n", .{err});
-            };
+        // There was an `action=display` branch here that wrote `text`
+        // straight to the panel. Removed: no form on the page ever posted it
+        // (there is no `text` input), and it was the last place outside the
+        // display thread that touched the serial port -- letting any POST
+        // splice arbitrary bytes, escape sequences included, into whatever
+        // frame the render loop was mid-way through emitting.
+        if (std.mem.eql(u8, action, "init")) {
+            // Deliberately does not touch the port: only the display thread
+            // may write to it (see `mode.requestReinit`). This hands the job
+            // to the running mode loop, which stops so the dispatch loop can
+            // init and repaint on the display thread.
+            mode_mod.requestReinit();
+            std.debug.print("Display re-init requested from the web page\n", .{});
         }
 
         // Redirect back to main page
@@ -278,7 +301,17 @@ fn handleConnection(
             }
         }
 
-        try protocol.sendUnitDefaultInitCmd(allocator, serial_port, 1);
+        // Deliberately does NOT touch the serial port. Re-initialising the
+        // panel used to happen here, on the HTTP thread -- but the outgoing
+        // mode's render loop is still running and still writing to the same
+        // fd at this moment, and nothing serializes the two. The interleaved
+        // bytes corrupt whichever frame they land in, and
+        // `unitDefaultInitCmd` carries a window-geometry command
+        // (`ESC 0;0;119;15w`): a mangled one leaves later writes addressing
+        // somewhere off-screen, so the panel goes blank and *stays* blank,
+        // since a redraw repaints content but never re-sends the geometry.
+        // The mode dispatch loop in `main` now does the init instead, on the
+        // display thread, after the switch has taken effect.
         if (std.mem.eql(u8, new_mode, "clocks")) {
             mode.store(.Clocks, .release);
         } else if (std.mem.eql(u8, new_mode, "bluray")) {

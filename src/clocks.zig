@@ -4,7 +4,8 @@ const protocol = @import("protocol.zig");
 const time = @import("time.zig");
 const config = @import("config.zig");
 const process_mgmt = @import("process_mgmt.zig");
-const Mode = @import("mode.zig").Mode;
+const mode_mod = @import("mode.zig");
+const Mode = mode_mod.Mode;
 
 pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std.atomic.Value(Mode)) !void {
     // Build the command string dynamically
@@ -30,6 +31,16 @@ pub fn runClocks(io: Io, allocator: std.mem.Allocator, port: anytype, mode: *std
         // Check for mode change
         if (mode.load(.acquire) != .Clocks) {
             std.debug.print("Mode changed, exiting clocks mode...\n", .{});
+            return;
+        }
+
+        // A re-init was requested from the web page. Stop, and let
+        // the dispatch loop in `main` service it: it owns the serial
+        // port on this thread, and re-entering this function repaints
+        // from scratch because the "what is on the panel" records
+        // start empty. Checked without consuming -- `main` clears it.
+        if (mode_mod.reinitPending()) {
+            std.debug.print("Re-init requested, exiting clocks mode...\n", .{});
             return;
         }
 
